@@ -21,6 +21,17 @@ New invariants get a test in `tests/test_hogs.py` (see `DockerCleanItemsTest`).
 - New cache/app → one `PathDef` line in `PATH_DEFS`.
 - README screenshots come only from `docs/make_screenshots.py`, which uses fictitious data. Real terminal output contains the author's work image names; it stays out of the repo.
 
+## Installation
+
+Three install paths exist (README › Instalação); all of them assume the code is the single file `hogs.py`:
+
+- `install.sh` downloads only `hogs.py` from the `main` branch raw URL, so `main` must always hold a working `hogs.py`.
+- `pyproject.toml` ships `py-modules = ["hogs"]` with the entry point `hogs:main`.
+
+Splitting or renaming `hogs.py` means updating `install.sh` and `pyproject.toml` in the same commit.
+
+The version lives in two places, `__version__` in `hogs.py` and `version` in `pyproject.toml`; bump both together.
+
 ## Before committing
 
 1. `python3 -m unittest discover -s tests`
