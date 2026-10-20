@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hogs"
+version = "0.1.0"
+description = "Mostra quem está comendo o disco do seu Mac (Docker incluso) e ajuda a limpar com segurança."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Will Lobato" }]
+requires-python = ">=3.9"
+dependencies = ["rich>=12"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/willlobato/hogs"
+
+[project.scripts]
+hogs = "hogs:main"
+
+[tool.setuptools]
+py-modules = ["hogs"]
