@@ -7,6 +7,8 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
 `--clean` only offers what is reclaimable. These are guardrails: a change that weakens one breaks the tool's core promise, even if it simplifies the code.
 
 - Docker volumes, running containers and images used by any container are shown as information, never offered for deletion.
+- The one volume exception: BuildKit state volumes (`buildx_buildkit_*_state`) are build cache. They are reclaimed only through `docker buildx prune`, never removed as volumes.
+- `--docker-gc` prunes with `--max-used-space`, which keeps the most recent cache. Pruning a `docker`-driver builder works only through the current context's builder (`default` fails on Docker Desktop).
 - Locally built images (`origin == "local"`) are listed one per item, never grouped, always 🔴.
 - When `image_origin` is unsure, classify toward the higher risk.
 - A stopped container whose compose project still has something running stays out of the 🟢 group.

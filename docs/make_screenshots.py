@@ -4,6 +4,8 @@
 """
 import io
 import sys
+import time
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -41,6 +43,9 @@ docker = h.Docker(
              for n in range(6)],
     volumes=[{"name": "pgdata", "size": int(15.9 * GB), "used": True},
              {"name": "old-cache", "size": int(1.5 * GB), "used": False}],
+    builders=[{"name": "multiarch", "driver": "docker-container", "nodes": ["multiarch0"], "running": True}],
+    builder_caches=[{"builder": "multiarch", "volume": "buildx_buildkit_multiarch0_state", "size": int(15.8 * GB)}],
+    current_builder="multiarch",
 )
 
 
@@ -77,6 +82,28 @@ snapshot = h.Snapshot(total=int(494.4 * GB), free=int(18.2 * GB), docker=docker,
                       others=[("~/Development", int(15.4 * GB)), ("~/.vscode", int(6.1 * GB))], apps=apps)
 
 
+# Uma semana de histórico: Docker estável e um dia ruim de builds (+0,7 GB por hora nas últimas 26h).
+NOW = time.time()
+
+
+def grew(hours):
+    return 0.7 * min(hours, 26)
+
+
+records = [{"t": NOW - hours * 3600, "free": int((18.2 + grew(hours)) * GB),
+            "docker_raw": int((112.7 - grew(hours)) * GB)} for hours in range(168, 0, -1)]
+base_sizes = h.snapshot_sizes(snapshot)
+base_sizes.update({"Docker.raw": int(94.5 * GB), "Docker: imagens": int(28 * GB), "Docker: cache de build": int(29 * GB),
+                   "WhatsApp": int(30.1 * GB), "npm": int(3.1 * GB), "~/Development": int(14.6 * GB)})
+records.append({"t": NOW - 26 * 3600, "full": True, "free": int(36.4 * GB), "docker_raw": int(94.5 * GB),
+                "sizes": base_sizes})
+records.sort(key=lambda r: r["t"])
+
+# Configuração fictícia pro painel de prevenção (sem ler o Docker nem o hogs da sua máquina).
+FAKE_JSON = {h.DAEMON_JSON: {"builder": {"gc": {"enabled": True, "defaultKeepStorage": "20GB"}}},
+             h.DOCKER_SETTINGS: {"DiskTRIM": True}}
+
+
 def save(name, render):
     con = Console(record=True, width=118, force_terminal=True, color_system="truecolor", file=io.StringIO())
     render(con)
@@ -84,5 +111,7 @@ def save(name, render):
     print("ok", name)
 
 
-save("report.svg", lambda con: h.report(con, snapshot))
+with mock.patch.object(h, "load_config", return_value={}), \
+        mock.patch.object(h, "read_json", side_effect=lambda path: FAKE_JSON.get(path, {})):
+    save("report.svg", lambda con: h.report(con, snapshot, records))
 save("apps.svg", lambda con: (con.print(h.apps_table(apps, 7)), con.print(h.apps_footer())))

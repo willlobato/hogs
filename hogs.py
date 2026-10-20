@@ -37,7 +37,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -49,10 +49,18 @@ DATA_VOLUME = "/System/Volumes/Data" if os.path.ismount("/System/Volumes/Data") 
 DOCKER_CONTAINER = CONTAINERS / "com.docker.docker"
 DOCKER_RAW = DOCKER_CONTAINER / "Data/vms/0/data/Docker.raw"
 
-LABEL = "dev.hogs.alert"
+DOCKER_SETTINGS = GROUP_CONTAINERS / "group.com.docker/settings-store.json"
+DAEMON_JSON = HOME / ".docker/daemon.json"
+
+LABEL = "dev.hogs.agent"
+OLD_LABELS = ["dev.hogs.alert"]  # nome usado na 0.1.0
 PLIST = LIB / "LaunchAgents" / f"{LABEL}.plist"
-STATE = APP_SUPPORT / "hogs" / "state.json"
+DATA_DIR = APP_SUPPORT / "hogs"
+STATE = DATA_DIR / "state.json"
+CONFIG = DATA_DIR / "config.json"
+HISTORY = DATA_DIR / "history.jsonl"
 LOG = LIB / "Logs" / "hogs.log"
+HISTORY_DAYS = 90
 
 GB = 1e9
 MIN_SHOW = 50e6          # itens menores que isso não aparecem
@@ -198,6 +206,40 @@ class Docker:
     images: list[dict] = field(default_factory=list)
     stopped: list[dict] = field(default_factory=list)
     volumes: list[dict] = field(default_factory=list)
+    builders: list[dict] = field(default_factory=list)
+    builder_caches: list[dict] = field(default_factory=list)   # volumes de estado do BuildKit
+    current_builder: str = ""
+
+
+def list_builders() -> list[dict]:
+    r = sh(["docker", "buildx", "ls", "--format", "json"], timeout=30)
+    builders = []
+    for line in (r.stdout.splitlines() if r and r.returncode == 0 else []):
+        try:
+            b = json.loads(line)
+        except ValueError:
+            continue
+        nodes = b.get("Nodes") or []
+        builders.append({"name": b.get("Name", ""), "driver": b.get("Driver", ""),
+                         "nodes": [n.get("Name", "") for n in nodes],
+                         "running": any(n.get("Status") == "running" for n in nodes)})
+    return builders
+
+
+def current_builder() -> str:
+    r = sh(["docker", "buildx", "inspect"], timeout=30)
+    for line in (r.stdout.splitlines() if r and r.returncode == 0 else []):
+        if line.startswith("Name:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def builder_of_volume(volume: str, builders: list[dict]) -> str | None:
+    """Builders docker-container guardam o cache em `buildx_buildkit_<node>_state`."""
+    m = re.fullmatch(r"buildx_buildkit_(.+)_state", volume)
+    if not m:
+        return None
+    return next((b["name"] for b in builders if m.group(1) in b["nodes"]), m.group(1))
 
 
 def gather_docker() -> Docker:
@@ -268,12 +310,49 @@ def gather_docker() -> Docker:
             "project": project, "project_running": project in running_projects,
         })
 
+    d.builders = list_builders()
+    d.current_builder = current_builder()
     for vol in v.get("Volumes") or []:
-        d.volumes.append({
-            "name": vol.get("Name", ""), "size": parse_size(vol.get("Size", "")),
-            "used": vol.get("Links", "0") not in ("0", "N/A"),
-        })
+        name, size = vol.get("Name", ""), parse_size(vol.get("Size", ""))
+        if builder := builder_of_volume(name, d.builders):
+            d.builder_caches.append({"builder": builder, "volume": name, "size": size})
+            continue
+        d.volumes.append({"name": name, "size": size, "used": vol.get("Links", "0") not in ("0", "N/A")})
     return d
+
+
+def prune_builder(name: str, max_gb: float | None = None) -> subprocess.CompletedProcess | None:
+    """Sem limite: apaga todo o cache do builder. Com limite: mantém só os N GB mais recentes."""
+    if max_gb is None:
+        return sh(["docker", "buildx", "prune", "--builder", name, "-a", "-f"], timeout=900)
+    limit = f"{max_gb:g}gb"
+    r = sh(["docker", "buildx", "prune", "--builder", name, "-f", "--max-used-space", limit], timeout=900)
+    if r and r.returncode != 0 and "unknown flag" in r.stderr:      # buildx < 0.17
+        r = sh(["docker", "buildx", "prune", "--builder", name, "-f", "--keep-storage", limit], timeout=900)
+    return r
+
+
+def trim_builders(max_gb: float) -> list[tuple[str, int, str]]:
+    """Aplica o limite em cada builder rodando; devolve (builder, liberado, erro).
+
+    Os builders do driver `docker` dividem o cache do próprio Docker e só aceitam comandos pelo
+    contexto atual (`default` falha no Docker Desktop, que usa `desktop-linux`), então só esse é podado."""
+    ctx = sh(["docker", "context", "show"])
+    context = ctx.stdout.strip() if ctx and ctx.returncode == 0 else "default"
+    done = []
+    for b in list_builders():
+        if not b["running"] or (b["driver"] == "docker" and b["name"] != context):
+            continue
+        r = prune_builder(b["name"], max_gb)
+        if not r or r.returncode != 0:
+            done.append((b["name"], 0, (r.stderr.strip().splitlines() or ["erro"])[-1] if r else "docker não respondeu"))
+            continue
+        freed = 0
+        for line in r.stdout.splitlines():
+            if line.startswith("Total:"):
+                freed = parse_size(line.split(":", 1)[1])
+        done.append((b["name"], freed, ""))
+    return done
 
 
 def docker_clean_items(d: Docker) -> list[Item]:
@@ -284,6 +363,12 @@ def docker_clean_items(d: Docker) -> list[Item]:
         items.append(Item("docker", "Docker: cache de build", d.build_cache, SAFE,
                           lambda: sh(["docker", "builder", "prune", "-a", "-f"], timeout=900),
                           "próximo build fica mais lento"))
+
+    for bc in d.builder_caches:
+        if bc["size"] >= 1e6:
+            items.append(Item("docker", f"Docker: cache do builder {bc['builder']}", bc["size"], SAFE,
+                              lambda n=bc["builder"]: prune_builder(n),
+                              "próximo build fica mais lento"))
 
     untagged = [i for i in d.images if not i["used"] and i["origin"] == "none"]
     if untagged:
@@ -550,9 +635,118 @@ def gather(con: Console) -> Snapshot:
 
     items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
                   make_action(pd), pd.hint, make_guard(pd)) for pd in PATH_DEFS]
-    others = sorted(((short(p), sizes[p]) for p in candidates if sizes.get(p, 0) >= GB), key=lambda x: -x[1])
+    # guarda a partir de 100 MB pro histórico; o relatório só mostra os de 1 GB+
+    others = sorted(((short(p), sizes[p]) for p in candidates if sizes.get(p, 0) >= 100e6), key=lambda x: -x[1])
     usage = shutil.disk_usage(DATA_VOLUME)
     return Snapshot(usage.total, usage.free, docker, items, others, apps)
+
+
+# ---------------------------------------------------------------- histórico
+#
+# Duas fontes gravam em history.jsonl: o agente (de hora em hora, só espaço livre e Docker.raw,
+# porque precisa ser instantâneo) e cada relatório (tudo, com "full": true).
+
+def history_load(days: float = HISTORY_DAYS) -> list[dict]:
+    cutoff = time.time() - days * 86400
+    try:
+        lines = HISTORY.read_text().splitlines()
+    except OSError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("t", 0) >= cutoff:
+            records.append(rec)
+    return sorted(records, key=lambda r: r["t"])
+
+
+def history_append(rec: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with HISTORY.open("a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        with HISTORY.open() as f:
+            first = json.loads(f.readline() or "{}")
+    except (OSError, ValueError):
+        first = {}
+    if first.get("t", time.time()) < time.time() - HISTORY_DAYS * 86400:
+        HISTORY.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in history_load()))
+
+
+def light_record() -> dict:
+    rec = {"t": time.time(), "free": shutil.disk_usage(DATA_VOLUME).free}
+    try:
+        rec["docker_raw"] = DOCKER_RAW.stat().st_blocks * 512
+    except OSError:
+        pass
+    return rec
+
+
+def snapshot_sizes(s: Snapshot) -> dict[str, int]:
+    d = s.docker
+    sizes = {"Docker.raw": d.raw_real}
+    if d.running:
+        sizes["Docker: imagens"] = sum(i["size"] for i in d.images)
+        sizes["Docker: cache de build"] = d.build_cache + sum(b["size"] for b in d.builder_caches)
+        sizes["Docker: volumes"] = sum(v["size"] for v in d.volumes)
+    sizes.update({i.label: i.size for i in s.items})
+    sizes.update(dict(s.others))
+    return {k: v for k, v in sizes.items() if v >= 10e6}
+
+
+def record_snapshot(s: Snapshot) -> None:
+    history_append({"t": time.time(), "free": s.free, "docker_raw": s.docker.raw_real,
+                    "full": True, "sizes": snapshot_sizes(s)})
+
+
+def value_at(records: list[dict], key: str, t: float) -> tuple[float, int] | None:
+    """Último registro com `key` até o instante t; se não houver, o mais antigo."""
+    found = [r for r in records if key in r]
+    if not found:
+        return None
+    before = [r for r in found if r["t"] <= t]
+    r = before[-1] if before else found[0]
+    return r["t"], r[key]
+
+
+def baseline(records: list[dict], now: float) -> dict | None:
+    """Relatório completo pra comparar: o mais recente com pelo menos 20h; senão o mais antigo com 1h+."""
+    full = [r for r in records if r.get("full")]
+    day_old = [r for r in full if r["t"] <= now - 20 * 3600]
+    if day_old:
+        return day_old[-1]
+    hour_old = [r for r in full if r["t"] <= now - 3600]
+    return hour_old[0] if hour_old else None
+
+
+def growth(current: dict[str, int], base: dict[str, int], min_delta: float = 100e6) -> list[tuple[str, int]]:
+    deltas = [(k, v - base.get(k, 0)) for k, v in current.items()]
+    return sorted((d for d in deltas if d[1] >= min_delta), key=lambda d: -d[1])
+
+
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(records: list[dict], key: str, now: float, days: int = 7, buckets: int = 28) -> str:
+    start, width = now - days * 86400, days * 86400 / buckets
+    vals: list[int | None] = [None] * buckets
+    for r in records:
+        if key in r and r["t"] >= start:
+            vals[min(buckets - 1, int((r["t"] - start) / width))] = r[key]
+    known = [v for v in vals if v is not None]
+    if len(known) < 2:
+        return ""
+    lo, hi = min(known), max(known)
+    chars = [" " if v is None else SPARK[round((v - lo) / (hi - lo) * (len(SPARK) - 1)) if hi > lo else 0]
+             for v in vals]
+    return "".join(chars).lstrip()
+
+
+def fmt_delta(n: float) -> str:
+    return ("+" if n >= 0 else "−") + fmt(abs(n))
 
 
 # ---------------------------------------------------------------- relatório
@@ -609,6 +803,8 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
         (f"Imagens sem uso, construídas aqui ({len(local)})", local_size, LOSS, local_names),
         (f"Imagens sem tag ({len(none)})", none_size, SAFE, "versões antigas órfãs"),
         ("Cache de build", d.build_cache, SAFE, "próximo build fica mais lento"),
+        *[(f"Cache do builder {bc['builder']}", bc["size"], SAFE, "volume do BuildKit; o daemon.json não limita")
+          for bc in d.builder_caches],
         (f"Containers parados ({len(d.stopped)})", sum(c["size"] for c in d.stopped), SAFE, ""),
         (f"Volumes sem uso ({len(vol_free)})", sum(v["size"] for v in vol_free), INFO, "dados de bancos: revise à mão"),
         (f"Volumes em uso ({len(vol_used)})", sum(v["size"] for v in vol_used), INFO, "nunca mexo"),
@@ -636,7 +832,30 @@ def unused_images_table(d: Docker) -> Table | None:
     return t
 
 
-def header(s: Snapshot) -> Panel:
+def trend(s: Snapshot, records: list[dict], now: float) -> Text | None:
+    """'últimas 24h: livre −3 GB · Docker +17 GB' e as minicurvas da semana."""
+    past = value_at(records, "free", now - 86400)
+    if not past or now - past[0] < 3600:
+        return None
+    when = "últimas 24h" if now - past[0] >= 20 * 3600 else f"desde {ago(datetime.fromtimestamp(past[0], timezone.utc))}"
+    free_delta = s.free - past[1]
+    t = Text.assemble(("📈 ", ""), (f"{when}: ", "bold"), "livre ",
+                      (fmt_delta(free_delta), "red" if free_delta < -GB else "green" if free_delta > GB else ""))
+    raw_past = value_at(records, "docker_raw", now - 86400)
+    if raw_past and s.docker.raw_real:
+        raw_delta = s.docker.raw_real - raw_past[1]
+        t.append("  ·  Docker ").append(fmt_delta(raw_delta), style="red" if raw_delta > GB else "")
+    points = records + [{"t": now, "free": s.free, "docker_raw": s.docker.raw_real}]
+    curves = [(label, sparkline(points, key, now, buckets=21)) for label, key in (("livre", "free"), ("Docker", "docker_raw"))]
+    if any(c for _, c in curves):
+        t.append("\n   7 dias   ", style="dim")
+        for label, curve in curves:
+            if curve:
+                t.append(f"{label} ", style="dim").append(curve, style="cyan").append("   ")
+    return t
+
+
+def header(s: Snapshot, records: list[dict] | None = None) -> Panel:
     used = s.total - s.free
     dev = sum(i.size for i in s.items if i.cat == "dev")
     apps = sum(i.size for i in s.items if i.cat == "apps")
@@ -659,17 +878,89 @@ def header(s: Snapshot) -> Panel:
     free_color = "red" if s.free < 30 * GB else "yellow" if s.free < 60 * GB else "green"
     line = Text.assemble(("Macintosh HD", "bold"), f"  ·  {fmt(used)} de {fmt(s.total)} usados  ·  ",
                          (f"{fmt(s.free)} livres", f"bold {free_color}"))
-    return Panel(Group(line, Text(), bar, legend), title="[bold]🐷 hogs[/]  [dim]quem está comendo seu disco[/]",
+    body = [line, Text(), bar, legend]
+    if records and (t := trend(s, records, time.time())) is not None:
+        body += [Text(), t]
+    return Panel(Group(*body), title="[bold]🐷 hogs[/]  [dim]quem está comendo seu disco[/]",
                  title_align="left", border_style="grey50", padding=(1, 2))
 
 
-def report(con: Console, s: Snapshot) -> None:
-    con.print(header(s))
-    for t in (category_table("🐳 Docker", docker_rows(s.docker)), unused_images_table(s.docker),
+def growth_table(s: Snapshot, records: list[dict]) -> Table | Text:
+    now = time.time()
+    base = baseline(records, now)
+    if base is None:
+        return Text("📈 O histórico começou agora: a partir de amanhã o hogs mostra o que mais cresceu. "
+                    "Com o agente ligado (hogs --alert ou --docker-gc), ele também registra de hora em hora.",
+                    style="dim")
+    rows = growth(snapshot_sizes(s), base.get("sizes", {}))[:8]
+    since = ago(datetime.fromtimestamp(base["t"], timezone.utc))
+    if not rows:
+        return Text(f"📈 Nada cresceu mais de 100 MB desde o último relatório ({since}).", style="dim")
+    top = rows[0][1]
+    t = Table(title=f"📈 O que mais cresceu ({since})", title_justify="left", title_style="bold",
+              box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
+    t.add_column("Item", ratio=3, no_wrap=True, overflow="ellipsis")
+    t.add_column("Cresceu", justify="right", no_wrap=True)
+    t.add_column("", no_wrap=True, width=14)
+    t.add_column("Agora", justify="right", style="dim", no_wrap=True)
+    current = snapshot_sizes(s)
+    for label, delta in rows:
+        color = "red" if delta >= GB else "yellow"
+        t.add_row(label, Text(fmt_delta(delta), style=f"bold {color}"), mini_bar(delta, top, color), fmt(current[label]))
+    return t
+
+
+def prevention_panel(s: Snapshot) -> Panel | None:
+    d = s.docker
+    if not d.running and not d.raw_real:
+        return None
+    cfg = load_config()
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(no_wrap=True)
+    grid.add_column()
+
+    def row(ok: bool | None, text: str, hint: str = "") -> None:
+        icon = Text("✔", style="green") if ok else Text("ℹ", style="blue") if ok is None else Text("!", style="bold yellow")
+        grid.add_row(icon, Text.assemble(text, (f"  {hint}" if hint else "", "dim")))
+
+    gc_gb = cfg.get("builder_cache_gb")
+    if gc_gb:
+        row(True, f"Limite do cache de build: no máximo {gc_gb:g} GB por builder", "o hogs confere a cada 1h")
+    else:
+        row(False, "Limite do cache de build: desligado", "ligue com: hogs --docker-gc 20")
+
+    daemon_gc = read_json(DAEMON_JSON).get("builder", {}).get("gc", {})
+    builder = next((b for b in d.builders if b["name"] == d.current_builder), None)
+    if daemon_gc.get("enabled"):
+        text = f"Limpeza automática do Docker (daemon.json): mantém {daemon_gc.get('defaultKeepStorage', '?')}"
+        if builder and builder["driver"] != "docker":
+            ignores = f"o builder ativo ({builder['name']}) roda num container e ignora essa regra"
+            row(bool(gc_gb), text, f"{ignores}; o --docker-gc cobre ele" if gc_gb else f"mas {ignores}")
+        else:
+            row(True, text)
+    else:
+        row(bool(gc_gb), "Limpeza automática do Docker (daemon.json): desligada",
+            "o --docker-gc cobre isso" if gc_gb else "Docker › Settings › Docker Engine")
+
+    if read_json(DOCKER_SETTINGS).get("DiskTRIM") is False:
+        row(False, "TRIM desligado: o espaço apagado no Docker não volta pro macOS",
+            "Docker › Settings › Resources › Advanced")
+    if d.raw_limit:
+        row(None, f"Teto do disco do Docker: {fmt(d.raw_limit)} ({d.raw_limit / s.total:.0%} do seu disco)",
+            "é só um limite; reduzir apaga todas as imagens, containers e volumes")
+    return Panel(grid, title="[bold]🛡  Prevenção[/]", title_align="left", border_style="grey50", padding=(0, 2))
+
+
+def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None:
+    records = records or []
+    con.print(header(s, records))
+    con.print(growth_table(s, records))
+    con.print()
+    for t in (category_table("🐳 Docker", docker_rows(s.docker)), prevention_panel(s), unused_images_table(s.docker),
               category_table("🧰 Caches de dev", [(i.label, i.size, i.risk, i.hint) for i in s.items if i.cat == "dev"]),
               category_table("📦 Apps e dados", [(i.label, i.size, i.risk, i.hint) for i in s.items if i.cat == "apps"]),
               category_table("🔎 Outros grandes (fora da lista acima)",
-                             [(label, size, INFO, "") for label, size in s.others[:12]])):
+                             [(label, size, INFO, "") for label, size in s.others if size >= GB][:12])):
         if t is not None:
             con.print(t)
             con.print()
@@ -764,6 +1055,106 @@ def clean(con: Console, s: Snapshot) -> None:
     con.print(Panel(msg, border_style="green", padding=(0, 2)))
 
 
+# ---------------------------------------------------------------- configuração e agente
+
+def read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_config() -> dict:
+    return read_json(CONFIG)
+
+
+def save_config(cfg: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+def log(msg: str) -> None:
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", flush=True)
+
+
+def ensure_agent(cfg: dict) -> str | None:
+    """Instala o agente do launchd se algum recurso estiver ligado; senão remove. Devolve o erro, se houver."""
+    uid = os.getuid()
+    for label in [LABEL, *OLD_LABELS]:
+        sh(["launchctl", "bootout", f"gui/{uid}/{label}"])
+    for label in OLD_LABELS:
+        (PLIST.parent / f"{label}.plist").unlink(missing_ok=True)
+    if not (cfg.get("alert_gb") or cfg.get("builder_cache_gb")):
+        PLIST.unlink(missing_ok=True)
+        return None
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "--agent"],
+        "StartInterval": 3600,
+        "RunAtLoad": True,
+        "EnvironmentVariables": {"PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
+        "StandardOutPath": str(LOG),
+        "StandardErrorPath": str(LOG),
+    }
+    PLIST.parent.mkdir(parents=True, exist_ok=True)
+    PLIST.write_bytes(plistlib.dumps(plist))
+    r = sh(["launchctl", "bootstrap", f"gui/{uid}", str(PLIST)])
+    if not r or r.returncode != 0:
+        return r.stderr.strip() if r else "launchctl não encontrado"
+    return None
+
+
+def agent_run() -> None:
+    """Roda de hora em hora pelo launchd: grava o histórico, poda o cache de build e avisa se o disco encher."""
+    cfg = load_config()
+    history_append(light_record())
+    if cfg.get("builder_cache_gb"):
+        for name, freed, err in trim_builders(cfg["builder_cache_gb"]):
+            if err:
+                log(f"builder {name}: falhou: {err}")
+            elif freed:
+                log(f"builder {name}: liberou {fmt(freed)}")
+    if cfg.get("alert_gb"):
+        check(cfg["alert_gb"])
+
+
+def agent_status() -> None:
+    cfg = load_config()
+    r = sh(["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"])
+    loaded = bool(r and r.returncode == 0)
+    if cfg.get("alert_gb") or cfg.get("builder_cache_gb"):
+        print("Agente " + ("ativo, roda a cada 1h." if loaded else "configurado mas não carregado: rode o comando de novo."))
+    else:
+        print("Agente desligado.")
+    alert_gb, gc_gb = cfg.get("alert_gb"), cfg.get("builder_cache_gb")
+    print(f"  Aviso de disco cheio:     {f'abaixo de {alert_gb:g} GB livres' if alert_gb else 'desligado (hogs --alert 30)'}")
+    print(f"  Limite do cache de build: {f'{gc_gb:g} GB por builder' if gc_gb else 'desligado (hogs --docker-gc 20)'}")
+    records = history_load()
+    if records:
+        print(f"  Histórico: {len(records)} registros desde {datetime.fromtimestamp(records[0]['t']):%d/%m/%Y %H:%M}")
+    else:
+        print("  Histórico: vazio")
+
+
+def parse_gb(arg: str, usage: str) -> float:
+    try:
+        value = float(arg.replace(",", "."))
+    except ValueError:
+        sys.exit(usage)
+    if value <= 0:
+        sys.exit(usage)
+    return value
+
+
+def set_feature(key: str, value: float | None) -> None:
+    cfg = load_config()
+    cfg[key] = value
+    save_config(cfg)
+    if err := ensure_agent(cfg):
+        sys.exit(f"Não consegui ativar o agente: {err}")
+
+
 # ---------------------------------------------------------------- alerta
 
 def notify(title: str, body: str, sound: str | None = None) -> None:
@@ -782,9 +1173,13 @@ def alert_message(free: int) -> tuple[str, str]:
         reclaim = sum(parse_size(json.loads(line).get("Reclaimable", "")) for line in r.stdout.splitlines())
         try:
             raw = DOCKER_RAW.stat().st_blocks * 512
-            body = f"Docker ocupa {fmt(raw)} (~{fmt(reclaim)} liberáveis). "
         except OSError:
-            pass
+            raw = 0
+        if raw:
+            body = f"Docker ocupa {fmt(raw)} (~{fmt(reclaim)} liberáveis). "
+            past = value_at(history_load(2), "docker_raw", time.time() - 86400)
+            if past and raw - past[1] > 2 * GB:
+                body += f"Cresceu {fmt(raw - past[1])} em 24h. "
     return f"💾 Disco quase cheio: {fmt(free)} livres", body + "Rode hogs no terminal."
 
 
@@ -793,61 +1188,54 @@ def check(threshold_gb: float) -> None:
     if free >= threshold_gb * GB:
         return
     critical = free < 10 * GB
-    try:
-        state = json.loads(STATE.read_text())
-    except (OSError, ValueError):
-        state = {}
+    state = read_json(STATE)
     if time.time() - state.get("last", 0) < (3600 if critical else 6 * 3600):
         return
     title, body = alert_message(free)
     notify(title, body, "Basso" if critical else None)
-    STATE.parent.mkdir(parents=True, exist_ok=True)
+    log(f"aviso enviado: {title}")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps({"last": time.time()}))
 
 
 def alert(arg: str) -> None:
-    uid = os.getuid()
+    usage = "Use: hogs --alert <GB> | off | test"
     if arg == "status":
-        if not PLIST.exists():
-            print("Aviso desligado. Ligue com: hogs --alert 30")
-            return
-        args = plistlib.loads(PLIST.read_bytes())["ProgramArguments"]
-        threshold = args[args.index("--threshold") + 1]
-        r = sh(["launchctl", "print", f"gui/{uid}/{LABEL}"])
-        state = "ativo" if r and r.returncode == 0 else "instalado mas não carregado (rode hogs --alert de novo)"
-        print(f"Aviso {state}: notifica quando o espaço livre cair abaixo de {threshold} GB (checa a cada 1h).")
+        agent_status()
     elif arg == "off":
-        sh(["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
-        PLIST.unlink(missing_ok=True)
-        print("Aviso desligado.")
+        set_feature("alert_gb", None)
+        print("Aviso de disco desligado.")
     elif arg == "test":
-        free = shutil.disk_usage(DATA_VOLUME).free
-        notify(*alert_message(free))
+        notify(*alert_message(shutil.disk_usage(DATA_VOLUME).free))
         print("Notificação de teste enviada. Se não apareceu, libere notificações do "
               "'Editor de Scripts' em Ajustes do Sistema › Notificações.")
     else:
-        try:
-            threshold = float(arg.replace(",", "."))
-        except ValueError:
-            sys.exit("Use: hogs --alert <GB> | off | test")
-        plist = {
-            "Label": LABEL,
-            "ProgramArguments": [sys.executable, str(Path(__file__).resolve()),
-                                 "--check", "--threshold", f"{threshold:g}"],
-            "StartInterval": 3600,
-            "RunAtLoad": True,
-            "EnvironmentVariables": {"PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
-            "StandardOutPath": str(LOG),
-            "StandardErrorPath": str(LOG),
-        }
-        PLIST.parent.mkdir(parents=True, exist_ok=True)
-        sh(["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
-        PLIST.write_bytes(plistlib.dumps(plist))
-        r = sh(["launchctl", "bootstrap", f"gui/{uid}", str(PLIST)])
-        if not r or r.returncode != 0:
-            sys.exit(f"Não consegui ativar: {r.stderr.strip() if r else 'launchctl não encontrado'}")
-        print(f"Aviso ativado: notifica quando o espaço livre cair abaixo de {threshold:g} GB (checa a cada 1h).\n"
-              f"Desligar: hogs --alert off")
+        gb = parse_gb(arg, usage)
+        set_feature("alert_gb", gb)
+        print(f"Aviso ativado: notifica quando o espaço livre cair abaixo de {gb:g} GB (checa a cada 1h).\n"
+              "Desligar: hogs --alert off")
+
+
+def docker_gc(arg: str) -> None:
+    usage = "Use: hogs --docker-gc <GB> | off"
+    if arg == "status":
+        agent_status()
+        return
+    if arg == "off":
+        set_feature("builder_cache_gb", None)
+        print("Limite do cache de build desligado.")
+        return
+    gb = parse_gb(arg, usage)
+    print(f"Aplicando agora: cada builder fica com no máximo {gb:g} GB de cache…")
+    done = trim_builders(gb)
+    if not done:
+        print("  Docker não está rodando; o limite vale a partir da próxima checagem.")
+    for name, freed, err in done:
+        status = f"falhou: {err}" if err else f"liberou {fmt(freed)}" if freed else "já estava dentro do limite"
+        print(f"  {name}: {status}")
+    set_feature("builder_cache_gb", gb)
+    print(f"Limite ativado: o hogs confere a cada 1h e apaga o cache mais antigo acima de {gb:g} GB.\n"
+          "Desligar: hogs --docker-gc off")
 
 
 # ---------------------------------------------------------------- main
@@ -867,14 +1255,17 @@ def run() -> None:
                    help="aviso automático quando o espaço livre cair abaixo de GB")
     p.add_argument("--apps", nargs="?", const=20, type=int, metavar="N",
                    help="só os N apps menos usados (padrão 20)")
-    p.add_argument("--check", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--threshold", type=float, default=30, help=argparse.SUPPRESS)
+    p.add_argument("--docker-gc", nargs="?", const="status", metavar="GB|off",
+                   help="mantém o cache de build de cada builder abaixo de GB (confere a cada 1h)")
+    p.add_argument("--agent", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
 
-    if args.check:
-        return check(args.threshold)
+    if args.agent:
+        return agent_run()
     if args.alert:
         return alert(args.alert)
+    if args.docker_gc:
+        return docker_gc(args.docker_gc)
     if not HAS_RICH:
         sys.exit("hogs precisa da biblioteca rich:  pip install rich")
 
@@ -886,10 +1277,12 @@ def run() -> None:
         con.print(apps_footer())
         return
     snapshot = gather(con)
+    records = history_load()
+    record_snapshot(snapshot)
     if args.clean:
         clean(con, snapshot)
     else:
-        report(con, snapshot)
+        report(con, snapshot, records)
 
 
 if __name__ == "__main__":
