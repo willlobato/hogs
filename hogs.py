@@ -1974,12 +1974,22 @@ def main() -> None:
 
 
 def run() -> None:
-    p = argparse.ArgumentParser(prog="hogs", description="Mostra quem está comendo seu disco e ajuda a limpar.")
+    p = argparse.ArgumentParser(
+        prog="hogs", description="Mostra quem está comendo seu disco e ajuda a limpar.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="exemplos:\n"
+               "  hogs                          relatório do disco\n"
+               "  hogs --clean                  escolhe o que apagar do relatório\n"
+               "  hogs --worktrees ~/Projetos   worktrees Git: quais dá pra apagar e por quê\n"
+               "  hogs --worktrees ~/Projetos --clean\n"
+               "                                apaga os worktrees 🟢 (todos ou por número)")
     p.add_argument("--version", action="version", version=f"hogs {__version__}")
-    p.add_argument("--clean", action="store_true", help="escolhe o que apagar")
-    p.add_argument("--worktrees", type=Path, metavar="PASTA", help="analisa worktrees Git dentro desta pasta")
+    p.add_argument("--clean", action="store_true",
+                   help="escolhe o que apagar; com --worktrees, só os worktrees seguros (🟢)")
+    p.add_argument("--worktrees", type=Path, metavar="PASTA",
+                   help="acha os worktrees Git em PASTA e diz quais já estão na main e podem ser apagados")
     p.add_argument("--worktree-days", type=int, default=0, metavar="DIAS",
-                   help="exige DIAS sem mudança para um worktree ser seguro (padrão: sem mínimo)")
+                   help="com --worktrees: também exige DIAS sem mudança (padrão: sem mínimo)")
     p.add_argument("--alert", nargs="?", const="status", metavar="GB|off|test",
                    help="aviso automático quando o espaço livre cair abaixo de GB")
     p.add_argument("--apps", nargs="?", const=20, type=int, metavar="N",
