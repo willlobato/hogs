@@ -1,4 +1,8 @@
+import io
 import sys
+import json
+import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -188,6 +192,357 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(hogs.fmt_delta(17 * 10**9), "+17,0 GB")
         self.assertEqual(hogs.fmt_delta(-3_200_000_000), "−3,2 GB")
 
+
+class WorktreeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.git(self.repo, "init", "-b", "main")
+        self.git(self.repo, "config", "user.name", "Test")
+        self.git(self.repo, "config", "user.email", "test@example.invalid")
+        self.git(self.repo, "config", "commit.gpgsign", "false")
+        (self.repo / "file.txt").write_text("initial\n")
+        (self.repo / ".gitignore").write_text(".env\n")
+        self.git(self.repo, "add", ".")
+        self.git(self.repo, "commit", "-m", "initial")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.path = self.root / "feature with spaces"
+        self.git(self.repo, "worktree", "add", "-b", "feature", str(self.path))
+        self.w = hogs.Worktree(self.path, self.repo)
+        self.age()
+
+    def git(self, path, *args):
+        return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def age(self):
+        old = time.time() - 90 * 86400
+        gd = Path(self.git(self.path, "rev-parse", "--absolute-git-dir"))
+        for base in (self.path, gd):
+            for root, dirs, files in os.walk(base):
+                for name in dirs + files:
+                    os.utime(Path(root) / name, (old, old))
+            os.utime(base, (old, old))
+
+    def inspect(self, usage=None, agents=None, days=30):
+        return hogs.inspect_worktree(self.w, days, usage or ([], "", []), agents or hogs.Agents())
+
+    def quiet(self):
+        stack = mock.patch.object(hogs, "worktree_usage", return_value=([], "", []))
+        stack2 = mock.patch.object(hogs, "agent_activity", return_value=hogs.Agents())
+        stack.start(); stack2.start()
+        self.addCleanup(stack.stop); self.addCleanup(stack2.stop)
+
+    def test_old_merged_clean_is_eligible_and_removal_preserves_branch(self):
+        row = self.inspect()
+        self.assertTrue(row.eligible, row.reason)
+        self.quiet()
+        hogs.remove_worktree(row, 30)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.git(self.repo, "rev-parse", "feature"), row.head)
+
+    def test_modified_untracked_and_ignored_files_are_preserved(self):
+        for filename in ("file.txt", "untracked.txt", ".env"):
+            with self.subTest(filename=filename):
+                p = self.path / filename
+                original = p.read_text() if p.exists() else None
+                p.write_text("keep me\n")
+                self.assertFalse(self.inspect().eligible)
+                if original is None:
+                    p.unlink()
+                else:
+                    p.write_text(original)
+                self.age()
+
+    def test_unmerged_commit_is_preserved(self):
+        (self.path / "file.txt").write_text("new work\n")
+        self.git(self.path, "commit", "-am", "work")
+        self.age()
+        self.assertIn("merge não comprovado", self.inspect().reason)
+
+    def test_recent_locked_and_main_are_preserved(self):
+        os.utime(self.path / "file.txt", None)
+        self.assertFalse(self.inspect().eligible)
+        self.age()
+        self.git(self.repo, "worktree", "lock", str(self.path))
+        self.assertFalse(self.inspect().eligible)
+        self.assertFalse(hogs.inspect_worktree(hogs.Worktree(self.repo, self.repo), 30, ([], "", [])).eligible)
+
+    def test_running_things_and_unknown_checks_are_preserved(self):
+        for usage, verdict in ((([(self.path / "file.txt", "vim (pid 1)")], "", []), "depois"),
+                               (([], "failed", []), "manter"),
+                               (([], "", [(self.root, "container db")]), "depois"),
+                               (([], "", [(self.path / "file.txt", "container web")]), "depois")):
+            row = self.inspect(usage)
+            self.assertFalse(row.eligible)
+            self.assertEqual(row.verdict, verdict)
+        self.assertEqual(self.inspect(([(self.path / "file.txt", "vim (pid 1)")], "", [])).users, ["vim (pid 1)"])
+        self.assertTrue(self.inspect(([(self.root, "zsh (pid 2)")], "", [])).eligible)
+        many = ([(self.path / "a", "node (pid 1)"), (self.path / "b", "node (pid 2)"),
+                 (self.path, "Claude Code apps-3")], "", [])
+        row = self.inspect(many)
+        self.assertEqual(row.users, ["Claude Code apps-3 (aberta dentro)", "node ×2"])
+        self.assertEqual(row.sessions, ["apps-3"])
+        self.assertEqual(row.verdict, "depois", "sessão aberta DENTRO da pasta perderia o cwd")
+        self.assertIn("aberta dentro da pasta", row.reason)
+
+    def test_merged_recent_with_open_session_is_safe_by_default(self):
+        os.utime(self.path / "file.txt", None)
+        cited = hogs.Agents(mentions={self.path: {"Claude Code apps-9d"}})
+        row = self.inspect(agents=cited, days=0)
+        self.assertTrue(row.eligible, row.reason)
+        self.assertEqual(row.sessions, ["apps-9d"])
+        self.assertEqual(row.users, ["Claude Code apps-9d"])
+        self.assertTrue(row.reason.endswith("sessão apps-9d"))
+        row = self.inspect(agents=cited, days=7)
+        self.assertEqual(row.verdict, "depois", "--worktree-days continua valendo quando pedido")
+        self.assertTrue(row.reason.startswith("mexido"))
+        (self.path / "file.txt").write_text("rascunho\n")
+        row = self.inspect(agents=cited, days=0)
+        self.assertEqual(row.verdict, "manter")
+        self.assertEqual(row.users, ["Claude Code apps-9d"], "quem usa aparece mesmo quando é ⚪")
+
+    def test_build_output_is_not_activity(self):
+        (self.repo / ".gitignore").write_text(".env\nnode_modules/\n")
+        self.git(self.repo, "commit", "-am", "ignore")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/main", "main")
+        self.git(self.path, "merge", "--ff-only", "main")
+        self.age()
+        (self.path / "node_modules").mkdir()
+        (self.path / "node_modules" / "pkg").write_text("x")
+        row = self.inspect()
+        self.assertTrue(row.eligible, row.reason)
+
+    def test_recheck_blocks_changes_after_selection(self):
+        row = self.inspect()
+        (self.path / "new.txt").write_text("unsaved work")
+        self.quiet()
+        with self.assertRaises(RuntimeError):
+            hogs.remove_worktree(row, 30)
+        self.assertTrue(self.path.exists())
+
+    def test_discovery_deduplicates_and_respects_scope(self):
+        self.quiet()
+        rows, warnings = hogs.gather_worktrees(self.root, 30)
+        self.assertEqual([r.path for r in rows], [self.path])
+        self.assertEqual(warnings, [])
+        self.assertEqual(hogs.gather_worktrees(self.repo, 30)[0], [])
+
+    def test_missing_default_branch_is_inconclusive(self):
+        self.git(self.repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        self.assertTrue(self.inspect().eligible, "origin/main local serve de principal")
+        self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/main")
+        self.assertIn("desconhecida", self.inspect().reason)
+
+    def merge_into_main(self, squash):
+        (self.path / "file.txt").write_text("feature work\n")
+        self.git(self.path, "commit", "-am", "work")
+        (self.path / "more.txt").write_text("more\n")
+        self.git(self.path, "add", "more.txt")
+        self.git(self.path, "commit", "-m", "more work")
+        self.git(self.repo, "commit", "--allow-empty", "-m", "outro trabalho na main")
+        if squash:
+            self.git(self.repo, "merge", "--squash", "feature")
+            self.git(self.repo, "commit", "-m", "squash feature")
+        else:
+            self.git(self.repo, "cherry-pick", "main..feature")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/main", "main")
+        self.age()
+
+    def test_squash_merge_is_recognized(self):
+        self.merge_into_main(squash=True)
+        row = self.inspect()
+        self.assertTrue(row.eligible, row.reason)
+        self.assertTrue(row.reason.startswith("squash em origin/main"))
+
+    def test_rebase_merge_is_recognized(self):
+        self.merge_into_main(squash=False)
+        row = self.inspect()
+        self.assertTrue(row.eligible, row.reason)
+        self.assertTrue(row.reason.startswith("rebase em origin/main"))
+
+    def test_squash_missing_part_of_branch_is_preserved(self):
+        (self.path / "file.txt").write_text("feature work\n")
+        self.git(self.path, "commit", "-am", "work")
+        self.git(self.repo, "merge", "--squash", "feature")
+        self.git(self.repo, "commit", "-m", "squash feature")
+        (self.path / "later.txt").write_text("commit depois do squash\n")
+        self.git(self.path, "add", "later.txt")
+        self.git(self.path, "commit", "-m", "later")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/main", "main")
+        self.age()
+        self.assertIn("merge não comprovado", self.inspect().reason)
+
+    def test_regenerable_ignored_dirs_allow_removal(self):
+        (self.repo / ".gitignore").write_text(".env\nnode_modules/\ntarget/\nnotes/\n")
+        self.git(self.repo, "commit", "-am", "ignore")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/main", "main")
+        self.git(self.path, "merge", "--ff-only", "main")
+        for d in ("node_modules/pkg", "web/node_modules/x", "target/classes"):
+            (self.path / d).mkdir(parents=True)
+            (self.path / d / "f").write_text("x")
+        self.age()
+        row = self.inspect()
+        self.assertTrue(row.eligible, row.reason)
+        (self.path / "notes").mkdir()
+        (self.path / "notes" / "plano.md").write_text("plano de outra sessão")
+        self.age()
+        self.assertIn("notes/", self.inspect().reason)
+        (self.path / "notes" / "plano.md").unlink()
+        (self.path / "notes").rmdir()
+        self.age()
+        self.quiet()
+        hogs.remove_worktree(self.inspect(), 30)
+        self.assertFalse(self.path.exists())
+
+    def test_agent_sessions_are_information_not_blockers(self):
+        claude = hogs.claude_key(self.path)
+        for folders in ([("Claude Code", claude)], [("Claude Code", claude + "--claude-worktrees-x")],
+                        [("Codex", str(self.path / "sub"))]):
+            row = self.inspect(agents=hogs.Agents(folders=folders))
+            self.assertTrue(row.eligible, row.reason)
+            self.assertIn("aberto na pasta", row.users[0])
+        parent = [("Claude Code", hogs.claude_key(self.root)), ("Codex", str(self.root))]
+        self.assertEqual(self.inspect(agents=hogs.Agents(folders=parent)).users, [])
+        cited = hogs.Agents(mentions={self.path: {"Claude Code a", "Claude Code b", "Codex"}})
+        row = self.inspect(agents=cited)
+        self.assertTrue(row.eligible)
+        self.assertEqual(row.users, ["Claude Code a", "Claude Code b", "Codex (últimos 7 d)"])
+        row = self.inspect(agents=hogs.Agents(error="falhou"))
+        self.assertTrue(row.eligible)
+        self.assertIn("sessões: falhou", row.users)
+
+    def fake_home(self):
+        home = self.root / "home"
+        (home / ".claude" / "sessions").mkdir(parents=True)
+        (home / ".claude" / "projects").mkdir(parents=True)
+        patcher = mock.patch.object(hogs, "HOME", home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return home
+
+    def live_session(self, home, text, sid="s1", pid=None, started=0):
+        proj = home / ".claude" / "projects" / "-apps"
+        proj.mkdir(exist_ok=True)
+        (proj / f"{sid}.jsonl").write_text(text)
+        (home / ".claude" / "sessions" / f"{sid}.json").write_text(
+            '{"pid": %d, "sessionId": "%s", "cwd": "/apps", "startedAt": %d, "name": "apps-1"}'
+            % (pid or os.getpid(), sid, started))
+        os.utime(proj / f"{sid}.jsonl", (0, 0))  # transcrição antiga não importa: o processo está vivo
+        return proj
+
+    def test_live_claude_session_citing_worktree_is_named(self):
+        home = self.fake_home()
+        other = self.root / "feature with spaces-2"
+        self.live_session(home, json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "input": {"file_path": f"{self.path}/file.txt"}},
+            {"type": "text", "text": f"veja {other}."}]}}) + "\n")
+        agents = hogs.agent_activity(30, [self.path, other])
+        self.assertEqual(agents.error, "")
+        self.assertEqual(agents.mentions, {p: {"Claude Code apps-1"} for p in (self.path, other)})
+        row = self.inspect(agents=agents)
+        self.assertTrue(row.eligible)
+        self.assertEqual(row.sessions, ["apps-1"])
+
+    def test_live_claude_subagents_count_but_other_sessions_in_same_folder_do_not(self):
+        home = self.fake_home()
+        proj = self.live_session(home, "{}\n")
+        (proj / "outra-sessao.jsonl").write_text('"cd %s && ls"\n' % self.path)
+        self.assertEqual(hogs.agent_activity(30, [self.path]).mentions, {})
+        (proj / "s1" / "subagents").mkdir(parents=True)
+        (proj / "s1" / "subagents" / "a.jsonl").write_text('"cd %s && ls"\n' % self.path)
+        self.assertIn(self.path, hogs.agent_activity(30, [self.path]).mentions)
+
+    def test_only_work_counts_not_tool_output(self):
+        home = self.fake_home()
+        listing = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": f"{self.path}  abc123 [feature]"}]}}
+        context = {"type": "attachment", "attachment": {"content": str(self.path)}}
+        self.live_session(home, json.dumps(listing) + "\n" + json.dumps(context) + "\n")
+        self.assertEqual(hogs.agent_activity(30, [self.path]).mentions, {})
+        typed = {"type": "user", "message": {"content": f"trabalhe em {self.path}"}}
+        self.live_session(home, json.dumps(listing) + "\n" + json.dumps(typed) + "\n")
+        self.assertIn(self.path, hogs.agent_activity(30, [self.path]).mentions)
+        command = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "input": {"command": f"git -C '{self.path}' status"}}]}}
+        self.live_session(home, json.dumps(command) + "\n")
+        self.assertIn(self.path, hogs.agent_activity(30, [self.path]).mentions)
+
+    def test_dead_or_unrelated_sessions_do_not_block(self):
+        home = self.fake_home()
+        dead = 2 ** 22 + 12345
+        while hogs.pid_alive(dead):
+            dead += 1
+        self.live_session(home, '"%s"\n' % self.path, pid=dead)
+        self.live_session(home, '"%s-outro/x" "%s.bak"\n' % (self.path, self.path), sid="s2")
+        agents = hogs.agent_activity(30, [self.path])
+        self.assertEqual((agents.error, agents.mentions), ("", {}))
+
+    def test_live_session_without_transcript_is_inconclusive(self):
+        home = self.fake_home()
+        (home / ".claude" / "sessions" / "x.json").write_text('{"pid": %d, "sessionId": "nao-existe"}' % os.getpid())
+        self.assertIn("sem transcrição", hogs.agent_activity(30, [self.path]).error)
+
+    def test_codex_recent_sessions_count(self):
+        home = self.fake_home()
+        codex = home / ".codex" / "sessions" / "2026" / "11" / "02"
+        codex.mkdir(parents=True)
+        output = {"type": "response_item", "payload": {"type": "custom_tool_call_output", "output": str(self.path)}}
+        call = {"type": "response_item", "payload": {"type": "custom_tool_call", "input": f"git -C {self.path} status"}}
+        (codex / "rollout-1.jsonl").write_text('{"payload": {"cwd": "/apps"}}\n' + json.dumps(output) + "\n")
+        self.assertEqual(hogs.agent_activity(30, [self.path]).mentions, {}, "saída de comando não conta")
+        (codex / "rollout-1.jsonl").write_text('{"payload": {"cwd": "/apps"}}\n' + json.dumps(call) + "\n")
+        agents = hogs.agent_activity(30, [self.path])
+        self.assertIn(("Codex", "/apps"), agents.folders)
+        self.assertEqual(agents.mentions, {self.path: {"Codex"}})
+        os.utime(codex / "rollout-1.jsonl", (0, 0))
+        self.assertEqual(hogs.agent_activity(30, [self.path]).mentions, {})
+
+
+    def console(self):
+        out = io.StringIO()
+        return hogs.Console(file=out, width=160, force_terminal=False), out
+
+    def test_selection_numbers(self):
+        self.assertEqual(hogs.selection_numbers("a", 3), {1, 2, 3})
+        self.assertEqual(hogs.selection_numbers("1, 3-9", 4), {1, 3, 4})
+        self.assertEqual(hogs.selection_numbers("", 3), set())
+        self.assertEqual(hogs.selection_numbers("0 7 x", 3), set())
+
+    def test_report_numbers_safe_and_summarizes(self):
+        row = self.inspect()
+        con, out = self.console()
+        hogs.worktrees_report(con, [row], self.root, 30)
+        text = out.getvalue()
+        self.assertIn("seguro · #1", text)
+        self.assertIn("SEGURO PARA APAGAR", text)
+        self.assertIn("--clean", text)
+
+    def test_clean_offers_only_safe_confirms_and_keeps_branch(self):
+        self.quiet()
+        safe = self.inspect()
+        unsafe = hogs.Worktree(self.root / "x", self.repo, blockers=["merge não comprovado em origin/main"])
+        con, out = self.console()
+        with mock.patch.object(hogs.Prompt, "ask", return_value="a"), \
+                mock.patch.object(hogs.Confirm, "ask", return_value=False):
+            hogs.clean_worktrees(con, [safe, unsafe], 30, self.root)
+        self.assertTrue(self.path.exists(), "sem confirmação nada sai")
+        with mock.patch.object(hogs.Prompt, "ask", return_value="a"), \
+                mock.patch.object(hogs.Confirm, "ask", return_value=True):
+            hogs.clean_worktrees(con, [safe, unsafe], 30, self.root)
+        self.assertFalse(self.path.exists())
+        self.assertIn("1 worktree removido", out.getvalue())
+        self.assertEqual(self.git(self.repo, "rev-parse", "feature"), safe.head)
+
+    def test_clean_without_safe_offers_nothing(self):
+        con, out = self.console()
+        with mock.patch.object(hogs.Prompt, "ask") as ask:
+            hogs.clean_worktrees(con, [hogs.Worktree(self.path, self.repo, blockers=["x"])], 30, self.root)
+        ask.assert_not_called()
+        self.assertIn("Nenhum worktree", out.getvalue())
 
 if __name__ == "__main__":
     unittest.main()

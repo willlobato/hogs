@@ -63,6 +63,9 @@ Confira com `hogs --version`.
 |---|---|
 | `hogs` | Relatório completo: disco, Docker, caches de dev, apps e o que mais estiver grande |
 | `hogs --clean` | Lista o que dá pra apagar e apaga só o que você escolher |
+| `hogs --worktrees PASTA` | Quadro por projeto: quem usa cada worktree, quando mudou, merge e se é seguro apagar |
+| `hogs --worktrees PASTA --clean` | Escolhe worktrees candidatos e confirma a remoção, preservando branches |
+| `hogs --worktrees PASTA --worktree-days 3` | Só considera seguro o que está há 3 dias sem mudança (padrão: sem mínimo) |
 | `hogs --apps [N]` | Os N apps que você menos usa (padrão: 20) |
 | `hogs --docker-gc 20` | Mantém o cache de build de cada builder abaixo de 20 GB, conferindo de hora em hora |
 | `hogs --docker-gc off` | Desliga o limite do cache de build |
@@ -112,6 +115,67 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - 🛡️ Imagens construídas localmente aparecem uma por uma, nunca em grupo.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
 - Nada é apagado sem você confirmar.
+
+## Worktrees Git
+
+```bash
+hogs --worktrees ~/Development
+hogs --worktrees ~/Development --clean
+```
+
+<img src="docs/worktrees.svg" alt="Análise de worktrees com dados fictícios" width="900">
+
+A análise é somente leitura e fica limitada aos worktrees registrados dentro da pasta escolhida.
+Um quadro por projeto mostra, para cada worktree: pasta e branch, tamanho, **há quanto tempo mudou**,
+se **já foi mergeado**, **quem usa ou usou** (sessão do Claude Code pelo nome, Codex, processos como
+`node ×3`, containers) e o veredito:
+
+- 🟢 **seguro**: pode apagar;
+- 🟡 **depois**: mergeado e limpo, mas algo roda dentro da pasta agora (dev server, container, sessão
+  aberta dentro dela);
+- ⚪ **manter**: tem trabalho que só existe ali (não mergeado, alterações, `.env`…) ou ficou dúvida.
+
+Por último vem o **resumo**: quantos são 🟢 e por quê, quais sessões abertas trabalharam neles, o que
+falta para os 🟡, por que cada grupo ⚪ fica, e o que fazer, com o comando pronto.
+
+Cada 🟢 recebe um número (`#1`, `#2`…). Com `--clean`, só os 🟢 são oferecidos, com os mesmos números
+e a sessão que trabalhou em cada um: digite `a` para apagar todos de uma vez ou os números para
+escolher (`1,3,5-7`). Ele mostra o que vai sair e o total, pede confirmação (padrão: não) e confere
+tudo de novo antes de cada remoção. O que mudou desde a análise fica, com o motivo. No fim, mostra
+como recriar um worktree removido.
+
+Um worktree 🟢 precisa passar por **todas** as condições:
+
+- sem alterações nem arquivos não versionados;
+- HEAD já incorporado à principal (`origin/HEAD`, ou `origin/main`/`origin/master` locais), por
+  merge, rebase ou squash: rebase e squash são comprovados por patch-id, só lendo o repositório;
+- ignorados só regeneráveis: `node_modules`, `target`, `build`, `dist`, `.docusaurus`, `.gradle`,
+  caches de Python etc. Qualquer outro ignorado (`.env`, `.terraform`, `.superpowers`, certificados)
+  bloqueia e aparece no motivo;
+- nada rodando dentro da pasta: nenhum processo com arquivo aberto ou cwd nela (`lsof`), nenhum
+  container montando-a e nenhuma sessão do Claude Code aberta dentro dela.
+
+Com isso, apagar não perde nada: o trabalho está na main e a branch fica.
+
+**Sessões abertas não impedem.** Uma sessão do Claude Code viva (`~/.claude/sessions`) que trabalhou no
+worktree (o caminho aparece num comando, arquivo ou texto da conversa atual, inclusive de subagentes;
+saída de comando não conta) é mostrada pelo nome, assim como sessões do Codex e do Claude Code abertas
+na pasta nos últimos 7 dias. É informação para você decidir; a sessão só perde a pasta.
+
+`--worktree-days N` exige N dias sem mudança (arquivos ou metadados Git: commit, checkout, add) para
+um worktree ser 🟢. O padrão é sem mínimo. Arquivos em pastas regeneráveis (`node_modules`, `target`…)
+não contam como mudança.
+
+Se `lsof` falhar ou o Docker estiver instalado mas não responder, a análise fica inconclusiva e não
+oferece remoção. Checkouts principais, worktrees bloqueados, HEAD destacado, submódulos e worktrees
+contendo outros worktrees também são preservados.
+
+A verificação de merge usa as referências **locais**, sem rede nem `fetch` automático. Atualize-as com
+`git fetch origin` no repositório antes da análise. Squash que não bate exatamente com a branch (conflito
+resolvido, commit depois do merge) aparece como “merge não comprovado”.
+
+A remoção usa `git worktree remove`, sem `--force`. As branches permanecem e permitem recriar o
+checkout. Os tamanhos são estimativas (blocos compartilhados no APFS). Nada é removido automaticamente.
 
 ## Prevenção: o Docker para de inchar
 
