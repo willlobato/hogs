@@ -29,6 +29,7 @@ from typing import Callable
 try:
     from rich import box
     from rich.console import Console, Group
+    from rich.padding import Padding
     from rich.panel import Panel
     from rich.prompt import Confirm, Prompt
     from rich.table import Table
@@ -37,7 +38,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -409,6 +410,727 @@ def docker_clean_items(d: Docker) -> list[Item]:
                           lambda names=names: [sh(["docker", "rmi", n]) for n in names],
                           ", ".join(n.rsplit("/", 1)[-1] for n in names[:3]) + "…"))
     return items
+
+
+# ---------------------------------------------------------------- worktrees
+
+@dataclass
+class Worktree:
+    path: Path
+    repo: Path
+    head: str = ""
+    branch: str = ""
+    size: int = 0
+    last_activity: float = 0
+    reason: str = "não verificado"
+    eligible: bool = False
+    merged: str = ""                                       # "squash em origin/main"; vazio = não comprovado
+    users: list[str] = field(default_factory=list)         # quem usa: sessões, processos, containers
+    sessions: list[str] = field(default_factory=list)      # sessões vivas do Claude Code que trabalham nele
+    blockers: list[str] = field(default_factory=list)      # ⚪ manter: trabalho que só existe aqui ou dúvida
+    waits: list[str] = field(default_factory=list)         # 🟡 depois: em uso ou mexido há pouco
+
+    @property
+    def verdict(self) -> str:
+        return "seguro" if self.eligible else ("manter" if self.blockers or not self.waits else "depois")
+
+
+def git_at(path: Path, *args: str) -> subprocess.CompletedProcess | None:
+    return sh(["git", "--no-optional-locks", "-C", str(path), *args])
+
+
+def inside(path: Path, parent: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def worktree_usage() -> tuple[list[tuple[Path, str]], str, list[tuple[Path, str]]]:
+    """Arquivos abertos (caminho, processo) e mounts de containers rodando (origem, container).
+
+    Uma falha de inspeção nunca equivale a ausência de uso."""
+    r = sh(["lsof", "-Fpcn"], timeout=60)
+    if r is None or r.returncode != 0 or r.stderr.strip():
+        return [], "não foi possível verificar arquivos abertos (lsof)", []
+    claude = {str(d["pid"]): d["name"] for d in live_claude_sessions()[0]}
+    paths, pid, cmd = [], "", ""
+    for line in r.stdout.splitlines():
+        if line.startswith("p"):
+            pid, cmd = line[1:], ""
+        elif line.startswith("c"):
+            cmd = line[1:]
+        elif line.startswith("n/"):
+            who = f"Claude Code {claude[pid]}" if pid in claude else f"{cmd or 'processo'} (pid {pid})"
+            paths.append((Path(line[1:]).resolve(), who))
+    mounts = []
+    if shutil.which("docker"):
+        r = sh(["docker", "ps", "-q"])
+        if r is None or r.returncode:
+            return paths, "não foi possível verificar os containers Docker", []
+        ids = r.stdout.split()
+        if ids:
+            r = sh(["docker", "inspect", "--format", "{{.Name}}\t{{json .Mounts}}", *ids])
+            if r is None or r.returncode:
+                return paths, "não foi possível verificar os mounts Docker", []
+            try:
+                for line in r.stdout.splitlines():
+                    name, _, raw = line.partition("\t")
+                    mounts.extend((Path(m["Source"]).resolve(), f"container {name.lstrip('/')}")
+                                  for m in json.loads(raw) if m.get("Source"))
+            except (ValueError, TypeError, KeyError):
+                return paths, "resposta de mounts Docker inválida", []
+    return paths, "", mounts
+
+
+def registered_worktrees(repo: Path) -> list[dict[str, str]]:
+    r = git_at(repo, "worktree", "list", "--porcelain", "-z")
+    if r is None or r.returncode:
+        raise RuntimeError(f"não consegui listar worktrees de {repo}")
+    records, record = [], {}
+    for field in r.stdout.split("\0"):
+        if not field:
+            if record:
+                records.append(record)
+                record = {}
+        else:
+            key, _, value = field.partition(" ")
+            record[key] = value
+    return records
+
+
+# Pastas ignoradas que um build ou instalação recria. Qualquer outro ignorado (.env, estado Terraform,
+# planos de sessões de agentes, certificados) bloqueia a remoção.
+REGENERABLE = frozenset({
+    "node_modules", "target", "build", "dist", ".docusaurus", ".angular", ".next", ".nuxt", ".svelte-kit",
+    ".vite", ".turbo", ".parcel-cache", "coverage", ".nyc_output", ".gradle", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".venv", ".DS_Store",
+})
+
+def raise_error(error: OSError) -> None:
+    raise error
+
+
+def only_regenerable(folder: Path) -> bool:
+    for root, dirs, files in os.walk(folder, onerror=raise_error):
+        dirs[:] = [d for d in dirs if d not in REGENERABLE]
+        if any(f not in REGENERABLE for f in files):
+            return False
+    return True
+
+
+def protected_ignored(listing: str, path: Path) -> list[str]:
+    """Ignorados (saída -z de ls-files --directory) que não são artefato regenerável.
+
+    Uma pasta inteira ignorada aparece como uma entrada só ("web/"); ela passa se tudo dentro dela estiver
+    em pastas regeneráveis ("web/node_modules")."""
+    kept = []
+    for entry in filter(None, listing.split("\0")):
+        if entry.rstrip("/").rsplit("/", 1)[-1] in REGENERABLE:
+            continue
+        if entry.endswith("/") and only_regenerable(path / entry):
+            continue
+        if not any(entry.startswith(k) for k in kept if k.endswith("/")):
+            kept.append(entry)
+    return kept
+
+
+def default_branch(path: Path) -> str:
+    r = git_at(path, "symbolic-ref", "refs/remotes/origin/HEAD")
+    if r is not None and r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    for ref in ("refs/remotes/origin/main", "refs/remotes/origin/master"):
+        r = git_at(path, "rev-parse", "--verify", "--quiet", ref)
+        if r is not None and r.returncode == 0:
+            return ref
+    return ""
+
+
+def patch_ids(path: Path, *args: str) -> set[str] | None:
+    """patch-id de cada commit/diff da saída de `git <args>`; só leitura."""
+    diff = git_at(path, *args, "--no-color", "--no-ext-diff")
+    if diff is None or diff.returncode:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(path), "patch-id", "--stable"], input=diff.stdout,
+                           capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return {line.split()[0] for line in r.stdout.splitlines() if line.strip()} if r.returncode == 0 else None
+
+
+def merged_how(path: Path, head: str, ref: str) -> str:
+    """'merge', 'rebase' ou 'squash' quando o conteúdo do HEAD comprovadamente está em ref; senão ''."""
+    r = git_at(path, "merge-base", "--is-ancestor", head, ref)
+    if r is not None and r.returncode == 0:
+        return "merge"
+    mb = git_at(path, "merge-base", head, ref)
+    if mb is None or mb.returncode or not mb.stdout.strip():
+        return ""
+    base = mb.stdout.strip()
+    cherry = git_at(path, "cherry", ref, head, base)
+    if cherry is not None and cherry.returncode == 0:
+        lines = cherry.stdout.splitlines()
+        if lines and all(line.startswith("- ") for line in lines):
+            return "rebase"
+    mine = patch_ids(path, "diff", base, head)
+    if not mine or len(mine) != 1:
+        return ""
+    theirs = patch_ids(path, "log", "--no-merges", "-p", "--max-count=2000", f"{base}..{ref}")
+    return "squash" if theirs and mine <= theirs else ""
+
+
+def claude_key(path: Path | str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+@dataclass
+class Agents:
+    """Sinais de sessões de agentes (Claude Code, Codex) sobre os worktrees."""
+    folders: list[tuple[str, str]] = field(default_factory=list)  # (agente, pasta ou chave do Claude)
+    mentions: dict[Path, set[str]] = field(default_factory=dict)  # worktree → sessões que o citaram
+    error: str = ""
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def live_claude_sessions() -> tuple[list[dict], str]:
+    """Registros de ~/.claude/sessions/<pid>.json cujo processo está vivo."""
+    registry = HOME / ".claude" / "sessions"
+    found = []
+    for entry in (registry.glob("*.json") if registry.is_dir() else []):
+        try:
+            data = json.loads(entry.read_text())
+        except ValueError:
+            return [], f"registro de sessão do Claude Code ilegível: {entry.name}"
+        if isinstance(data.get("pid"), int) and pid_alive(data["pid"]):
+            data["name"] = str(data.get("name") or f"pid {data['pid']}")
+            found.append(data)
+    return found, ""
+
+
+def live_claude_transcripts() -> tuple[list[tuple[str, Path]], str]:
+    """Transcrições das sessões do Claude Code com processo vivo.
+
+    O Claude Code registra cada sessão aberta em ~/.claude/sessions/<pid>.json (sessionId, cwd, startedAt) e
+    grava a conversa em ~/.claude/projects/<cwd com '-'>/<sessionId>.jsonl, com subagentes em <sessionId>/.
+    Só a conversa atual conta: outras transcrições da mesma pasta são de outras sessões.
+    Uma sessão viva sem transcrição localizável torna a verificação inconclusiva. Devolve (nome, arquivo)."""
+    projects = HOME / ".claude" / "projects"
+    files: set[tuple[str, Path]] = set()
+    sessions, error = live_claude_sessions()
+    if error:
+        return [], error
+    for data in sessions:
+        sid, name = data.get("sessionId"), data["name"]
+        main = list(projects.glob(f"*/{sid}.jsonl")) if sid else []
+        if not main:
+            return [], f"sessão ativa do Claude Code sem transcrição localizável (pid {data['pid']})"
+        for m in main:
+            files.add((name, m))
+            if m.with_suffix("").is_dir():
+                files.update((name, f) for f in m.with_suffix("").rglob("*.jsonl"))
+    return sorted(files), ""
+
+
+def claude_work(line: bytes) -> bytes:
+    """Parte de uma linha da transcrição do Claude Code que é trabalho na sessão: o que o assistente fez ou
+    escreveu (comandos, caminhos, texto) e o que o usuário digitou. Saída de ferramenta (tool_result, como
+    `git worktree list`) e anexos de contexto não contam. Linha ilegível conta inteira."""
+    try:
+        record = json.loads(line)
+        kind, content = record.get("type"), (record.get("message") or {}).get("content")
+    except (ValueError, AttributeError):
+        return line
+    if kind == "assistant":
+        return json.dumps(content, ensure_ascii=False).encode()
+    if kind == "user":
+        if isinstance(content, str):
+            return content.encode()
+        if isinstance(content, list):
+            return json.dumps([c for c in content if not (isinstance(c, dict) and c.get("type") == "tool_result")],
+                              ensure_ascii=False).encode()
+    return b""
+
+
+def codex_work(line: bytes) -> bytes:
+    """Mesma ideia de claude_work para ~/.codex/sessions: chamadas de ferramenta (comando, patch) e mensagens
+    do usuário e do assistente contam; saídas (*_output, event_msg) e contexto do sistema não."""
+    try:
+        record = json.loads(line)
+        payload = record.get("payload") or {}
+        kind = payload.get("type") if record.get("type") == "response_item" else None
+    except (ValueError, AttributeError):
+        return line
+    if kind in ("function_call", "custom_tool_call", "local_shell_call"):
+        return json.dumps([payload.get(k) for k in ("arguments", "input", "action")], ensure_ascii=False).encode()
+    if kind == "message" and payload.get("role") in ("user", "assistant"):
+        return json.dumps(payload.get("content"), ensure_ascii=False).encode()
+    return b""
+
+
+def agent_activity(days: int, paths: list[Path]) -> Agents:
+    """Sessões que estão ou estiveram trabalhando nos worktrees.
+
+    - Claude Code vivo: o caminho absoluto do worktree num comando, arquivo ou texto da conversa atual
+      (inclusive subagentes) bloqueia, sem prazo.
+    - Codex nos últimos `days` dias: cwd dentro do worktree, ou o caminho num comando ou mensagem.
+    - Claude Code nos últimos `days` dias: pasta de trabalho dentro do worktree (~/.claude/projects)."""
+    since = time.time() - days * 86400
+    agents = Agents()
+    projects, codex = HOME / ".claude" / "projects", HOME / ".codex" / "sessions"
+    scan: list[tuple[str, Path, Callable[[bytes], bytes]]] = []
+    try:
+        for d in (projects.iterdir() if projects.is_dir() else []):
+            if any(f.stat().st_mtime > since for f in d.glob("*.jsonl")):
+                agents.folders.append(("Claude Code", d.name))
+        live, error = live_claude_transcripts()
+        if error:
+            agents.error = error
+            return agents
+        scan += [(f"Claude Code {name}", f, claude_work) for name, f in live]
+        for f in (codex.rglob("*.jsonl") if codex.is_dir() else []):
+            if f.stat().st_mtime <= since:
+                continue
+            with f.open(encoding="utf-8", errors="replace") as fh:
+                first = fh.readline()
+            try:
+                cwd = json.loads(first).get("payload", {}).get("cwd")
+            except (ValueError, AttributeError):
+                agents.error = f"sessão do Codex ilegível: {short(f)}"
+                return agents
+            if cwd:
+                agents.folders.append(("Codex", str(Path(cwd).resolve())))
+            scan.append(("Codex", f, codex_work))
+        if paths and scan:
+            alts = sorted({str(p).encode() for p in paths}, key=len, reverse=True)
+            rx = re.compile(b"(" + b"|".join(re.escape(a) for a in alts) + rb")(?![A-Za-z0-9_-])(?!\.[A-Za-z0-9_-])")
+            for label, f, work in scan:
+                data = b"\n".join(work(line) for line in f.read_bytes().splitlines() if rx.search(line))
+                for hit in set(rx.findall(data)):
+                    agents.mentions.setdefault(Path(hit.decode()), set()).add(label)
+    except OSError as exc:
+        agents.error = f"não foi possível verificar sessões de agentes: {exc}"
+    return agents
+
+
+def session_matches(key: str, path: Path) -> bool:
+    """Sessão aberta na pasta ou dentro dela. A chave do Claude é ambígua (pasta-x casa com pasta/x);
+    o erro vai para o lado de preservar."""
+    if key.startswith("/"):
+        return inside(Path(key), path)
+    own = claude_key(path)
+    return key == own or key.startswith(own + "-")
+
+
+def group_processes(labels: set[str]) -> list[str]:
+    """{"node (pid 1)", "node (pid 2)", "vim (pid 3)"} → ["node ×2", "vim (pid 3)"]; sessões já saíram antes."""
+    by: dict[str, list[str]] = {}
+    for label in labels:
+        if label.startswith("Claude Code "):
+            continue
+        m = re.fullmatch(r"(.*) \(pid (\d+)\)", label)
+        by.setdefault(m.group(1) if m else label, []).append(label)
+    return [items[0] if len(items) == 1 else f"{cmd} ×{len(items)}" for cmd, items in sorted(by.items())]
+
+
+def elapsed(ts: float) -> str:
+    secs = max(0, time.time() - ts)
+    if secs < 3600:
+        return f"há {int(secs // 60)} min"
+    if secs < 86400:
+        return f"há {int(secs // 3600)} h"
+    return f"há {int(secs // 86400)} d"
+
+
+def last_change(path: Path, gitdir: Path) -> float:
+    """Última modificação do que é trabalho: arquivos fora de pastas regeneráveis e metadados Git
+    (commit, checkout, add). Builds e instalações em node_modules/target não contam, nem o mtime de pastas
+    (muda quando um build cria node_modules); arquivo versionado apagado aparece no git status, e um
+    processo rodando na pasta aparece pelo lsof."""
+    stamps = [(gitdir / n).stat().st_mtime for n in ("logs/HEAD", "index", "HEAD") if (gitdir / n).exists()]
+    for root, dirs, files in os.walk(path, onerror=raise_error):
+        dirs[:] = [d for d in dirs if d != ".git" and d not in REGENERABLE]
+        stamps += [(Path(root) / f).lstat().st_mtime for f in files if f != ".git" and f not in REGENERABLE]
+    return max(stamps, default=0)
+
+
+SESSION_WINDOW_DAYS = 7  # janela das sessões do Codex e das pastas do Claude mostradas como informação
+
+
+def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]], str, list[tuple[Path, str]]],
+                     agents: Agents | None = None) -> Worktree:
+    """Coleta todos os sinais e decide: 🟢 seguro, 🟡 depois (em uso ou recente) ou ⚪ manter."""
+    result = Worktree(w.path, w.repo, size=w.size)
+    def keep(reason: str) -> Worktree:
+        result.blockers.append(reason)
+        result.reason = result.blockers[0]
+        return result
+    try:
+        records = registered_worktrees(w.repo)
+        entry = next((r for r in records if Path(r["worktree"]).resolve() == w.path), None)
+        if not entry or entry is records[0] or not (w.path / ".git").is_file():
+            return keep("checkout principal, ausente ou não registrado")
+        result.head, result.branch = entry.get("HEAD", ""), entry.get("branch", "")
+        if any(k in entry for k in ("locked", "prunable", "bare", "detached")):
+            return keep("worktree bloqueado, ausente ou HEAD destacado")
+        if any(inside(Path(r["worktree"]).resolve(), w.path) and Path(r["worktree"]).resolve() != w.path
+               for r in records):
+            return keep("contém outro worktree")
+
+        # ⚪ trabalho que só existe aqui, ou dúvida
+        b = result.blockers
+        status = git_at(w.path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+        if status is None or status.returncode:
+            b.append("não foi possível verificar alterações locais")
+        elif status.stdout:
+            b.append(f"{len(status.stdout.splitlines())} alterações locais ou arquivos não versionados")
+        if (w.path / ".gitmodules").exists():
+            b.append("contém submódulos; revise antes")
+        ref = default_branch(w.path)
+        if not ref:
+            b.append("branch principal remota desconhecida (origin/HEAD)")
+        else:
+            how = merged_how(w.path, result.head, ref)
+            if how:
+                result.merged = f"{how} em {ref.removeprefix('refs/remotes/')}"
+            else:
+                b.append(f"merge não comprovado em {ref.removeprefix('refs/remotes/')}")
+        ignored = git_at(w.path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
+        if ignored is None or ignored.returncode:
+            b.append("não foi possível verificar arquivos ignorados")
+        else:
+            kept = protected_ignored(ignored.stdout, w.path)
+            if kept:
+                more = f" (+{len(kept) - 3})" if len(kept) > 3 else ""
+                b.append(f"ignorados que não voltam pelo Git: {', '.join(kept[:3])}{more}")
+
+        # Quem usa a pasta. Sessões do Claude Code e do Codex que trabalharam nele são só informação: o
+        # trabalho delas já está na main. Trava apenas o que roda dentro da pasta agora (dev server,
+        # container, Claude aberto dentro dela), porque apagar a pasta derruba o programa.
+        paths, error, mounts = usage
+        if error:
+            b.append(error)
+        if agents is None:
+            agents = agent_activity(SESSION_WINDOW_DAYS, [w.path])
+        cited = agents.mentions.get(w.path, set())
+        running = {who for p, who in paths if inside(p, w.path)}
+        opened_inside = sorted(x.removeprefix("Claude Code ") for x in running if x.startswith("Claude Code "))
+        result.sessions = sorted({c.removeprefix("Claude Code ") for c in cited if c.startswith("Claude Code ")}
+                                 | set(opened_inside))
+        containers = sorted({who for p, who in mounts if inside(p, w.path) or inside(w.path, p)})
+        result.users = [f"Claude Code {n}" + (" (aberta dentro)" if n in opened_inside else "")
+                        for n in result.sessions]
+        if "Codex" in cited:
+            result.users.append(f"Codex (últimos {SESSION_WINDOW_DAYS} d)")
+        for name in sorted({name for name, key in agents.folders if session_matches(key, w.path)}):
+            if name == "Codex" or not result.sessions:
+                result.users.append(f"{name} aberto na pasta (últimos {SESSION_WINDOW_DAYS} d)")
+        result.users += group_processes(running) + containers
+        if agents.error:
+            result.users.append(f"sessões: {agents.error}")
+        now_here = ([f"Claude Code {n} aberta dentro da pasta" for n in opened_inside]
+                    + group_processes(running) + containers)
+        if now_here:
+            result.waits.append(f"em uso agora: {', '.join(now_here[:2])}")
+
+        gitdir = git_at(w.path, "rev-parse", "--absolute-git-dir")
+        if gitdir is None or gitdir.returncode:
+            b.append("metadados Git indisponíveis")
+        else:
+            result.last_activity = last_change(w.path, Path(gitdir.stdout.strip()))
+            if days and result.last_activity > time.time() - days * 86400:
+                result.waits.append(f"mexido {elapsed(result.last_activity)} (mínimo {days} d)")
+    except (OSError, RuntimeError, KeyError) as exc:
+        result.blockers.append(f"inspeção inconclusiva: {exc}")
+    result.eligible = not result.blockers and not result.waits and bool(result.merged)
+    if result.eligible:
+        result.reason = f"{result.merged} · mexido {elapsed(result.last_activity)}"
+        if result.sessions:
+            result.reason += f" · sessão {', '.join(result.sessions)}"
+    else:
+        result.reason = (result.blockers or result.waits or ["não verificado"])[0]
+    return result
+
+
+def gather_worktrees(root: Path, days: int) -> tuple[list[Worktree], list[str]]:
+    root = root.expanduser().resolve()
+    found, warnings, repos = {}, [], set()
+    def walk_error(error: OSError) -> None:
+        warnings.append(str(error))
+    for directory, dirs, files in os.walk(root, onerror=walk_error):
+        if ".git" in dirs or ".git" in files:
+            repo = Path(directory)
+            dirs[:] = []
+            common = git_at(repo, "rev-parse", "--git-common-dir")
+            if common is None or common.returncode:
+                warnings.append(f"não consegui inspecionar {repo}")
+                continue
+            key = (repo / common.stdout.strip()).resolve()
+            if key in repos:
+                continue
+            repos.add(key)
+            try:
+                for record in registered_worktrees(repo)[1:]:
+                    path = Path(record["worktree"]).resolve()
+                    if inside(path, root):
+                        found[path] = Worktree(path, repo)
+            except (RuntimeError, KeyError) as exc:
+                warnings.append(str(exc))
+        else:
+            dirs[:] = [d for d in dirs if d not in {"node_modules", ".git", "target", ".venv", "vendor"}]
+    usage = worktree_usage() if found else ([], "", [])
+    agents = agent_activity(SESSION_WINDOW_DAYS, list(found))
+    # Um checkout usado para consultar o Git pode ser removido: use o principal como âncora.
+    for w in found.values():
+        try:
+            w.repo = Path(registered_worktrees(w.repo)[0]["worktree"])
+        except (RuntimeError, KeyError, IndexError):
+            pass
+    def inspect(w: Worktree) -> Worktree:
+        w.size = du(w.path)
+        return inspect_worktree(w, days, usage, agents)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        rows = list(pool.map(inspect, found.values()))
+    return sorted(rows, key=lambda w: -w.size), warnings
+
+
+def remove_worktree(w: Worktree, days: int) -> None:
+    current = inspect_worktree(w, days, worktree_usage())
+    if not current.eligible or (current.head, current.branch) != (w.head, w.branch):
+        raise RuntimeError(current.reason if not current.eligible else "HEAD ou branch mudou desde a análise")
+    r = git_at(w.repo, "worktree", "remove", str(w.path))
+    if r is None or r.returncode:
+        raise RuntimeError(r.stderr.strip() if r is not None else "Git não respondeu")
+
+
+VERDICTS = {"seguro": ("🟢", "green"), "depois": ("🟡", "yellow"), "manter": ("⚪", "dim")}
+
+
+def safe_worktrees(rows: list[Worktree]) -> list[Worktree]:
+    """Os 🟢 na ordem em que recebem número (#1, #2…), a mesma no quadro e no --clean."""
+    return sorted((w for w in rows if w.eligible), key=lambda w: (w.repo.name.lower(), -w.size))
+
+
+def where(w: Worktree, root: Path | None) -> str:
+    try:
+        return str(w.path.relative_to(root)) if root else short(w.path)
+    except ValueError:
+        return short(w.path)
+
+
+def hogs_command(root: Path, days: int) -> str:
+    extra = f" --worktree-days {days}" if days else ""
+    return f"hogs --worktrees {short(root)}{extra}"
+
+
+def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = None, days: int = 0) -> None:
+    """Quadro por projeto e, por último (o que fica na tela), o resumo."""
+    order = {"seguro": 0, "depois": 1, "manter": 2}
+    number = {id(w): n for n, w in enumerate(safe_worktrees(rows), 1)}
+    projects: dict[Path, list[Worktree]] = {}
+    for w in rows:
+        projects.setdefault(w.repo, []).append(w)
+    for repo in sorted(projects, key=lambda r: r.name.lower()):
+        items = sorted(projects[repo], key=lambda w: (order[w.verdict], -w.size))
+        t = Table(title=f"📁 {repo.name}  [dim]{short(repo)}[/]", title_justify="left",
+                  box=box.SIMPLE_HEAD, expand=True)
+        t.add_column("Worktree / branch", ratio=3)
+        t.add_column("Tamanho", justify="right", no_wrap=True)
+        t.add_column("Mudou", no_wrap=True)
+        t.add_column("Na main?", ratio=2)
+        t.add_column("Em uso por", ratio=2)
+        t.add_column("Veredito", ratio=3)
+        for w in items:
+            icon, style = VERDICTS[w.verdict]
+            verdict = (f"{icon} seguro · #{number[id(w)]}" if w.eligible
+                       else f"{icon} {w.verdict}: {w.reason}")
+            t.add_row(Text(where(w, root)).append(f"\n{w.branch.removeprefix('refs/heads/')}", style="dim"),
+                      fmt(w.size),
+                      elapsed(w.last_activity) if w.last_activity else "—",
+                      Text(f"✓ {w.merged}", style="green") if w.merged else Text("✗ não comprovado", style="dim"),
+                      Text("\n".join(w.users) if w.users else "—"),
+                      Text(verdict, style=style))
+        con.print(t)
+    worktrees_summary(con, rows, root, days)
+
+
+CATEGORIES = {
+    "dentro": ("tem uma sessão do Claude Code aberta dentro da pasta",
+               "têm uma sessão do Claude Code aberta dentro da pasta"),
+    "uso": ("tem algo rodando dentro (dev server, container)", "têm algo rodando dentro (dev server, container)"),
+    "recente": ("foi mexido dentro do prazo pedido", "foram mexidos dentro do prazo pedido"),
+    "merge": ("tem trabalho que ainda não está na main", "têm trabalho que ainda não está na main"),
+    "alterações": ("tem alterações ou arquivos novos sem commit", "têm alterações ou arquivos novos sem commit"),
+    "ignorados": ("tem arquivos fora do Git que não voltam (.env, planos…)",
+                  "têm arquivos fora do Git que não voltam (.env, planos…)"),
+    "outros": ("está travado, sem branch ou não deu pra conferir",
+               "estão travados, sem branch ou não deu pra conferir"),
+}
+
+
+def worktree_category(w: Worktree) -> str:
+    """Motivo principal, para o resumo (chave de CATEGORIES)."""
+    if w.verdict == "depois":
+        first = w.waits[0]
+        if first.startswith("mexido"):
+            return "recente"
+        return "dentro" if "aberta dentro da pasta" in first else "uso"
+    text = " ".join(w.blockers)
+    for key, mark in (("merge", "merge não comprovado"), ("alterações", "alterações locais"),
+                      ("ignorados", "ignorados que não voltam")):
+        if mark in text:
+            return key
+    return "outros"
+
+
+def n_worktrees(n: int) -> str:
+    return f"{n} worktree" if n == 1 else f"{n} worktrees"
+
+
+def indent(text: str | Text, by: int = 5) -> Padding:
+    return Padding(text if isinstance(text, Text) else Text(text), (0, 0, 0, by))
+
+
+def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, days: int) -> None:
+    def group(v: str) -> list[Worktree]:
+        return [w for w in rows if w.verdict == v]
+    def size(ws: list[Worktree]) -> str:
+        return fmt(sum(w.size for w in ws))
+    def breakdown(ws: list[Worktree]) -> list[str]:
+        by: dict[str, list[Worktree]] = {}
+        for w in ws:
+            by.setdefault(worktree_category(w), []).append(w)
+        return [indent(f"• {len(v)} {CATEGORIES[k][len(v) != 1]} · {size(v)}")
+                for k, v in sorted(by.items(), key=lambda kv: -len(kv[1]))]
+
+    safe, later, keep = group("seguro"), group("depois"), group("manter")
+    lines: list = [Text.assemble(("🟢 SEGURO PARA APAGAR  ", "bold green"),
+                                 (f"{n_worktrees(len(safe))} · {size(safe)}", "bold"))]
+    prazo = f", e parados há mais de {days} dias" if days else ""
+    lines.append(indent(Text(f"Já estão na main (merge, squash ou rebase), sem alterações, sem arquivos que o Git não "
+                             f"recupera e sem nada rodando dentro da pasta{prazo}. A branch continua existindo.",
+                             style="green")))
+    with_session: dict[str, int] = {}
+    for w in safe:
+        for name in w.sessions:
+            with_session[name] = with_session.get(name, 0) + 1
+    if with_session:
+        names = ", ".join(f"{n} ({c})" for n, c in sorted(with_session.items(), key=lambda kv: -kv[1]))
+        lines.append(indent(Text(f"Sessões do Claude Code abertas que trabalharam em alguns deles: {names}. Não "
+                                 "impedem: o trabalho já está na main; a sessão só perde a pasta.", style="dim")))
+    if later:
+        lines += [Text(""), Text.assemble(("🟡 DEPOIS  ", "bold yellow"),
+                                          (f"{n_worktrees(len(later))} · {size(later)}", "bold"),
+                                          ("  mergeados e limpos, mas algo roda dentro agora", "yellow"))]
+        lines += breakdown(later)
+    if keep:
+        lines += [Text(""), Text.assemble(("⚪ MANTER  ", "bold"),
+                                          (f"{n_worktrees(len(keep))} · {size(keep)}", "bold"), ("  não apague", "dim"))]
+        lines += breakdown(keep)
+
+    cmd = hogs_command(root, days) if root else "hogs --worktrees PASTA"
+    todo = [Text(""), Text("O que fazer", style="bold")]
+    step = 1
+    if safe:
+        todo.append(Text(f"  {step}. Apagar os 🟢: {cmd} --clean", style="bold"))
+        todo.append(indent("Digite a para todos ou os números do quadro (ex: 1,3,5-7). Ele confirma antes e "
+                           "confere tudo de novo antes de cada remoção."))
+        step += 1
+    if later:
+        todo.append(Text(f"  {step}. Liberar 🟡: pare o que roda dentro deles (dev server, container, sessão aberta "
+                         "dentro da pasta; está na coluna Em uso por) e rode o comando de novo."))
+        step += 1
+    if keep:
+        todo.append(Text(f"  {step}. ⚪ ficam com você: o motivo de cada um está na coluna Veredito."))
+    if not safe and not later:
+        todo.append(Text("  Nada a apagar agora. Rode de novo daqui a alguns dias."))
+    con.print(Panel(Group(*lines, *todo), title=f"Resumo · {n_worktrees(len(rows))} · {size(rows)}",
+                    title_align="left", border_style="green" if safe else "yellow", padding=(1, 2)))
+    con.print(Text("Merge conferido nas referências locais de origin; rode git fetch nos repositórios para "
+                   "atualizá-las.", style="dim"))
+
+
+def clean_worktrees(con: Console, rows: list[Worktree], days: int, root: Path | None = None) -> None:
+    """Só os 🟢: todos de uma vez (a) ou pelos números do quadro, com confirmação e reverificação."""
+    safe = safe_worktrees(rows)
+    if not safe:
+        con.print(Panel("Nenhum worktree 🟢 agora. O resumo acima diz o que falta para cada grupo.",
+                        border_style="yellow", padding=(0, 2)))
+        return
+    t = Table(title="🗑  Worktrees seguros para apagar", title_justify="left", title_style="bold",
+              box=box.SIMPLE_HEAD, expand=True)
+    t.add_column("#", justify="right", style="cyan", no_wrap=True)
+    t.add_column("Projeto", no_wrap=True)
+    t.add_column("Worktree / branch", ratio=3)
+    t.add_column("Tamanho", justify="right", no_wrap=True)
+    t.add_column("Mexido", no_wrap=True)
+    t.add_column("Na main", ratio=2)
+    t.add_column("Sessão que trabalhou nele", ratio=2)
+    for n, w in enumerate(safe, 1):
+        t.add_row(str(n), w.repo.name,
+                  Text(where(w, root)).append(f"\n{w.branch.removeprefix('refs/heads/')}", style="dim"),
+                  fmt(w.size), elapsed(w.last_activity), Text(f"✓ {w.merged}", style="green"),
+                  Text(", ".join(w.sessions) or "—", style="dim"))
+    con.print(t)
+    raw = Prompt.ask(f"Quais apagar? [cyan]a[/] = todos os {len(safe)} ({fmt(sum(w.size for w in safe))}) · "
+                     "números, ex: [cyan]1,3,5-7[/] · Enter cancela", default="", show_default=False)
+    numbers = selection_numbers(raw, len(safe))
+    chosen = [w for n, w in enumerate(safe, 1) if n in numbers]
+    if not chosen:
+        con.print("[dim]Nada apagado.[/]")
+        return
+
+    con.print(Text(f"\nVou remover {n_worktrees(len(chosen))}, {fmt(sum(w.size for w in chosen))}:", style="bold"))
+    for w in chosen:
+        note = f"  · sessão {', '.join(w.sessions)}" if w.sessions else ""
+        con.print(Text(f"  • {w.repo.name} / {where(w, root)}  ({w.branch.removeprefix('refs/heads/')}){note}"))
+    con.print(Text("As branches ficam. Antes de cada remoção confiro tudo de novo; se algo mudou, ele fica.",
+                   style="dim"))
+    if not Confirm.ask("Remover?", default=False):
+        con.print("[dim]Nada apagado.[/]")
+        return
+
+    done, kept = [], []
+    for w in chosen:
+        try:
+            with con.status(f"Removendo {where(w, root)}…"):
+                remove_worktree(w, days)
+        except (OSError, RuntimeError) as exc:
+            kept.append((w, str(exc)))
+            con.print(Text(f"  ↷ {where(w, root)}: mantido, {exc}", style="yellow"))
+            continue
+        done.append(w)
+        con.print(Text(f"  ✔ {where(w, root)} removido", style="green"))
+    msg = Text.assemble((f"✔ {n_worktrees(len(done))} removido{'s' if len(done) != 1 else ''}", "bold green"),
+                        f" · {fmt(sum(w.size for w in done))} · livre agora: "
+                        f"{fmt(shutil.disk_usage(DATA_VOLUME).free)}")
+    if kept:
+        msg.append(f"\n↷ {n_worktrees(len(kept))} mantido{'s' if len(kept) != 1 else ''} porque algo mudou "
+                   "desde a análise (motivo acima)", style="yellow")
+    if done:
+        w = done[0]
+        msg.append(f"\nPara recriar um: git -C {short(w.repo)} worktree add {short(w.path)} "
+                   f"{w.branch.removeprefix('refs/heads/')}", style="dim")
+    con.print(Panel(msg, border_style="green" if done else "yellow", padding=(0, 2)))
+
+
+def selection_numbers(raw: str, total: int) -> set[int]:
+    """'a' = todos; '1,3,5-7' = esses. Números fora da lista são ignorados."""
+    chosen: set[int] = set()
+    for tok in re.split(r"[,\s]+", raw.strip().lower()):
+        if tok == "a":
+            chosen |= set(range(1, total + 1))
+        elif m := re.fullmatch(r"(\d+)-(\d+)", tok):
+            chosen |= set(range(int(m.group(1)), int(m.group(2)) + 1))
+        elif tok.isdigit():
+            chosen.add(int(tok))
+    return {n for n in chosen if 1 <= n <= total}
 
 
 # ---------------------------------------------------------------- pastas conhecidas
@@ -983,7 +1705,7 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
 
 def clean_items(s: Snapshot) -> list[Item]:
     items = docker_clean_items(s.docker) + [i for i in s.items if i.action]
-    items = [i for i in items if i.size >= 1e6]
+    items = [i for i in items if i.size >= 1e6 or i.cat == "worktree"]
     return sorted(items, key=lambda i: (i.risk.rank, -i.size))
 
 
@@ -1042,8 +1764,12 @@ def clean(con: Console, s: Snapshot) -> None:
         if i.guard and (why := i.guard()):
             con.print(f"  [yellow]↷[/] {i.label}: pulei, {why}")
             continue
-        with con.status(f"Limpando {i.label}…"):
-            i.action()
+        try:
+            with con.status(f"Limpando {i.label}…"):
+                i.action()
+        except (OSError, RuntimeError) as exc:
+            con.print(Text(f"  ↷ {i.label}: {exc}", style="yellow"))
+            continue
         con.print(f"  [green]✔[/] {i.label}")
 
     after = shutil.disk_usage(DATA_VOLUME).free
@@ -1251,6 +1977,9 @@ def run() -> None:
     p = argparse.ArgumentParser(prog="hogs", description="Mostra quem está comendo seu disco e ajuda a limpar.")
     p.add_argument("--version", action="version", version=f"hogs {__version__}")
     p.add_argument("--clean", action="store_true", help="escolhe o que apagar")
+    p.add_argument("--worktrees", type=Path, metavar="PASTA", help="analisa worktrees Git dentro desta pasta")
+    p.add_argument("--worktree-days", type=int, default=0, metavar="DIAS",
+                   help="exige DIAS sem mudança para um worktree ser seguro (padrão: sem mínimo)")
     p.add_argument("--alert", nargs="?", const="status", metavar="GB|off|test",
                    help="aviso automático quando o espaço livre cair abaixo de GB")
     p.add_argument("--apps", nargs="?", const=20, type=int, metavar="N",
@@ -1259,6 +1988,10 @@ def run() -> None:
                    help="mantém o cache de build de cada builder abaixo de GB (confere a cada 1h)")
     p.add_argument("--agent", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.worktree_days < 0:
+        p.error("--worktree-days não pode ser negativo")
+    if args.worktrees and not args.worktrees.expanduser().is_dir():
+        p.error("--worktrees precisa apontar para uma pasta existente")
 
     if args.agent:
         return agent_run()
@@ -1270,6 +2003,16 @@ def run() -> None:
         sys.exit("hogs precisa da biblioteca rich:  pip install rich")
 
     con = Console()
+    if args.worktrees:
+        with con.status("[bold]🌳 Conferindo worktrees, alterações e sinais de uso…[/]"):
+            rows, warnings = gather_worktrees(args.worktrees, args.worktree_days)
+        root = args.worktrees.expanduser().resolve()
+        for warning in warnings:
+            con.print(Text(warning, style="yellow"))
+        worktrees_report(con, rows, root, args.worktree_days)
+        if args.clean:
+            clean_worktrees(con, rows, args.worktree_days, root)
+        return
     if args.apps:
         with con.status("[bold]🐷 Vendo quais apps você não abre há tempo…[/]", spinner="dots"):
             apps = gather_apps()

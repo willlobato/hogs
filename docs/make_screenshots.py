@@ -115,3 +115,29 @@ with mock.patch.object(h, "load_config", return_value={}), \
         mock.patch.object(h, "read_json", side_effect=lambda path: FAKE_JSON.get(path, {})):
     save("report.svg", lambda con: h.report(con, snapshot, records))
 save("apps.svg", lambda con: (con.print(h.apps_table(apps, 7)), con.print(h.apps_footer())))
+D, H = 86400, 3600
+DEV, T0 = Path("~/Development"), time.time()
+
+
+def wt(repo, name, branch, gb, age, merged="", users=(), sessions=(), blockers=(), waits=(), ok=False):
+    w = h.Worktree(DEV / name, DEV / repo, branch=f"refs/heads/{branch}", size=int(gb * GB),
+                   last_activity=T0 - age, eligible=ok, merged=merged, users=list(users),
+                   sessions=list(sessions), blockers=list(blockers), waits=list(waits))
+    w.reason = (f"{merged} · mexido {h.elapsed(w.last_activity)}" if ok
+                else (w.blockers or w.waits)[0])
+    return w
+
+
+WORKTREES = [
+    wt("app", "app-fix-login", "fix/login", 0.9, 21 * D, "merge em origin/main", ok=True),
+    wt("app", "app-old-header", "fix/header", 0.4, 12 * D, "squash em origin/main", ok=True),
+    wt("app", "app-preview", "feat/preview", 0.8, 5 * H, "squash em origin/main", ["Claude Code app-12"],
+       ["app-12"], ok=True),
+    wt("app", "app-dashboard", "feat/dashboard", 1.4, 2 * H, users=["Claude Code app-7", "node ×3"],
+       sessions=["app-7"], blockers=["merge não comprovado em origin/main"]),
+    wt("api", "api-infra", "feat/infra", 0.6, 9 * D, "merge em origin/main",
+       blockers=["ignorados que não voltam pelo Git: .terraform/, .env"]),
+    wt("api", "api-cache", "feat/cache", 0.3, 3 * D, "rebase em origin/main", ["node ×2"],
+       waits=["em uso agora: node ×2"]),
+]
+save("worktrees.svg", lambda con: h.worktrees_report(con, WORKTREES, DEV))
