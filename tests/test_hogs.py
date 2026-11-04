@@ -34,6 +34,11 @@ class FmtTest(unittest.TestCase):
         self.assertEqual(hogs.fmt(450_000_000), "450 MB")
         self.assertEqual(hogs.fmt(5_000), "5 kB")
 
+    def test_rounding_never_shows_1000_of_the_smaller_unit(self):
+        self.assertEqual(hogs.fmt(999_700_000), "1,0 GB")
+        self.assertEqual(hogs.fmt(999_400_000), "999 MB")
+        self.assertEqual(hogs.fmt(999_700), "1 MB")
+
 
 class ImageOriginTest(unittest.TestCase):
     def test_origins(self):
@@ -64,6 +69,20 @@ class SelectionTest(unittest.TestCase):
     def test_ignores_out_of_range_and_junk(self):
         self.assertEqual(self.labels("99 x 0"), [])
         self.assertEqual(self.labels(""), [])
+
+    def test_huge_range_is_clamped_to_the_list(self):
+        start = time.perf_counter()
+        self.assertEqual(self.labels("4-99999999999999"), ["i4", "i5"])
+        self.assertEqual(hogs.selection_numbers("0-99999999999999", 3), {1, 2, 3})
+        self.assertLess(time.perf_counter() - start, 0.5)
+
+
+class ParseGbTest(unittest.TestCase):
+    def test_accepts_decimal_comma_and_rejects_non_finite(self):
+        self.assertEqual(hogs.parse_gb("2,5", "uso"), 2.5)
+        for bad in ("nan", "inf", "0", "-3", "x"):
+            with self.assertRaises(SystemExit, msg=bad):
+                hogs.parse_gb(bad, "uso")
 
 
 class AgoTest(unittest.TestCase):
@@ -103,6 +122,95 @@ class DockerCleanItemsTest(unittest.TestCase):
 
     def test_nothing_when_docker_is_down(self):
         self.assertEqual(hogs.docker_clean_items(hogs.Docker(running=False)), [])
+
+    @staticmethod
+    def fake_docker(images=(), containers=(), inspect=None):
+        """sh falso para gather_docker: system df (resumo e -v), inspect; o resto responde vazio."""
+        calls = []
+
+        def sh(cmd, timeout=60):
+            calls.append(cmd)
+            if cmd[:3] == ["docker", "system", "df"]:
+                out = (json.dumps({"Images": list(images), "Containers": list(containers), "Volumes": []})
+                       if "-v" in cmd else json.dumps({"Type": "Images", "Size": "0B", "Reclaimable": "0B"}))
+                return subprocess.CompletedProcess(cmd, 0, out, "")
+            if cmd[:2] == ["docker", "inspect"]:
+                return inspect and subprocess.CompletedProcess(cmd, 0, inspect, "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return sh, calls
+
+    def test_image_pulled_by_digest_is_removed_by_digest_not_by_repo(self):
+        # `docker rmi postgres` seria postgres:latest, outra imagem
+        digest = "sha256:" + "d" * 64
+        img = {"Repository": "postgres", "Tag": "<none>", "Digest": digest, "ID": "sha256:" + "e" * 64,
+               "UniqueSize": "600MB", "Containers": "0", "CreatedSince": "2 months ago"}
+        sh, calls = self.fake_docker(images=[img])
+        with mock.patch.object(hogs, "sh", sh):
+            for item in hogs.docker_clean_items(hogs.gather_docker()):
+                item.action()
+        self.assertEqual([c for c in calls if c[:2] == ["docker", "rmi"]], [["docker", "rmi", f"postgres@{digest}"]])
+
+    def test_paused_container_is_alive_and_protects_its_project(self):
+        labels = "com.docker.compose.project=infra"
+        cs = [{"ID": "p" * 64, "Names": "db", "State": "paused", "Labels": labels, "Size": "1MB"},
+              {"ID": "x" * 64, "Names": "worker", "State": "exited", "Labels": labels, "Size": "1MB"}]
+        sh, _ = self.fake_docker(containers=cs, inspect=f"{'x' * 64}|2020-01-01T00:00:00Z|2019-01-01T00:00:00Z\n")
+        with mock.patch.object(hogs, "sh", sh):
+            d = hogs.gather_docker()
+        self.assertEqual([(c["name"], c["project_running"]) for c in d.stopped], [("worker", True)])
+
+    def test_unknown_container_age_never_counts_as_old(self):
+        cs = [{"ID": "a" * 64, "Names": "mydb", "State": "exited", "Labels": "", "Size": "1MB"}]
+        sh, _ = self.fake_docker(containers=cs, inspect=None)  # docker inspect falhou
+        with mock.patch.object(hogs, "sh", sh):
+            d = hogs.gather_docker()
+        item = next(i for i in hogs.docker_clean_items(d) if "mydb" in i.label)
+        self.assertIs(item.risk, hogs.LOSS)
+        self.assertEqual(item.hint, "idade desconhecida")
+
+    def test_never_started_container_ages_from_creation(self):
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.0Z")
+        cs = [{"ID": "a" * 64, "Names": "fresh", "State": "created", "Labels": "", "Size": "1MB"}]
+        sh, _ = self.fake_docker(containers=cs, inspect=f"{'a' * 64}|0001-01-01T00:00:00Z|{yesterday}\n")
+        with mock.patch.object(hogs, "sh", sh):
+            self.assertEqual(hogs.gather_docker().stopped[0]["age"], 1)
+
+    def test_report_rows_for_stopped_containers_use_clean_risks(self):
+        d = hogs.Docker(running=True)
+        d.stopped = [{"name": "mydb", "size": 5e9, "age": 3, "project": None, "project_running": False},
+                     {"name": "ancient", "size": 1e9, "age": 400, "project": None, "project_running": False}]
+        risks = {label.split(" (")[0]: risk for label, _, risk, _ in hogs.docker_rows(d) if "parados" in label}
+        self.assertEqual(risks, {"Containers parados há +30 dias": hogs.SAFE, "Outros containers parados": hogs.LOSS})
+
+    def test_small_images_hint_ellipsis_only_when_truncated(self):
+        d = hogs.Docker(running=True)
+        d.images = [{"name": "nginx:1", "size": 100e6, "used": False, "origin": "hub", "created": "", "id": "a"}]
+        item = next(i for i in hogs.docker_clean_items(d) if i.label.startswith("Imagens pequenas"))
+        self.assertEqual(item.hint, "nginx:1")
+
+    def test_failed_removal_is_reported_not_marked_done(self):
+        d = hogs.Docker(running=True)
+        d.images = [{"name": "old:t1", "size": 900_000_000, "used": False, "origin": "local", "created": "", "id": "b"}]
+        items = hogs.docker_clean_items(d)
+        con = hogs.Console(file=io.StringIO(), width=200)
+        failing = lambda cmd, timeout=60: subprocess.CompletedProcess(cmd, 1, "", "Error: conflict: image is in use")
+        with mock.patch.object(hogs, "sh", failing), mock.patch.object(hogs, "clean_items", return_value=items), \
+                mock.patch.object(hogs.Prompt, "ask", return_value="1"), \
+                mock.patch.object(hogs.Confirm, "ask", return_value=True):
+            hogs.clean(con, hogs.Snapshot(1, 1, d, [], []))
+        out = con.file.getvalue().split("Total:")[1]
+        self.assertNotIn("✔ Imagem old:t1", out)
+        self.assertIn("↷ Imagem old:t1: Error: conflict: image is in use", out)
+
+    def test_run_all_runs_every_command_and_then_fails(self):
+        calls = []
+
+        def sh(cmd, timeout=60):
+            calls.append(cmd)
+            return None if cmd[-1] == "b" else subprocess.CompletedProcess(cmd, 0, "", "")
+        with mock.patch.object(hogs, "sh", sh), self.assertRaisesRegex(RuntimeError, "1 de 3 falharam"):
+            hogs.run_all([["docker", "rm", x] for x in "abc"])
+        self.assertEqual(len(calls), 3)
 
 
 class BuilderTest(unittest.TestCase):

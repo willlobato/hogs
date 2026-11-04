@@ -109,9 +109,12 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 
 **Garantias:**
 
-- ❌ Nunca toca em **containers rodando** nem em **imagens usadas por algum container**.
+- ❌ Nunca toca em **containers rodando** (pausados ou reiniciando contam como rodando) nem em **imagens usadas por algum container**.
 - ❌ Nunca apaga **volumes do Docker**, porque é lá que ficam os dados dos seus bancos. A única exceção é o volume de estado de um builder `buildx`, que é só cache de build; mesmo assim o hogs não remove o volume, ele roda `docker buildx prune` nele.
 - 🛡️ Um container parado de um projeto `docker compose` que ainda tem algo rodando nunca entra no grupo “seguro”.
+- 🛡️ Um container cuja idade o Docker não informa nunca conta como “parado há +30 dias”; um que nunca foi iniciado conta a partir da criação.
+- 🛡️ Imagem sem tag baixada por digest (`postgres@sha256:…`) é removida pelo digest, nunca por `docker rmi postgres` (que seria a `postgres:latest`).
+- Se um comando de limpeza falha, o item aparece como mantido, com a mensagem de erro, e não como apagado.
 - 🛡️ Imagens construídas localmente aparecem uma por uma, nunca em grupo.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
 - Nada é apagado sem você confirmar.
