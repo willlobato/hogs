@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import plistlib
 import re
@@ -38,7 +39,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -117,9 +118,10 @@ def du(path: Path) -> int:
 
 
 def fmt(n: float) -> str:
-    if n >= GB:
+    # Os limites são onde o arredondamento vira 1000 da unidade menor (999,7 MB → "1,0 GB", não "1000 MB").
+    if n >= 999.5e6:
         s = f"{n / GB:.1f} GB"
-    elif n >= 1e6:
+    elif n >= 999.5e3:
         s = f"{n / 1e6:.0f} MB"
     else:
         s = f"{n / 1e3:.0f} kB"
@@ -139,6 +141,27 @@ def parse_size(s: str) -> int:
 
 def short(p: Path | str) -> str:
     return str(p).replace(str(HOME), "~", 1)
+
+
+def require(r: subprocess.CompletedProcess | None, what: str) -> subprocess.CompletedProcess:
+    """Comando ausente, sem resposta ou com código ≠ 0 vira RuntimeError com a última linha do erro."""
+    if r is None:
+        raise RuntimeError(f"{what}: não encontrado ou sem resposta")
+    if r.returncode:
+        raise RuntimeError((r.stderr.strip().splitlines() or [f"{what} falhou"])[-1])
+    return r
+
+
+def run_all(cmds: list[list[str]], timeout: int = 60) -> None:
+    """Roda todos os comandos mesmo se algum falhar; no fim, falha se algum falhou."""
+    errors = []
+    for cmd in cmds:
+        try:
+            require(sh(cmd, timeout=timeout), cmd[0])
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise RuntimeError((f"{len(errors)} de {len(cmds)} falharam: " if len(cmds) > 1 else "") + errors[0])
 
 
 def process_running(name: str) -> bool:
@@ -183,14 +206,19 @@ def image_origin(repo: str) -> str:
 ORIGIN_LABEL = {"registry": "registry", "hub": "Docker Hub", "local": "construída aqui", "none": "sem tag"}
 
 
-def _age_days(ts: str) -> int:
+def _age_days(ts: str) -> int | None:
+    """Dias desde o instante do Docker; None se vazio, ilegível ou zerado (0001-01-01: nunca aconteceu)."""
     try:
         dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
     except ValueError:
-        return 9999
-    if dt.year < 2000:           # container criado e nunca iniciado
-        return 9999
+        return None
+    if dt.year < 2000:
+        return None
     return (datetime.now(timezone.utc) - dt).days
+
+
+# Estados em que o container está vivo: não é "parado" e o projeto compose dele conta como rodando.
+ACTIVE_STATES = {"running", "paused", "restarting", "removing"}
 
 
 def _labels(s: str) -> dict[str, str]:
@@ -276,9 +304,16 @@ def gather_docker() -> Docker:
         except ValueError:
             used = False
         repo, tag = img.get("Repository", "<none>"), img.get("Tag", "<none>")
+        image_id, digest = img.get("ID", "").removeprefix("sha256:")[:12], img.get("Digest", "")
+        # Sem tag, `docker rmi repo` seria repo:latest, outra imagem: remove pelo digest ou pelo ID.
+        if tag != "<none>":
+            name = ref = f"{repo}:{tag}"
+        elif repo != "<none>" and digest.startswith("sha256:"):
+            name, ref = f"{repo}@{digest[:19]}…", f"{repo}@{digest}"
+        else:
+            name, ref = repo, image_id
         d.images.append({
-            "repo": repo, "tag": tag, "id": img.get("ID", "").removeprefix("sha256:")[:12],
-            "name": repo if tag == "<none>" else f"{repo}:{tag}",
+            "repo": repo, "tag": tag, "id": image_id, "name": name, "ref": ref,
             "size": parse_size(img.get("UniqueSize", "")), "used": used,
             "origin": image_origin(repo), "created": img.get("CreatedSince", ""),
         })
@@ -294,20 +329,23 @@ def gather_docker() -> Docker:
     containers = v.get("Containers") or []
     running_projects = {
         _labels(c.get("Labels", "")).get("com.docker.compose.project")
-        for c in containers if c.get("State") == "running"
+        for c in containers if c.get("State") in ACTIVE_STATES
     } - {None}
-    stopped = [c for c in containers if c.get("State") != "running"]
-    finished: dict[str, str] = {}
+    stopped = [c for c in containers if c.get("State") not in ACTIVE_STATES]
+    ages: dict[str, int | None] = {}
     if stopped:
-        r = sh(["docker", "inspect", "--format", "{{.Id}}|{{.State.FinishedAt}}"] + [c["ID"] for c in stopped])
+        r = sh(["docker", "inspect", "--format", "{{.Id}}|{{.State.FinishedAt}}|{{.Created}}"]
+               + [c["ID"] for c in stopped])
         for line in (r.stdout.splitlines() if r else []):
-            cid, _, ts = line.partition("|")
-            finished[cid] = ts
+            cid, finished_at, created = (line.split("|") + ["", ""])[:3]
+            # Nunca iniciado: FinishedAt zerado, vale a criação. Idade desconhecida nunca conta como antiga.
+            age = _age_days(finished_at)
+            ages[cid] = age if age is not None else _age_days(created)
     for c in stopped:
         project = _labels(c.get("Labels", "")).get("com.docker.compose.project")
         d.stopped.append({
             "name": c.get("Names", c["ID"][:12]), "image": c.get("Image", ""),
-            "size": parse_size(c.get("Size", "")), "age": _age_days(finished.get(c["ID"], "")),
+            "size": parse_size(c.get("Size", "")), "age": ages.get(c["ID"]),
             "project": project, "project_running": project in running_projects,
         })
 
@@ -356,41 +394,54 @@ def trim_builders(max_gb: float) -> list[tuple[str, int, str]]:
     return done
 
 
+def is_old_stopped(c: dict) -> bool:
+    """Parado há +30 dias, idade conhecida e sem projeto rodando: vai para o grupo 🟢."""
+    return c["age"] is not None and c["age"] >= OLD_CONTAINER_DAYS and not c["project_running"]
+
+
+def stopped_risk(c: dict) -> Risk:
+    return SAFE if is_old_stopped(c) else REDOWN if c["project"] else LOSS
+
+
+def image_ref(img: dict) -> str:
+    return img.get("ref") or img["name"]
+
+
 def docker_clean_items(d: Docker) -> list[Item]:
     if not d.running:
         return []
     items: list[Item] = []
     if d.build_cache:
         items.append(Item("docker", "Docker: cache de build", d.build_cache, SAFE,
-                          lambda: sh(["docker", "builder", "prune", "-a", "-f"], timeout=900),
+                          lambda: run_all([["docker", "builder", "prune", "-a", "-f"]], timeout=900),
                           "próximo build fica mais lento"))
 
     for bc in d.builder_caches:
         if bc["size"] >= 1e6:
             items.append(Item("docker", f"Docker: cache do builder {bc['builder']}", bc["size"], SAFE,
-                              lambda n=bc["builder"]: prune_builder(n),
+                              lambda n=bc["builder"]: require(prune_builder(n), "docker buildx prune"),
                               "próximo build fica mais lento"))
 
     untagged = [i for i in d.images if not i["used"] and i["origin"] == "none"]
     if untagged:
         ids = [i["id"] for i in untagged]
         items.append(Item("docker", f"Docker: imagens sem tag ({len(untagged)})", sum(i["size"] for i in untagged),
-                          SAFE, lambda ids=ids: [sh(["docker", "rmi", x]) for x in ids], "versões antigas órfãs"))
+                          SAFE, lambda ids=ids: run_all([["docker", "rmi", x] for x in ids]), "versões antigas órfãs"))
 
-    old = [c for c in d.stopped if c["age"] >= OLD_CONTAINER_DAYS and not c["project_running"]]
+    old = [c for c in d.stopped if is_old_stopped(c)]
     if old:
         names = [c["name"] for c in old]
         preview = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
         items.append(Item("docker", f"Docker: containers parados há +{OLD_CONTAINER_DAYS} dias ({len(old)})",
                           sum(c["size"] for c in old), SAFE,
-                          lambda names=names: [sh(["docker", "rm", n]) for n in names], preview))
+                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview))
     for c in d.stopped:
-        if c in old:
+        if is_old_stopped(c):
             continue
-        why = f"projeto {c['project']} está rodando" if c["project_running"] else f"parado há {c['age']} dias"
-        items.append(Item("docker", f"Docker: container {c['name']}", c["size"],
-                          REDOWN if c["project"] else LOSS,
-                          lambda n=c["name"]: sh(["docker", "rm", n]), why))
+        why = (f"projeto {c['project']} está rodando" if c["project_running"]
+               else f"parado há {c['age']} dias" if c["age"] is not None else "idade desconhecida")
+        items.append(Item("docker", f"Docker: container {c['name']}", c["size"], stopped_risk(c),
+                          lambda n=c["name"]: run_all([["docker", "rm", n]]), why))
 
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):
@@ -401,14 +452,15 @@ def docker_clean_items(d: Docker) -> list[Item]:
             small_pullable.append(img)
             continue
         items.append(Item("docker", f"Imagem {img['name']}", img["size"], LOSS if local else REDOWN,
-                          lambda n=img["name"]: sh(["docker", "rmi", n]),
+                          lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]),
                           f"{ORIGIN_LABEL[img['origin']]} · {img['created']}"))
     if small_pullable:
         names = [i["name"] for i in small_pullable]
+        refs = [image_ref(i) for i in small_pullable]
         items.append(Item("docker", f"Imagens pequenas de registry/Hub ({len(names)})",
                           sum(i["size"] for i in small_pullable), REDOWN,
-                          lambda names=names: [sh(["docker", "rmi", n]) for n in names],
-                          ", ".join(n.rsplit("/", 1)[-1] for n in names[:3]) + "…"))
+                          lambda refs=refs: run_all([["docker", "rmi", r] for r in refs]),
+                          ", ".join(n.rsplit("/", 1)[-1] for n in names[:3]) + ("…" if len(names) > 3 else "")))
     return items
 
 
@@ -1120,14 +1172,15 @@ def clean_worktrees(con: Console, rows: list[Worktree], days: int, root: Path | 
     con.print(Panel(msg, border_style="green" if done else "yellow", padding=(0, 2)))
 
 
-def selection_numbers(raw: str, total: int) -> set[int]:
-    """'a' = todos; '1,3,5-7' = esses. Números fora da lista são ignorados."""
+def selection_numbers(raw: str, total: int, everything: set[int] | None = None) -> set[int]:
+    """'a' = `everything` (padrão: todos); '1,3,5-7' = esses. Números fora da lista são ignorados."""
     chosen: set[int] = set()
     for tok in re.split(r"[,\s]+", raw.strip().lower()):
         if tok == "a":
-            chosen |= set(range(1, total + 1))
+            chosen |= set(range(1, total + 1)) if everything is None else everything
         elif m := re.fullmatch(r"(\d+)-(\d+)", tok):
-            chosen |= set(range(int(m.group(1)), int(m.group(2)) + 1))
+            # limitado à lista: "1-99999999999" não cria bilhões de números
+            chosen |= set(range(max(1, int(m.group(1))), min(total, int(m.group(2))) + 1))
         elif tok.isdigit():
             chosen.add(int(tok))
     return {n for n in chosen if 1 <= n <= total}
@@ -1190,7 +1243,7 @@ def make_action(pd: PathDef) -> Callable[[], object] | None:
         return lambda: [shutil.rmtree(p, ignore_errors=True) for p in pd.paths]
     if pd.action == "empty":
         return lambda: empty_dir(pd.paths[0])
-    return lambda: sh(pd.action, timeout=900)
+    return lambda: run_all([pd.action], timeout=900)
 
 
 def make_guard(pd: PathDef) -> Callable[[], str | None] | None:
@@ -1527,13 +1580,28 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
         ("Cache de build", d.build_cache, SAFE, "próximo build fica mais lento"),
         *[(f"Cache do builder {bc['builder']}", bc["size"], SAFE, "volume do BuildKit; o daemon.json não limita")
           for bc in d.builder_caches],
-        (f"Containers parados ({len(d.stopped)})", sum(c["size"] for c in d.stopped), SAFE, ""),
+        *stopped_rows(d.stopped),
         (f"Volumes sem uso ({len(vol_free)})", sum(v["size"] for v in vol_free), INFO, "dados de bancos: revise à mão"),
         (f"Volumes em uso ({len(vol_used)})", sum(v["size"] for v in vol_used), INFO, "nunca mexo"),
     ]
     untracked = d.raw_real - d.total
     if untracked > 3 * GB:
         rows.append(("Não contabilizado pelo Docker", untracked, INFO, "VM e sobras; parte volta ao reiniciar o Docker"))
+    return rows
+
+
+def stopped_rows(stopped: list[dict]) -> list[tuple[str, int, Risk, str]]:
+    """Containers parados com o mesmo risco do --clean: os antigos 🟢 e o resto pelo pior risco."""
+    old = [c for c in stopped if is_old_stopped(c)]
+    rest = [c for c in stopped if not is_old_stopped(c)]
+    rows = []
+    if old:
+        rows.append((f"Containers parados há +{OLD_CONTAINER_DAYS} dias ({len(old)})",
+                     sum(c["size"] for c in old), SAFE, ""))
+    if rest:
+        risk = max((stopped_risk(c) for c in rest), key=lambda r: r.rank)
+        rows.append((f"Outros containers parados ({len(rest)})", sum(c["size"] for c in rest), risk,
+                     "recentes ou de projeto rodando; veja um por um no --clean"))
     return rows
 
 
@@ -1710,17 +1778,9 @@ def clean_items(s: Snapshot) -> list[Item]:
 
 
 def parse_selection(raw: str, items: list[Item]) -> list[Item]:
-    chosen: set[int] = set()
-    for tok in re.split(r"[,\s]+", raw.strip().lower()):
-        if not tok:
-            continue
-        if tok == "a":
-            chosen |= {n for n, i in enumerate(items, 1) if i.risk is SAFE}
-        elif m := re.fullmatch(r"(\d+)-(\d+)", tok):
-            chosen |= set(range(int(m.group(1)), int(m.group(2)) + 1))
-        elif tok.isdigit():
-            chosen.add(int(tok))
-    return [items[n - 1] for n in sorted(chosen) if 1 <= n <= len(items)]
+    """Como selection_numbers, mas 'a' são só os 🟢."""
+    safe = {n for n, i in enumerate(items, 1) if i.risk is SAFE}
+    return [items[n - 1] for n in sorted(selection_numbers(raw, len(items), safe))]
 
 
 def clean(con: Console, s: Snapshot) -> None:
@@ -1868,7 +1928,7 @@ def parse_gb(arg: str, usage: str) -> float:
         value = float(arg.replace(",", "."))
     except ValueError:
         sys.exit(usage)
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         sys.exit(usage)
     return value
 

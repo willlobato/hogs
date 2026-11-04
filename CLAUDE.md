@@ -10,7 +10,12 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
 - The one volume exception: BuildKit state volumes (`buildx_buildkit_*_state`) are build cache. They are reclaimed only through `docker buildx prune`, never removed as volumes.
 - `--docker-gc` prunes with `--max-used-space`, which keeps the most recent cache. Pruning a `docker`-driver builder works only through the current context's builder (`default` fails on Docker Desktop).
 - Locally built images (`origin == "local"`) are listed one per item, never grouped, always 🔴.
-- When `image_origin` is unsure, classify toward the higher risk.
+- When `image_origin` is unsure, classify toward the higher risk. Same for a stopped container's age: unknown
+  age is never "old" (🟢); a never-started container ages from `Created`.
+- Paused, restarting and removing containers count as running (`ACTIVE_STATES`), also for their compose project.
+- `docker rmi` targets the exact reference (`img["ref"]`): an untagged `repo` pulled by digest is removed as
+  `repo@sha256:…`, never as bare `repo` (= `repo:latest`).
+- Cleanup actions raise on failure (`require`/`run_all`), so `clean()` reports ↷ instead of ✔.
 - A stopped container whose compose project still has something running stays out of the 🟢 group.
 - Every deletion goes through the selection + `Confirm` flow.
 - Worktree deletion uses `git worktree remove` without force and preserves branches. Recheck HEAD,
