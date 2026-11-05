@@ -520,10 +520,14 @@ def docker_clean_items(d: Docker) -> list[Item]:
         for img, current in sorted(rollbacks, key=lambda p: -p[0]["size"]):
             age = rollback_age_days(img, current, seen[img["name"]], now)
             old = age > days
-            items.append(Item("docker", f"Ponto de volta {img['name']}", img["size"], SAFE if old else EVAL,
-                              lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]),
-                              f"ponto de volta há {int(age)} dias" if old
-                              else "ponto de volta recente: o QA pode estar em andamento"))
+            hint = (f"ponto de volta há {int(age)} dias" if old
+                    else "ponto de volta recente: o QA pode estar em andamento")
+            same = bool(img["id"]) and img["id"] == current["id"]
+            if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
+                hint = "mesma imagem da atual: só remove a tag"
+            items.append(Item("docker", f"Ponto de volta {img['name']}", 0 if same else img["size"],
+                              SAFE if old else EVAL,
+                              lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]), hint))
 
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):

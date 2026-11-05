@@ -159,6 +159,69 @@ class RollbackTest(unittest.TestCase):
         self.assertIs(labels["Imagem app:antes-x"].risk, hogs.LOSS)
 
 
+    def build(self, rollback_extra=None, current_extra=None, tag="antes-x"):
+        now = time.time()
+        d = hogs.Docker(running=True)
+        roll = {"name": f"app:{tag}", "repo": "app", "tag": tag, "ref": f"app:{tag}", "size": 7e8, "used": False,
+                "origin": "local", "created": "", "id": "1", "created_at": now - 90 * 86400}
+        cur = {"name": "app:latest", "repo": "app", "tag": "latest", "ref": "app:latest", "size": 7e8,
+               "used": True, "origin": "local", "created": "", "id": "2", "created_at": now - 90 * 86400}
+        roll.update(rollback_extra or {})
+        cur.update(current_extra or {})
+        d.images = [roll, cur]
+        return d, now
+
+    def run_items(self, d, seen):
+        with mock.patch.object(hogs, "first_seen", return_value=seen), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            return {i.label: i for i in hogs.docker_clean_items(d)}
+
+    def test_no_reliable_old_signal_is_eval(self):
+        d, now = self.build(current_extra={"created_at": None})
+        item = self.run_items(d, {"app:antes-x": now})["Ponto de volta app:antes-x"]
+        self.assertIs(item.risk, hogs.EVAL)
+
+    def test_recent_date_in_tag_name_drives_eval(self):
+        tag = "antes-" + time.strftime("%Y%m%d") + "-0000"
+        d, now = self.build(tag=tag)
+        item = self.run_items(d, {f"app:{tag}": now - 90 * 86400})[f"Ponto de volta app:{tag}"]
+        self.assertIs(item.risk, hogs.EVAL)
+
+    def test_first_seen_not_called_without_rollback_candidates(self):
+        d = hogs.Docker(running=True)
+        d.images = [{"name": "app:v1", "repo": "app", "tag": "v1", "ref": "app:v1", "size": 7e8, "used": False,
+                     "origin": "local", "created": "", "id": "1"}]
+        with mock.patch.object(hogs, "first_seen") as fs, mock.patch.object(hogs, "load_config", return_value={}):
+            hogs.docker_clean_items(d)
+        fs.assert_not_called()
+
+    def test_small_hub_rollback_is_not_repeated_in_small_images_group(self):
+        d, now = self.build(rollback_extra={"origin": "hub", "size": 1e8}, current_extra={"origin": "hub"})
+        labels = self.run_items(d, {"app:antes-x": now - 90 * 86400})
+        self.assertIn("Ponto de volta app:antes-x", labels)
+        self.assertFalse([k for k in labels if k.startswith("Imagens pequenas")])
+
+    def test_same_image_as_current_frees_nothing(self):
+        d, now = self.build(rollback_extra={"id": "2"})
+        item = self.run_items(d, {"app:antes-x": now - 90 * 86400})["Ponto de volta app:antes-x"]
+        self.assertEqual(item.size, 0)
+        self.assertIn("só remove a tag", item.hint)
+
+    def test_parse_created_at(self):
+        self.assertEqual(hogs.parse_created_at("2026-11-04 20:04:12 -0300 -03"),
+                         datetime(2026, 11, 4, 23, 4, 12, tzinfo=timezone.utc).timestamp())
+        self.assertIsNone(hogs.parse_created_at("lixo"))
+        self.assertIsNone(hogs.parse_created_at(""))
+
+    def test_gather_docker_reads_created_at(self):
+        img = {"Repository": "app", "Tag": "latest", "ID": "sha256:" + "a" * 64, "UniqueSize": "1GB",
+               "Containers": "0", "CreatedSince": "1 hour ago", "CreatedAt": "2026-11-04 20:04:12 -0300 -03"}
+        sh, _ = DockerCleanItemsTest.fake_docker(images=[img])
+        with mock.patch.object(hogs, "sh", sh):
+            d = hogs.gather_docker()
+        self.assertEqual(d.images[0]["created_at"], hogs.parse_created_at("2026-11-04 20:04:12 -0300 -03"))
+
+
 class AgoTest(unittest.TestCase):
     def days_ago(self, n):
         return hogs.ago(datetime.now(timezone.utc) - timedelta(days=n, hours=1))
