@@ -156,14 +156,14 @@ Como a matriz convive com os riscos que já existem (decisão do construtor, con
 - Nunca entram: bibliotecas de Fotos/Música (pacotes), pastas montadas por container e repositórios Git.
 
 ### Fora das sugestões nesta versão
-- `~/Development` fora dos worktrees: aparece na barra como "Projetos", sem sugestões. O autor disse que o gargalo
+- A pasta dos worktrees (no caso do autor, `~/Development`) fora dos worktrees: aparece na barra como "Projetos", sem sugestões. O autor disse que o gargalo
   são os worktrees, não a pasta inteira.
 
 ## Barra e relatório
 
 - "Sistema e outros" deixa de existir como bloco opaco. A barra mostra partes nomeadas: Docker, Worktrees,
   Caches de dev, Apps e dados, Projetos, macOS e swap, Não identificado, Livre.
-- Sem contagem dupla (worktrees dentro de `~/Development`, clones APFS). A soma das partes nunca passa do usado;
+- Sem contagem dupla (worktrees dentro da pasta de projetos, clones APFS). A soma das partes nunca passa do usado;
   "Não identificado" é o resto, nunca negativo.
 - O cabeçalho mostra "com o recomendado: X GB livres".
 
@@ -294,7 +294,7 @@ O hogs é público. As regras nasceram do fluxo do autor, mas nada pode depender
 - Cruzar nome de imagem ou tag com PRs do GitHub, ou usar a API do GitHub.
 - Mudar os scripts de build dos projetos do autor para gravar as etiquetas OCI (tarefa opcional e separada, em outros
   repositórios).
-- Sugerir projetos inteiros de `~/Development` para remoção.
+- Sugerir projetos inteiros da pasta dos worktrees para remoção.
 - Apagar volumes do sistema, swap ou snapshots diretamente.
 - Alterar settings do Claude Code automaticamente.
 
