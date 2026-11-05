@@ -717,10 +717,13 @@ class Worktree:
     reason: str = "não verificado"
     eligible: bool = False
     merged: str = ""                                       # "squash em origin/main"; vazio = não comprovado
+    pushed: str = ""                                       # "origin/feature" contém o HEAD; vazio = não comprovado
     users: list[str] = field(default_factory=list)         # quem usa: sessões, processos, containers
     sessions: list[str] = field(default_factory=list)      # sessões vivas do Claude Code que trabalham nele
     blockers: list[str] = field(default_factory=list)      # ⚪ manter: trabalho que só existe aqui ou dúvida
     waits: list[str] = field(default_factory=list)         # 🟡 depois: em uso ou mexido há pouco
+    conversations: list[ConvLink] = field(default_factory=list)  # conversas do Claude Code ligadas a ele
+    checks: list[tuple[bool, str]] = field(default_factory=list)  # cada verificação: (passou, texto)
 
     @property
     def verdict(self) -> str:
@@ -867,6 +870,18 @@ def merged_how(path: Path, head: str, ref: str) -> str:
         return ""
     theirs = patch_ids(path, "log", "--no-merges", "-p", "--max-count=2000", f"{base}..{ref}")
     return "squash" if theirs and mine <= theirs else ""
+
+
+def pushed_ref(path: Path, head: str, branch: str) -> str | None:
+    """Ref remota local (sem refs/remotes/) que contém o HEAD: a da própria branch, senão a primeira.
+
+    Só lê o que o último fetch/push deixou; nunca acessa a rede. '' = nenhuma; None = o Git não respondeu."""
+    r = git_at(path, "for-each-ref", "--contains", head, "--format=%(refname)", "refs/remotes")
+    if r is None or r.returncode:
+        return None
+    refs = [x.removeprefix("refs/remotes/") for x in r.stdout.split() if not x.endswith("/HEAD")]
+    own = branch.removeprefix("refs/heads/")
+    return next((x for x in refs if x.partition("/")[2] == own), refs[0] if refs else "")
 
 
 def claude_key(path: Path | str) -> str:
@@ -1056,9 +1071,19 @@ SESSION_WINDOW_DAYS = 7  # janela das sessões do Codex e das pastas do Claude m
 
 
 def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]], str, list[tuple[Path, str]]],
-                     agents: Agents | None = None) -> Worktree:
-    """Coleta todos os sinais e decide: 🟢 seguro, 🟡 depois (em uso ou recente) ou ⚪ manter."""
-    result = Worktree(w.path, w.repo, size=w.size)
+                     agents: Agents | None = None, links: list[ConvLink] | None = None, conv_error: str = "",
+                     stale_days: int = 30) -> Worktree:
+    """Coleta todos os sinais e decide: 🟢 seguro, 🟡 depois (em uso ou recente) ou ⚪ manter.
+
+    🟢 é mergeado na principal, ou sem merge mas enviado (HEAD numa ref remota local) e parado há mais de
+    stale_days, sem conversa do Claude Code nesse prazo. Cada verificação feita vira uma linha de checks."""
+    result = Worktree(w.path, w.repo, size=w.size, conversations=links or [])
+    marks = [0, 0]
+    def check(ok_text: str) -> None:
+        """Fecha uma verificação: falhou se ela acrescentou blocker ou wait desde a anterior."""
+        new = result.blockers[marks[0]:] + result.waits[marks[1]:]
+        result.checks.append((not new, new[0] if new else ok_text))
+        marks[:] = [len(result.blockers), len(result.waits)]
     def keep(reason: str) -> Worktree:
         result.blockers.append(reason)
         result.reason = result.blockers[0]
@@ -1084,6 +1109,7 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
             b.append(f"{len(status.stdout.splitlines())} alterações locais ou arquivos não versionados")
         if (w.path / ".gitmodules").exists():
             b.append("contém submódulos; revise antes")
+        check("tudo commitado")
         ref = default_branch(w.path)
         if not ref:
             b.append("branch principal remota desconhecida (origin/HEAD)")
@@ -1092,7 +1118,16 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
             if how:
                 result.merged = f"{how} em {ref.removeprefix('refs/remotes/')}"
             else:
-                b.append(f"merge não comprovado em {ref.removeprefix('refs/remotes/')}")
+                pushed = pushed_ref(w.path, result.head, result.branch)
+                if pushed is None:
+                    b.append("não foi possível verificar se os commits foram enviados")
+                elif not pushed:
+                    b.append(f"merge não comprovado em {ref.removeprefix('refs/remotes/')} "
+                             "e há commits não enviados")
+                else:
+                    result.pushed = pushed
+        check(f"já na main ({result.merged})" if result.merged
+              else f"enviado a {result.pushed} (conferido nas referências locais de origin)")
         ignored = git_at(w.path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
         if ignored is None or ignored.returncode:
             b.append("não foi possível verificar arquivos ignorados")
@@ -1101,6 +1136,7 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
             if kept:
                 more = f" (+{len(kept) - 3})" if len(kept) > 3 else ""
                 b.append(f"ignorados que não voltam pelo Git: {', '.join(kept[:3])}{more}")
+        check("sem .env nem arquivo que o Git não recupera")
 
         # Quem usa a pasta. Sessões do Claude Code e do Codex que trabalharam nele são só informação: o
         # trabalho delas já está na main. Trava apenas o que roda dentro da pasta agora (dev server,
@@ -1130,6 +1166,7 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
                     + group_processes(running) + containers)
         if now_here:
             result.waits.append(f"em uso agora: {', '.join(now_here[:2])}")
+        check("nada rodando dentro, nenhum container")
 
         gitdir = git_at(w.path, "rev-parse", "--absolute-git-dir")
         if gitdir is None or gitdir.returncode:
@@ -1138,10 +1175,30 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
             result.last_activity = last_change(w.path, Path(gitdir.stdout.strip()))
             if days and result.last_activity > time.time() - days * 86400:
                 result.waits.append(f"mexido {elapsed(result.last_activity)} (mínimo {days} d)")
+        # Sem merge, a pasta só sai parada: nada mexido nem conversado no prazo, e nenhuma sessão viva nela.
+        if not result.merged and result.pushed:
+            since = time.time() - stale_days * 86400
+            if result.last_activity > since:
+                result.waits.append(f"sem merge, mexido {elapsed(result.last_activity)} "
+                                    f"(em andamento; prazo {stale_days} d)")
+            recent = [link.conv for link in result.conversations if link.conv.last > since]
+            if recent:
+                conv = max(recent, key=lambda c: c.last)
+                result.waits.append(f"conversa do Claude Code {elapsed(conv.last)}: "
+                                    f"{conv.title or conv.session[:8]}")
+            if result.sessions:
+                result.waits.append(f"conversa aberta do Claude Code: {', '.join(result.sessions)}")
+            if conv_error:
+                b.append(conv_error)
+        idle = max(0, int((time.time() - result.last_activity) // 86400))
+        check(f"sem mexer desde {datetime.fromtimestamp(result.last_activity):%d/%m} ({idle} dias)")
     except (OSError, RuntimeError, KeyError) as exc:
         result.blockers.append(f"inspeção inconclusiva: {exc}")
-    result.eligible = not result.blockers and not result.waits and bool(result.merged)
-    if result.eligible:
+        check("")
+    result.eligible = not result.blockers and not result.waits and bool(result.merged or result.pushed)
+    if result.eligible and not result.merged:
+        result.reason = f"enviado a {result.pushed} · mexido {elapsed(result.last_activity)} · a branch fica"
+    elif result.eligible:
         result.reason = f"{result.merged} · mexido {elapsed(result.last_activity)}"
         if result.sessions:
             result.reason += f" · sessão {', '.join(result.sessions)}"
