@@ -3,6 +3,7 @@ import sys
 import json
 import os
 import plistlib
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -856,8 +857,10 @@ class BreakdownTest(unittest.TestCase):
     def test_worktrees_line_and_group_item(self):
         rows = [self.wt(1e9, "seguro"), self.wt(2e9, "seguro"), self.wt(4e9, "depois"), self.wt(8e9, "manter")]
         self.assertEqual(hogs.verdict_counts(rows),
-                         {"seguro": (2, int(3e9)), "depois": (1, int(4e9)), "manter": (1, int(8e9))})
-        self.assertEqual(hogs.verdict_counts([]), {"seguro": (0, 0), "depois": (0, 0), "manter": (0, 0)})
+                         {"seguro": (2, int(3e9)), "avaliar": (0, 0), "depois": (1, int(4e9)),
+                          "manter": (1, int(8e9))})
+        self.assertEqual(hogs.verdict_counts([]),
+                         {"seguro": (0, 0), "avaliar": (0, 0), "depois": (0, 0), "manter": (0, 0)})
         self.assertEqual(hogs.worktrees_line(rows, Path("/dev")).plain.split("  detalhes")[0],
                          "🌳 Worktrees: 4 · 15,0 GB · 2 podem sair (3,0 GB) · 1 em andamento · 1 com trabalho só aqui")
         self.assertIn("  detalhes: hogs --worktrees /dev", hogs.worktrees_line(rows, Path("/dev")).plain)
@@ -1700,6 +1703,9 @@ class WorktreeTest(unittest.TestCase):
         self.path = self.root / "feature with spaces"
         self.git(self.repo, "worktree", "add", "-b", "feature", str(self.path))
         self.w = hogs.Worktree(self.path, self.repo)
+        self.mounts = mock.patch.object(hogs, "all_container_mounts", return_value=([], True))
+        self.mounts.start()
+        self.addCleanup(self.mounts.stop)
         self.age()
 
     def git(self, path, *args):
@@ -2066,6 +2072,184 @@ class WorktreeTest(unittest.TestCase):
 
     def test_worktree_items_without_safe_is_empty(self):
         self.assertEqual(hogs.worktree_items([hogs.Worktree(self.path, self.repo, blockers=["x"])], self.root, 30), [])
+
+    def fake_trash(self):
+        """move_to_trash de mentira: move para uma pasta do teste e anota o caminho."""
+        trash = self.root / "Lixeira"
+        trash.mkdir(exist_ok=True)
+        moved = []
+        def move(p):
+            moved.append(p)
+            shutil.move(str(p), str(trash / p.name))
+        patcher = mock.patch.object(hogs, "move_to_trash", side_effect=move)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return trash, moved
+
+    def leftovers(self):
+        (self.path / "rascunho.md").write_text("anotação solta\n")
+        (self.path / ".env").write_text("TOKEN=x\n")
+        (self.path / "tmp").mkdir()
+        (self.path / "tmp" / "saida.log").write_text("log\n")
+        self.age()
+
+    def test_merged_with_files_outside_git_is_eval_and_they_go_to_trash(self):
+        self.leftovers()
+        row = self.inspect()
+        self.assertFalse(row.eligible, "nunca 🟢")
+        self.assertTrue(row.trashable, row.reason)
+        self.assertEqual(row.verdict, "avaliar")
+        self.assertEqual(sorted(row.leftovers), [".env", "rascunho.md", "tmp/"])
+        self.assertIn("Lixeira", row.reason)
+        self.quiet()
+        trash, moved = self.fake_trash()
+        with self.assertRaises(RuntimeError, msg="o caminho 🟢 recusa"):
+            hogs.remove_worktree(row, 0)
+        self.assertEqual(moved, [])
+        hogs.trash_and_remove_worktree(row, 0)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(sorted(p.name for p in trash.iterdir()), [".env", "rascunho.md", "tmp"])
+        self.assertEqual((trash / ".env").read_text(), "TOKEN=x\n", "o arquivo está inteiro na Lixeira")
+        self.assertEqual(self.git(self.repo, "rev-parse", "feature"), row.head, "a branch fica")
+
+    def test_symlink_outside_git_is_unlinked_and_its_target_never_touched(self):
+        shared = self.root / "compartilhado.env"
+        shared.write_text("SEGREDO=1\n")
+        (self.path / ".env").symlink_to(shared)
+        self.age()
+        row = self.inspect()
+        self.assertEqual(row.leftovers, [".env"])
+        self.quiet()
+        _, moved = self.fake_trash()
+        hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [], "o atalho não passa pelo Finder")
+        self.assertFalse(self.path.exists())
+        self.assertEqual(shared.read_text(), "SEGREDO=1\n", "o destino do atalho fica intacto")
+
+    def test_folder_of_a_stopped_container_never_goes_to_trash(self):
+        (self.path / "dados").mkdir()
+        (self.path / "dados" / "banco.mdf").write_text("dados do banco\n")
+        self.age()
+        self.assertTrue(self.inspect().trashable, "sem container, é 🟠")
+        stopped = ([(self.path / "dados").resolve()], True)    # docker ps -a: o container parado monta a pasta
+        with mock.patch.object(hogs, "all_container_mounts", return_value=stopped):
+            row = self.inspect()
+            self.assertEqual(row.verdict, "manter")
+            self.assertIn("container", row.reason)
+        with mock.patch.object(hogs, "all_container_mounts", return_value=([self.path.resolve()], True)):
+            self.assertEqual(self.inspect().verdict, "manter", "montar a pasta inteira também segura")
+        with mock.patch.object(hogs, "all_container_mounts", return_value=([], False)):
+            self.assertEqual(self.inspect().verdict, "manter", "Docker sem responder: na dúvida, segura")
+        row = self.inspect()
+        self.quiet()
+        _, moved = self.fake_trash()
+        with mock.patch.object(hogs, "all_container_mounts", return_value=stopped):
+            with self.assertRaisesRegex(RuntimeError, "container"):
+                hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [])
+        self.assertTrue((self.path / "dados" / "banco.mdf").exists())
+
+    def test_ignored_file_inside_untracked_folder_is_listed_once_and_removal_finishes(self):
+        (self.path / "tmp").mkdir()
+        (self.path / "tmp" / "a.txt").write_text("a\n")
+        (self.path / "tmp" / ".env").write_text("TOKEN=x\n")
+        self.age()
+        row = self.inspect()
+        self.assertEqual(row.leftovers, ["tmp/"])
+        self.quiet()
+        trash, moved = self.fake_trash()
+        hogs.trash_and_remove_worktree(row, 0)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(sorted(p.name for p in (trash / "tmp").iterdir()), [".env", "a.txt"])
+
+    def test_new_file_inside_a_listed_folder_is_refused(self):
+        self.leftovers()
+        row = self.inspect()
+        (self.path / "tmp" / "novo.log").write_text("depois da confirmação\n")
+        self.quiet()
+        _, moved = self.fake_trash()
+        with self.assertRaisesRegex(RuntimeError, "tmp/novo.log"):
+            hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [])
+
+    def test_all_container_mounts_reads_stopped_containers_and_falls_back(self):
+        self.mounts.stop()
+        calls = []
+        def fake(cmd, timeout=60):
+            calls.append(cmd)
+            if cmd[:3] == ["docker", "ps", "-aq"]:
+                return subprocess.CompletedProcess(cmd, 0, "c1\nc2\n", "")
+            return subprocess.CompletedProcess(cmd, 0, '[{"Type":"bind","Source":"/tmp"}]\n[]\n', "")
+        with mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(hogs, "sh", fake):
+            self.assertEqual(hogs.all_container_mounts(), ([Path("/tmp").resolve()], True))
+        self.assertEqual(calls[0], ["docker", "ps", "-aq"], "parados incluídos")
+        failed = lambda cmd, timeout=60: subprocess.CompletedProcess(cmd, 1, "", "erro")
+        with mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(hogs, "sh", failed), \
+                mock.patch.object(hogs, "MOUNTS_FILE", self.root / "nao-existe.json"):
+            self.assertEqual(hogs.all_container_mounts(), ([], False))
+        self.mounts.start()
+
+    def test_split_status_counts_renames_once(self):
+        out = "?? tmp/\0R  novo.txt\0velho.txt\0 M file.txt\0?? a b.md\0"
+        self.assertEqual(hogs.split_status(out), (["tmp/", "a b.md"], 2))
+
+    def test_trash_removal_refuses_new_files_after_selection(self):
+        self.leftovers()
+        row = self.inspect()
+        (self.path / "novo.txt").write_text("apareceu depois\n")
+        self.quiet()
+        _, moved = self.fake_trash()
+        with self.assertRaisesRegex(RuntimeError, "novo.txt"):
+            hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [], "nada vai para a Lixeira se a lista mudou")
+        self.assertTrue(self.path.exists())
+
+    def test_files_outside_git_never_release_edited_or_unmerged(self):
+        self.leftovers()
+        (self.path / "file.txt").write_text("editado sem commit\n")
+        self.age()
+        row = self.inspect()
+        self.assertEqual(row.verdict, "manter")
+        self.assertFalse(row.trashable)
+        self.assertIn("alterações locais", row.reason)
+        self.git(self.path, "checkout", "--", "file.txt")
+        self.commit_and_push()
+        row = self.inspect(days=0)
+        self.assertEqual(row.verdict, "manter", "sem merge, arquivo fora do Git segura como antes")
+        self.assertFalse(row.trashable)
+        self.quiet()
+        _, moved = self.fake_trash()
+        with self.assertRaises(RuntimeError):
+            hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [])
+        self.assertTrue(self.path.exists())
+
+    def test_trash_removal_refuses_when_in_use(self):
+        self.leftovers()
+        row = self.inspect()
+        self.quiet()
+        _, moved = self.fake_trash()
+        busy = ([(self.path / "rascunho.md", "vim (pid 1)")], "", [])
+        with mock.patch.object(hogs, "worktree_usage", return_value=busy):
+            with self.assertRaisesRegex(RuntimeError, "em uso agora"):
+                hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [])
+        self.assertTrue(self.path.exists())
+
+    def test_worktree_items_offer_trashable_as_eval_one_by_one(self):
+        self.leftovers()
+        row = self.inspect()
+        [item] = hogs.worktree_items([row], self.root, 0)
+        self.assertIs(item.risk, hogs.EVAL)
+        self.assertEqual(item.kind, "worktree_sobras")
+        self.assertIn("Lixeira", item.hint)
+        rows = [hogs.Row(hogs.item_key(item), [item.label], item)]
+        self.assertEqual(hogs.mark_all_safe(rows, set()), 0, "a nunca marca")
+        with mock.patch.object(hogs, "trash_and_remove_worktree") as rm:
+            item.action()
+        rm.assert_called_once_with(row, 0, self.root)
 
     def commit_and_push(self, push=True):
         (self.path / "file.txt").write_text("trabalho sem merge\n")
@@ -2937,6 +3121,26 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(len(app.marked), 4)
 
+    def test_trashable_worktree_is_marked_alone_and_confirmation_lists_its_files(self):
+        w = hogs.Worktree(self.ROOT / "shop-api" / "sobras", Path("/dev/shop-api"), "abc", "refs/heads/feat/sobras",
+                          900_000_000, time.time() - 5 * 86400, merged="merge em origin/main",
+                          leftovers=[".env", "notas/plano-longo-de-outra-sessao.md"])
+        self.assertEqual(w.verdict, "avaliar")
+        app = self.app(rows=[w])
+        self.press(app, "a")
+        self.assertNotIn("worktree|shop-api / shop-api/sobras", app.marked, "a só marca 🟢")
+        app.marked = {"worktree|shop-api / shop-api/sobras"}
+        app.mode = "confirm"
+        text = self.text(app)
+        for part in ("→ Lixeira: .env", "→ Lixeira: notas/plano-longo-de-outra-sessao.md",
+                     "Arquivos vão para a Lixeira."):
+            self.assertIn(part, text)
+        with mock.patch.object(hogs, "trash_and_remove_worktree") as rm:
+            app.handle(hogs.Key("s"))
+        rm.assert_called_once_with(w, 0, self.ROOT)
+        self.assertEqual(app.log, ["✔ shop-api / shop-api/sobras"])
+        self.assertIn(hogs.TRASH_NOTE, " ".join(self.text(app).split()))
+
     def test_space_on_group_marks_only_its_safe_items(self):
         app = self.app()
         self.press(app, "4")   # disk/docker: cache 🟢 e imagem 🔴
@@ -3343,10 +3547,10 @@ class CliTest(unittest.TestCase):
         self.assertIn(hogs.NEEDS_TTY, self.err.getvalue())
         self.assertNotIn(hogs.NEEDS_TTY, self.out.getvalue())
 
-    def test_version_is_0_6_0_in_both_places(self):
-        self.assertEqual(hogs.__version__, "0.6.0")
+    def test_version_is_0_7_0_in_both_places(self):
+        self.assertEqual(hogs.__version__, "0.7.0")
         toml = (Path(hogs.__file__).parent / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "0.6.0"', toml)
+        self.assertIn('version = "0.7.0"', toml)
 
 
 # ---- Revisão final da fase 3 (H1–H16)

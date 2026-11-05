@@ -167,6 +167,7 @@ Na [tela](#tela-interativa), nada vem marcado. `a` marca só os 🟢; os 🟡 e 
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
 - 🛡️ Arquivo pessoal só vai para a Lixeira, nunca é apagado direto.
 - 🛡️ Worktree só sai por `git worktree remove`, sem `--force`, e a branch fica. Tudo é conferido de novo logo antes de cada remoção, inclusive o envio e as conversas do Claude Code; o que mudou desde a análise fica.
+- 🛡️ Num worktree já na main, arquivos fora do Git só saem se você marcar o worktree (🟠, nunca pelo `a`), e vão para a Lixeira, nunca apagados direto. Alteração em arquivo versionado, ou arquivo fora do Git num worktree sem merge, segura o worktree.
 - 🛡️ Nenhuma pasta montada por um container (rodando ou parado) é sugerida, nem nada dentro dela. Vale também para a pasta por trás de um volume nomeado com bind (`--opt o=bind --opt device=/pasta`, comum em compose de banco). Se o Docker está instalado mas não responde e não há uma lista salva, o hogs não sugere arquivos parados nem caches grandes de apps.
 - 🛡️ Cópias antigas de apps só saem com o app fechado, e só as de versões diferentes da instalada. O app conta como aberto se o nome do executável, o nome cortado pelo macOS ou o caminho dele aparecer nos processos.
 - 🛡️ Reiniciar o Mac e aplicar atualizações do macOS são só recomendações: o hogs nunca executa essas ações e elas nunca entram na limpeza nem no “com o recomendado”.
@@ -195,8 +196,11 @@ processos como `node ×3`, containers), a **conversa** do Claude Code ligada a e
   A pasta sai, a branch fica.
 - 🟡 **em andamento**: algo roda dentro da pasta agora (dev server, container, sessão aberta dentro
   dela), ou está sem merge e foi mexido ou conversado nos últimos `stale_worktree_days` dias.
-- ⚪ **com trabalho só aqui**: commits que não estão na branch principal nem foram enviados, alterações, `.env`…,
-  ou ficou dúvida. Não apague.
+- 🟠 **com sobras**: já na main, sem alteração em arquivo versionado e sem nada rodando dentro, mas com
+  arquivos que o Git não guarda (não versionados, `.env`, anotações). Você decide: se marcar, esses
+  arquivos vão para a **Lixeira** e a pasta sai; a branch fica.
+- ⚪ **com trabalho só aqui**: commits que não estão na branch principal nem foram enviados, alterações em
+  arquivos versionados, arquivos fora do Git num worktree sem merge, ou ficou dúvida. Não apague.
 
 Por último vem o **resumo**: quantos são 🟢 e por quê, quais sessões abertas trabalharam neles, o que
 falta para os 🟡, por que cada grupo ⚪ fica, e o que fazer, com o comando pronto.
@@ -205,6 +209,13 @@ Para apagar, abra a tela (`hogs --worktrees PASTA` ou `hogs`, num terminal): na 
 têm caixinha. Marque com espaço (`a` marca todos os 🟢), tecle Enter para ver o que vai sair, o total e as
 conversas para reabrir antes, e confirme com `s`. Cada worktree é conferido de novo na hora da remoção; o
 que mudou desde a análise fica, com o motivo.
+
+Os 🟠 também têm caixinha, mas o `a` não os pega: marque um por um. A confirmação lista cada arquivo fora
+do Git que vai para a Lixeira. Na hora de apagar, tudo é conferido de novo; se apareceu um arquivo fora do
+Git que não estava na lista (mesmo dentro de uma pasta já listada), nada é mexido. Uma pasta usada por um
+container, mesmo parado (o banco de um `docker compose`, por exemplo), nunca vai para a Lixeira: o worktree
+fica ⚪. Um link simbólico fora do Git sai só como atalho: o arquivo
+para onde ele aponta fica onde está. Depois, a pasta sai com `git worktree remove`, sem `--force`.
 
 Um worktree 🟢 precisa passar por **todas** as condições:
 
