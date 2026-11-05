@@ -1600,7 +1600,22 @@ def hogs_command(root: Path, days: int) -> str:
     return f"hogs --worktrees {short(root)}{extra}"
 
 
-def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = None, days: int = 0) -> None:
+def conversation_cell(w: Worktree) -> Text:
+    """A conversa mais recente ligada ao worktree; embaixo, há quanto tempo, quantas outras e o aviso de reabrir."""
+    if not w.conversations:
+        return Text("—")
+    last = max(w.conversations, key=lambda link: link.conv.last).conv
+    head = ("● " if last.live else "") + (last.title or "(sem título)")
+    foot = elapsed(last.last)
+    if len(w.conversations) > 1:
+        foot += f" · +{len(w.conversations) - 1}"
+    if any(link.reopen for link in w.conversations):
+        foot += " · ⚠ reabra antes de apagar"
+    return Text(head).append(f"\n{foot}", style="dim")
+
+
+def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = None, days: int = 0,
+                     stale_days: int = 30) -> None:
     """Quadro por projeto e, por último (o que fica na tela), o resumo."""
     order = {"seguro": 0, "depois": 1, "manter": 2}
     number = {id(w): n for n, w in enumerate(safe_worktrees(rows), 1)}
@@ -1616,19 +1631,29 @@ def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = Non
         t.add_column("Mudou", no_wrap=True)
         t.add_column("Na main?", ratio=2)
         t.add_column("Em uso por", ratio=2)
+        t.add_column("Conversa", ratio=2, overflow="fold")
         t.add_column("Veredito", ratio=3)
         for w in items:
             icon, style = VERDICTS[w.verdict]
             verdict = (f"{icon} seguro · #{number[id(w)]}" if w.eligible
                        else f"{icon} {w.verdict}: {w.reason}")
+            if w.eligible and not w.merged:
+                verdict += "\na pasta sai, a branch fica"
+            if w.merged:
+                main = Text(f"✓ {w.merged}", style="green")
+            elif w.pushed:
+                main = Text("✗ sem merge", style="dim").append(f"\n✓ enviado ({w.pushed})", style="yellow")
+            else:
+                main = Text("✗ não comprovado", style="dim")
             t.add_row(Text(where(w, root)).append(f"\n{w.branch.removeprefix('refs/heads/')}", style="dim"),
                       fmt(w.size),
                       elapsed(w.last_activity) if w.last_activity else "—",
-                      Text(f"✓ {w.merged}", style="green") if w.merged else Text("✗ não comprovado", style="dim"),
+                      main,
                       Text("\n".join(w.users) if w.users else "—"),
+                      conversation_cell(w),
                       Text(verdict, style=style))
         con.print(t)
-    worktrees_summary(con, rows, root, days)
+    worktrees_summary(con, rows, root, days, stale_days)
 
 
 CATEGORIES = {
@@ -1636,7 +1661,12 @@ CATEGORIES = {
                "têm uma sessão do Claude Code aberta dentro da pasta"),
     "uso": ("tem algo rodando dentro (dev server, container)", "têm algo rodando dentro (dev server, container)"),
     "recente": ("foi mexido dentro do prazo pedido", "foram mexidos dentro do prazo pedido"),
-    "merge": ("tem trabalho que ainda não está na main", "têm trabalho que ainda não está na main"),
+    "andamento": ("está sem merge e foi mexido nos últimos {d} dias",
+                  "estão sem merge e foram mexidos nos últimos {d} dias"),
+    "conversa": ("está sem merge e tem conversa do Claude Code nos últimos {d} dias",
+                 "estão sem merge e têm conversa do Claude Code nos últimos {d} dias"),
+    "merge": ("tem commits que não estão na main nem foram enviados",
+              "têm commits que não estão na main nem foram enviados"),
     "alterações": ("tem alterações ou arquivos novos sem commit", "têm alterações ou arquivos novos sem commit"),
     "ignorados": ("tem arquivos fora do Git que não voltam (.env, planos…)",
                   "têm arquivos fora do Git que não voltam (.env, planos…)"),
@@ -1649,6 +1679,10 @@ def worktree_category(w: Worktree) -> str:
     """Motivo principal, para o resumo (chave de CATEGORIES)."""
     if w.verdict == "depois":
         first = w.waits[0]
+        if first.startswith("sem merge, mexido"):
+            return "andamento"
+        if first.startswith("conversa"):
+            return "conversa"
         if first.startswith("mexido"):
             return "recente"
         return "dentro" if "aberta dentro da pasta" in first else "uso"
@@ -1668,7 +1702,8 @@ def indent(text: str | Text, by: int = 5) -> Padding:
     return Padding(text if isinstance(text, Text) else Text(text), (0, 0, 0, by))
 
 
-def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, days: int) -> None:
+def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, days: int,
+                      stale_days: int = 30) -> None:
     def group(v: str) -> list[Worktree]:
         return [w for w in rows if w.verdict == v]
     def size(ws: list[Worktree]) -> str:
@@ -1677,16 +1712,31 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
         by: dict[str, list[Worktree]] = {}
         for w in ws:
             by.setdefault(worktree_category(w), []).append(w)
-        return [indent(f"• {len(v)} {CATEGORIES[k][len(v) != 1]} · {size(v)}")
+        return [indent(f"• {len(v)} {CATEGORIES[k][len(v) != 1].format(d=stale_days)} · {size(v)}")
                 for k, v in sorted(by.items(), key=lambda kv: -len(kv[1]))]
 
     safe, later, keep = group("seguro"), group("depois"), group("manter")
     lines: list = [Text.assemble(("🟢 SEGURO PARA APAGAR  ", "bold green"),
                                  (f"{n_worktrees(len(safe))} · {size(safe)}", "bold"))]
     prazo = f", e parados há mais de {days} dias" if days else ""
-    lines.append(indent(Text(f"Já estão na main (merge, squash ou rebase), sem alterações, sem arquivos que o Git não "
-                             f"recupera e sem nada rodando dentro da pasta{prazo}. A branch continua existindo.",
-                             style="green")))
+    unmerged = [w for w in safe if not w.merged]
+    merged = [w for w in safe if w.merged]
+    if merged or not safe:
+        who = f"{n_worktrees(len(merged))}: " if unmerged else ""
+        lines.append(indent(Text(f"{who}Já estão na main (merge, squash ou rebase), sem alterações, sem arquivos que o "
+                                 f"Git não recupera e sem nada rodando dentro da pasta{prazo}. A branch continua "
+                                 "existindo.", style="green")))
+    if unmerged:
+        lines.append(indent(Text(f"{n_worktrees(len(unmerged))} sem merge, parados há mais de {stale_days} dias, com "
+                                 "tudo commitado e enviado (conferido nas referências locais de origin): a pasta "
+                                 "sai, a branch fica.", style="green")))
+    reopen = [(w, link.conv) for w in safe for link in w.conversations if link.reopen]
+    if reopen:
+        lines.append(indent(Text("⚠ Reabra antes de apagar (a conversa começou dentro da pasta):", style="yellow")))
+        for w, conv in reopen[:5]:
+            lines.append(indent(Text(f"  {w.repo.name} / {where(w, root)}: {resume_command(conv)}", style="yellow")))
+        if len(reopen) > 5:
+            lines.append(indent(Text(f"  … mais {len(reopen) - 5}", style="yellow")))
     with_session: dict[str, int] = {}
     for w in safe:
         for name in w.sessions:
@@ -1696,9 +1746,9 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
         lines.append(indent(Text(f"Sessões do Claude Code abertas que trabalharam em alguns deles: {names}. Não "
                                  "impedem: o trabalho já está na main; a sessão só perde a pasta.", style="dim")))
     if later:
-        lines += [Text(""), Text.assemble(("🟡 DEPOIS  ", "bold yellow"),
+        lines += [Text(""), Text.assemble(("🟡 EM ANDAMENTO  ", "bold yellow"),
                                           (f"{n_worktrees(len(later))} · {size(later)}", "bold"),
-                                          ("  mergeados e limpos, mas algo roda dentro agora", "yellow"))]
+                                          ("  não mexa: em uso, mexido ou conversado há pouco", "yellow"))]
         lines += breakdown(later)
     if keep:
         lines += [Text(""), Text.assemble(("⚪ MANTER  ", "bold"),
@@ -1714,8 +1764,8 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
                            "confere tudo de novo antes de cada remoção."))
         step += 1
     if later:
-        todo.append(Text(f"  {step}. Liberar 🟡: pare o que roda dentro deles (dev server, container, sessão aberta "
-                         "dentro da pasta; está na coluna Em uso por) e rode o comando de novo."))
+        todo.append(Text(f"  {step}. 🟡 ficam: estão em uso ou em andamento (motivo na coluna Veredito). "
+                         "Rode de novo depois."))
         step += 1
     if keep:
         todo.append(Text(f"  {step}. ⚪ ficam com você: o motivo de cada um está na coluna Veredito."))
@@ -1723,7 +1773,7 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
         todo.append(Text("  Nada a apagar agora. Rode de novo daqui a alguns dias."))
     con.print(Panel(Group(*lines, *todo), title=f"Resumo · {n_worktrees(len(rows))} · {size(rows)}",
                     title_align="left", border_style="green" if safe else "yellow", padding=(1, 2)))
-    con.print(Text("Merge conferido nas referências locais de origin; rode git fetch nos repositórios para "
+    con.print(Text("Merge e envio conferidos nas referências locais de origin; rode git fetch nos repositórios para "
                    "atualizá-las.", style="dim"))
 
 
@@ -1746,7 +1796,8 @@ def clean_worktrees(con: Console, rows: list[Worktree], days: int, root: Path | 
     for n, w in enumerate(safe, 1):
         t.add_row(str(n), w.repo.name,
                   Text(where(w, root)).append(f"\n{w.branch.removeprefix('refs/heads/')}", style="dim"),
-                  fmt(w.size), elapsed(w.last_activity), Text(f"✓ {w.merged}", style="green"),
+                  fmt(w.size), elapsed(w.last_activity),
+                  Text(f"✓ {w.merged}", style="green") if w.merged else Text(f"✓ enviado ({w.pushed})", style="yellow"),
                   Text(", ".join(w.sessions) or "—", style="dim"))
     con.print(t)
     raw = Prompt.ask(f"Quais apagar? [cyan]a[/] = todos os {len(safe)} ({fmt(sum(w.size for w in safe))}) · "
@@ -1761,6 +1812,10 @@ def clean_worktrees(con: Console, rows: list[Worktree], days: int, root: Path | 
     for w in chosen:
         note = f"  · sessão {', '.join(w.sessions)}" if w.sessions else ""
         con.print(Text(f"  • {w.repo.name} / {where(w, root)}  ({w.branch.removeprefix('refs/heads/')}){note}"))
+        for link in w.conversations:
+            if link.reopen:
+                con.print(Text(f"    ⚠ reabra antes de apagar “{link.conv.title or link.conv.session[:8]}”: "
+                               f"{resume_command(link.conv)}", style="yellow"))
     con.print(Text("As branches ficam. Antes de cada remoção confiro tudo de novo; se algo mudou, ele fica.",
                    style="dim"))
     if not Confirm.ask("Remover?", default=False):
@@ -3116,7 +3171,7 @@ def run() -> None:
         root = args.worktrees.expanduser().resolve()
         for warning in warnings:
             con.print(Text(warning, style="yellow"))
-        worktrees_report(con, rows, root, args.worktree_days)
+        worktrees_report(con, rows, root, args.worktree_days, setting("stale_worktree_days"))
         if args.clean:
             clean_worktrees(con, rows, args.worktree_days, root)
         return

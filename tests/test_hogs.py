@@ -1822,5 +1822,137 @@ class WorktreeTest(unittest.TestCase):
         self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/aaa")
         self.assertEqual(hogs.pushed_ref(self.path, head, "refs/heads/feature"), "")
 
+
+class WorktreeReportTest(unittest.TestCase):
+    DEV = Path("/dev")
+
+    def rows(self):
+        conv = hogs.Conversation("s-123", "Relatório mensal", str(self.DEV / "shop-api-relatorio"),
+                                 time.time() - 41 * 86400, live=True)
+        parado = hogs.Worktree(self.DEV / "shop-api-relatorio", self.DEV / "shop-api", branch="refs/heads/feat/relatorio",
+                               size=int(1.2e9), last_activity=time.time() - 41 * 86400, eligible=True,
+                               pushed="origin/feat/rel", conversations=[hogs.ConvLink(conv, "dentro", True)])
+        andamento = hogs.Worktree(self.DEV / "shop-api-cupom", self.DEV / "shop-api", branch="refs/heads/feat/cupom",
+                                  waits=["sem merge, mexido há 3 d (em andamento; prazo 30 d)"])
+        return [parado, andamento]
+
+    def text(self, fn, *args):
+        out = io.StringIO()
+        fn(hogs.Console(file=out, width=300, force_terminal=False), *args)   # largo: nenhuma célula quebra
+        return out.getvalue()
+
+    def test_table_shows_conversation_pushed_and_new_verdicts(self):
+        text = self.text(hogs.worktrees_report, self.rows(), self.DEV, 0, 30)
+        for expected in ("Conversa", "● Relatório mensal", "reabra antes de apagar", "✓ enviado (origin/feat/rel)",
+                         "seguro · #1", "a pasta sai, a branch fica", "EM ANDAMENTO",
+                         "está sem merge e foi mexido nos últimos 30 dias",
+                         "cd /dev/shop-api-relatorio && claude --resume s-123", "Merge e envio conferidos"):
+            self.assertIn(expected, text)
+
+    def test_clean_warns_to_reopen_before_confirm(self):
+        with mock.patch.object(hogs.Prompt, "ask", return_value="a"), \
+                mock.patch.object(hogs.Confirm, "ask", return_value=False):
+            text = self.text(hogs.clean_worktrees, self.rows(), 0, self.DEV)
+        self.assertIn("⚠ reabra antes de apagar “Relatório mensal”: "
+                      "cd /dev/shop-api-relatorio && claude --resume s-123", text)
+        self.assertIn("Nada apagado", text)
+
+
+class WorktreeSummaryTest(unittest.TestCase):
+    DEV = Path("/dev")
+
+    def wt(self, name, merged="", pushed="", convs=(), **kw):
+        return hogs.Worktree(self.DEV / name, self.DEV / "shop-api", branch=f"refs/heads/{name}", size=1000,
+                             last_activity=time.time() - 41 * 86400, merged=merged, pushed=pushed,
+                             conversations=list(convs), **kw)
+
+    def summary(self, rows, width=300):
+        out = io.StringIO()
+        hogs.worktrees_summary(hogs.Console(file=out, width=width, force_terminal=False), rows, self.DEV, 0, 30)
+        return out.getvalue()
+
+    def conv(self, n, title="T", reopen=True):
+        c = hogs.Conversation(f"s-{n}", title, str(self.DEV / f"shop-api-w{n}"), time.time() - 3600)
+        return hogs.ConvLink(c, "dentro", reopen)
+
+    def test_only_unmerged_safe_never_claims_main(self):
+        text = self.summary([self.wt("a", pushed="origin/a", eligible=True)])
+        self.assertNotIn("Já estão na main", text)
+        self.assertIn("1 worktree sem merge, parados há mais de 30 dias, com tudo commitado e enviado "
+                      "(conferido nas referências locais de origin): a pasta sai, a branch fica.", text)
+
+    def test_only_merged_safe_has_no_unmerged_paragraph(self):
+        text = self.summary([self.wt("a", merged="squash em origin/main", eligible=True)])
+        self.assertIn("Já estão na main", text)
+        self.assertNotIn("sem merge, parados", text)
+
+    def test_both_kinds_have_both_paragraphs(self):
+        text = self.summary([self.wt("a", merged="merge em origin/main", eligible=True),
+                             self.wt("b", pushed="origin/b", eligible=True)])
+        self.assertIn("1 worktree: Já estão na main", text)
+        self.assertIn("1 worktree sem merge, parados", text)
+
+    def test_reopen_header_lines_and_overflow(self):
+        rows = [self.wt(f"w{n}", pushed="origin/x", eligible=True, convs=[self.conv(n)]) for n in range(7)]
+        text = self.summary(rows)
+        self.assertIn("⚠ Reabra antes de apagar (a conversa começou dentro da pasta):", text)
+        self.assertEqual(text.count("claude --resume"), 5)
+        self.assertIn("… mais 2", text)
+        self.assertIn("shop-api / w0: cd /dev/shop-api-w0 && claude --resume s-0", text)
+
+    def test_categories_singular_plural_and_conversa(self):
+        one = self.wt("a", waits=["conversa do Claude Code há 2 d: x"])
+        two = [self.wt("b", waits=["conversa do Claude Code há 2 d: x"]),
+               self.wt("c", waits=["conversa do Claude Code há 2 d: x"])]
+        self.assertEqual(hogs.worktree_category(one), "conversa")
+        self.assertIn("• 1 está sem merge e tem conversa do Claude Code nos últimos 30 dias", self.summary([one]))
+        self.assertIn("• 2 estão sem merge e têm conversa do Claude Code nos últimos 30 dias", self.summary(two))
+        text = self.summary([self.wt("d", waits=["sem merge, mexido há 3 d (em andamento; prazo 30 d)"])])
+        self.assertIn("está sem merge e foi mexido nos últimos 30 dias", text)
+        self.assertNotIn("{d}", text)
+
+
+class WorktreeTableTest(unittest.TestCase):
+    DEV = Path("/dev")
+
+    def table(self, rows, width=120):
+        out = io.StringIO()
+        with mock.patch.object(hogs, "worktrees_summary"):
+            hogs.worktrees_report(hogs.Console(file=out, width=width, force_terminal=False), rows, self.DEV, 0, 30)
+        return out.getvalue()
+
+    def link(self, n, title, last, reopen=False, live=False):
+        c = hogs.Conversation(f"s-{n}", title, "/dev/x", last, live=live)
+        return hogs.ConvLink(c, "branch", reopen)
+
+    def test_conversation_cell(self):
+        w = hogs.Worktree(self.DEV / "a", self.DEV / "r")
+        self.assertEqual(hogs.conversation_cell(w).plain, "—")
+        now = time.time()
+        w.conversations = [self.link(1, "", now - 7200), self.link(2, "Antiga", now - 5 * 86400, reopen=True)]
+        cell = hogs.conversation_cell(w).plain
+        self.assertEqual(cell, "(sem título)\nhá 2 h · +1 · ⚠ reabra antes de apagar")
+
+    def test_table_rows_by_verdict_at_normal_width(self):
+        now = time.time()
+        safe = hogs.Worktree(self.DEV / "ok", self.DEV / "shop-api", branch="refs/heads/ok", eligible=True,
+                             pushed="origin/ok", last_activity=now - 41 * 86400)
+        wait = hogs.Worktree(self.DEV / "wait", self.DEV / "shop-api", branch="refs/heads/wait",
+                             waits=["sem merge, mexido há 3 d"], reason="sem merge, mexido há 3 d")
+        keep = hogs.Worktree(self.DEV / "keep", self.DEV / "shop-api", branch="refs/heads/keep",
+                             blockers=["merge não comprovado"], reason="merge não comprovado",
+                             conversations=[self.link(1, "Título bem comprido para quebrar a coluna", now, live=True)])
+        text = self.table([safe, wait, keep])
+        self.assertIn("Conversa", text)
+        self.assertIn("🟢 seguro · #1", text)
+        self.assertIn("a pasta sai,", text)
+        self.assertIn("enviado", text)
+        self.assertIn("(origin/ok)", text)
+        self.assertIn("✗ sem merge", text)
+        self.assertIn("🟡 depois", text)
+        self.assertIn("⚪ manter", text)
+        self.assertEqual(text.count("✗ não"), 2)
+        self.assertIn("● Título", text)
+
 if __name__ == "__main__":
     unittest.main()
