@@ -3584,6 +3584,85 @@ def item_detail(i: Item, guard_text: str | None = None) -> list[Text]:
 
 # ---------------------------------------------------------------- tela: aba Worktrees
 
+WT_FILTERS = ["", "seguro", "depois", "manter"]
+WT_FILTER_LABELS = {"": "todos", "seguro": "🟢 podem sair", "depois": "🟡 em andamento",
+                    "manter": "⚪ com trabalho só aqui"}
+
+
+def _wt_merge_cell(w: Worktree) -> Text:
+    if w.merged:
+        return Text(f"✓ {w.merged}", style="green")
+    if w.pushed:
+        return Text("✗ sem merge · ✓ enviado", style="yellow")
+    return Text("✗ não comprovado", style="yellow")
+
+
+def _wt_conv_cell(w: Worktree) -> Text:
+    if not w.conversations:
+        return Text("—", style="dim")
+    c = max(w.conversations, key=lambda l: l.conv.last).conv
+    return Text(f"{'● ' if c.live else ''}{c.title or c.session[:8]} · {elapsed(c.last)}")
+
+
+def _wt_group_detail(repo: Path, kids: list[Worktree]) -> list[Text]:
+    counts = verdict_counts(kids)
+    lines = [Text(f"📁 {repo.name}", style="bold"), Text(short(repo))]
+    for v, (icon, color) in VERDICTS.items():
+        n, size = counts[v]
+        lines.append(Text(f"{icon} {n} {WT_FILTER_LABELS[v][2:]} · {fmt(size)}", style=color))
+    lines.append(Text(f"{len(kids)} worktrees · {fmt(sum(w.size for w in kids))}"))
+    return lines
+
+
+def worktrees_tree(rows: list[Worktree], root: Path | None, days: int = 0, flt: str = "",
+                   conversations: bool | None = None) -> tuple[list[Column], list[Row]]:
+    if conversations is None:
+        conversations = claude_dir().is_dir()
+    cols = [Column("Worktree · branch", ratio=4), Column("Tamanho", "right"), Column("Mexido"),
+            Column("Na main?", ratio=2), Column("Em uso por", ratio=2)]
+    if conversations:
+        cols.append(Column("Conversa", ratio=3))
+    cols.append(Column("Veredito", ratio=2))
+    safe = {id(w): i for w, i in zip(safe_worktrees(rows), worktree_items(rows, root, days))} if root else {}
+    order = {v: n for n, v in enumerate(VERDICTS)}
+    by_repo: dict[Path, list[Worktree]] = {}
+    for w in rows:
+        if not flt or w.verdict == flt:
+            by_repo.setdefault(w.repo, []).append(w)
+    out = []
+    for repo in sorted(by_repo, key=lambda r: (r.name.lower(), str(r))):
+        kids = sorted(by_repo[repo], key=lambda w: (order[w.verdict], -w.size))
+        counts = verdict_counts(kids)
+        summary = " ".join(f"{VERDICTS[v][0]}{counts[v][0]}" for v in VERDICTS)
+        cells = [f"📁 {repo.name}", fmt(sum(w.size for w in kids))] + [""] * (len(cols) - 3) + [summary]
+        children = []
+        for w in kids:
+            item = safe.get(id(w))
+            icon, color = VERDICTS[w.verdict]
+            wcells = [Text.assemble(where(w, root), (f" · {branch_name(w)}", "dim")), fmt(w.size),
+                      elapsed(w.last_activity) if w.last_activity else "—", _wt_merge_cell(w),
+                      ", ".join(w.users) or "—"]
+            if conversations:
+                wcells.append(_wt_conv_cell(w))
+            wcells.append(Text(f"{icon} {VERDICT_LABELS[w.verdict]}", style=color))
+            link = max(w.conversations, key=lambda l: l.conv.last) if w.conversations else None
+            children.append(Row(key=item_key(item) if item else f"wt/{w.path}", cells=wcells, item=item,
+                                detail=worktree_detail(w, root), title=f"{w.repo.name} / {where(w, root)}",
+                                path=w.path, resume=link.conv if link else None,
+                                how=link.how if link else ""))
+        out.append(Row(key=f"wt/{repo}", cells=cells, children=children, limit=8, kind="group",
+                       detail=_wt_group_detail(repo, kids), title=repo.name, path=repo))
+    return cols, out
+
+
+def worktree_totals(rows: list[Worktree], flt: str = "") -> Text:
+    counts = verdict_counts(rows)
+    parts = [f"{VERDICTS[v][0]} {counts[v][0]} {WT_FILTER_LABELS[v][2:]} · {fmt(counts[v][1])}" for v in VERDICTS]
+    text = "   ".join(parts)
+    if flt:
+        text += f"   filtro: {WT_FILTER_LABELS[flt]}"
+    return Text(text)
+
 
 # ---------------------------------------------------------------- tela: aba Docker
 
