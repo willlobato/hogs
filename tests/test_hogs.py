@@ -1306,6 +1306,40 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(hogs.resume_command(hogs.Conversation("s2")), "claude --resume s2")
 
 
+class ConversationLinkTest(unittest.TestCase):
+    def test_links_by_folder_branch_and_mention(self):
+        dev = Path("/dev")
+        a = hogs.Worktree(dev / "shop-api/wt a", dev / "shop-api", branch="refs/heads/feat/checkout")
+        a2 = hogs.Worktree(dev / "shop-api/wt a-2", dev / "shop-api", branch="refs/heads/feat/outra")
+        dirs = {dev / "shop-api": [dev / "shop-api", a.path, a2.path]}
+        C = hogs.Conversation
+        convs = [C("dentro", start=str(a.path / "src"), last=5, cwds={str(a.path / "src")}),
+                 C("branch", start="/dev/shop-api", last=4, branches={("/dev/shop-api", "feat/checkout")}),
+                 C("outro-repo", last=3, branches={("/dev/web", "feat/checkout")}),
+                 C("citou", last=2, mentions={"shop-api/wt a/x.txt"}),
+                 C("citou-2", last=1, mentions={"shop-api/wt a-2/y", "shop-api/wt a.bak"})]
+        links = hogs.conversation_links([a, a2], convs, dev, dirs)
+        self.assertEqual([(l.conv.session, l.how, l.reopen) for l in links[a.path]],
+                         [("dentro", "dentro", True), ("branch", "branch", False), ("citou", "citou", False)])
+        self.assertEqual([l.conv.session for l in links[a2.path]], ["citou-2"])
+
+    def test_mention_boundary(self):
+        dev = Path("/dev")
+        w = hogs.Worktree(dev / "shop/wt-a", dev / "shop", branch="refs/heads/x")
+        for mention, hit in (("shop/wt-a", True), ("shop/wt-a/src/x.py", True), ("shop/wt-a -la", True),
+                             ("shop/wt-a-2", False), ("shop/wt-a-2/src", False), ("shop/wt-a.bak", False),
+                             ("shop/wt-ab", False), ("shop/wt", False), ("outro/shop/wt-a", False)):
+            with self.subTest(mention=mention):
+                links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={mention})], dev, {})
+                self.assertEqual([l.how for l in links[w.path]], ["citou"] if hit else [])
+
+    def test_worktree_outside_scope_links_only_by_folder(self):
+        w = hogs.Worktree(Path("/outro/wt"), Path("/outro/repo"), branch="refs/heads/x")
+        convs = [hogs.Conversation("a", cwds={"/outro/wt"}, last=2), hogs.Conversation("b", mentions={"wt"}, last=1)]
+        links = hogs.conversation_links([w], convs, Path("/dev"), {})
+        self.assertEqual([l.conv.session for l in links[w.path]], ["a"])
+
+
 class WorktreeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1341,13 +1375,46 @@ class WorktreeTest(unittest.TestCase):
             os.utime(base, (old, old))
 
     def inspect(self, usage=None, agents=None, days=30):
-        return hogs.inspect_worktree(self.w, days, usage or ([], "", []), agents or hogs.Agents())
+        """Conversas conferidas (links=[]): nenhuma ligada a ele."""
+        return hogs.inspect_worktree(self.w, days, usage or ([], "", []), agents or hogs.Agents(), links=[])
 
     def quiet(self):
-        stack = mock.patch.object(hogs, "worktree_usage", return_value=([], "", []))
-        stack2 = mock.patch.object(hogs, "agent_activity", return_value=hogs.Agents())
-        stack.start(); stack2.start()
-        self.addCleanup(stack.stop); self.addCleanup(stack2.stop)
+        for target, value in (("worktree_usage", ([], "", [])), ("agent_activity", hogs.Agents()),
+                              ("claude_conversations", ([], ""))):
+            patcher = mock.patch.object(hogs, target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_find_repos_returns_main_checkouts_once(self):
+        self.assertEqual(hogs.find_repos(self.root), ([self.repo], []))
+
+    def test_gather_links_conversations_and_recheck_sees_new_ones(self):
+        self.quiet()
+        (self.path / "file.txt").write_text("trabalho\n")
+        self.git(self.path, "commit", "-am", "work")
+        self.git(self.path, "update-ref", "refs/remotes/origin/feature", "HEAD")
+        self.age()
+        old = hogs.Conversation("s1", "Antiga", str(self.path), time.time() - 60 * 86400, cwds={str(self.path)})
+        with mock.patch.object(hogs, "claude_conversations", return_value=([old], "")) as cc:
+            [row], _ = hogs.gather_worktrees(self.root, 0)
+        cc.assert_called_once()
+        self.assertTrue(row.eligible, row.reason)
+        self.assertEqual([(l.how, l.reopen) for l in row.conversations], [("dentro", True)])
+        new = hogs.Conversation("s2", "Nova", "/x", time.time(), cwds={str(self.path)})
+        with mock.patch.object(hogs, "claude_conversations", return_value=([new], "")):
+            with self.assertRaises(RuntimeError):
+                hogs.remove_worktree(row, 0, self.root)
+        self.assertTrue(self.path.exists())
+
+    def test_gather_links_by_branch_from_main_checkout(self):
+        self.quiet()
+        self.commit_and_push()
+        talk = hogs.Conversation("s3", "Na principal", str(self.repo), time.time(),
+                                 cwds={str(self.repo)}, branches={(str(self.repo), "feature")})
+        with mock.patch.object(hogs, "claude_conversations", return_value=([talk], "")):
+            [row], _ = hogs.gather_worktrees(self.root, 0)
+        self.assertEqual([(l.how, l.reopen) for l in row.conversations], [("branch", False)])
+        self.assertEqual(row.verdict, "depois")
 
     def test_old_merged_clean_is_eligible_and_removal_preserves_branch(self):
         row = self.inspect()
@@ -1665,10 +1732,9 @@ class WorktreeTest(unittest.TestCase):
         self.age()
 
     def link(self, days_ago, inside=False):
-        from types import SimpleNamespace
-        c = SimpleNamespace(session="s9", title="Rascunho do checkout", start=str(self.path) if inside else "/x",
-                            last=time.time() - days_ago * 86400, live=False)
-        return [SimpleNamespace(conv=c, how="dentro" if inside else "citou", reopen=inside)]
+        c = hogs.Conversation("s9", "Rascunho do checkout", str(self.path) if inside else "/x",
+                              time.time() - days_ago * 86400)
+        return [hogs.ConvLink(c, "dentro" if inside else "citou", inside)]
 
     def test_stale_unmerged_pushed_is_safe_and_removal_keeps_branch(self):
         self.commit_and_push()
@@ -1712,10 +1778,33 @@ class WorktreeTest(unittest.TestCase):
     def test_stale_window_is_a_parameter_and_conversation_error_blocks_only_unmerged(self):
         self.commit_and_push()
         self.age(20)
-        args = (self.w, 0, ([], "", []), hogs.Agents())
+        args = (self.w, 0, ([], "", []), hogs.Agents(), [])
         self.assertEqual(hogs.inspect_worktree(*args, stale_days=30).verdict, "depois")
         self.assertTrue(hogs.inspect_worktree(*args, stale_days=10).eligible)
         self.assertEqual(hogs.inspect_worktree(*args, conv_error="falhou", stale_days=10).verdict, "manter")
+
+    def test_conversations_not_checked_keep_unmerged_but_not_merged(self):
+        merged = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents())
+        self.assertTrue(merged.eligible, merged.reason)
+        self.commit_and_push()
+        links = self.link(40)
+        row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=None)
+        self.assertEqual(row.verdict, "manter")
+        self.assertEqual(row.reason, "conversas do Claude Code não verificadas")
+        row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=links)
+        self.assertTrue(row.eligible, row.reason)
+        self.assertIsNot(row.conversations, links, "guarda uma cópia, não a lista de quem chamou")
+        self.assertEqual(row.conversations, links)
+
+    def test_check_texts_name_the_remote_and_the_default_branch(self):
+        self.git(self.repo, "update-ref", "refs/remotes/origin/develop", "main")
+        self.git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
+        self.assertIn("já na develop (merge em origin/develop)", [t for _, t in self.inspect().checks])
+        self.commit_and_push(push=False)
+        self.git(self.path, "update-ref", "refs/remotes/fork/feature", "HEAD")
+        row = self.inspect(days=0)
+        self.assertEqual(row.pushed, "fork/feature")
+        self.assertIn("enviado a fork/feature (conferido nas referências locais de fork)", [t for _, t in row.checks])
 
     def test_merged_ignores_conversations_and_stale_window(self):
         row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=self.link(0, inside=True),

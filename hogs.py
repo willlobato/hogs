@@ -1336,8 +1336,9 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
     """Coleta todos os sinais e decide: 🟢 seguro, 🟡 depois (em uso ou recente) ou ⚪ manter.
 
     🟢 é mergeado na principal, ou sem merge mas enviado (HEAD numa ref remota local) e parado há mais de
-    stale_days, sem conversa do Claude Code nesse prazo. Cada verificação feita vira uma linha de checks."""
-    result = Worktree(w.path, w.repo, size=w.size, conversations=links or [])
+    stale_days, sem conversa do Claude Code nesse prazo. links=None = conversas não conferidas (bloqueia o
+    caminho sem merge); [] = conferidas, nenhuma ligada. Cada verificação feita vira uma linha de checks."""
+    result = Worktree(w.path, w.repo, size=w.size, conversations=list(links or []))
     marks = [0, 0]
     def check(ok_text: str) -> None:
         """Fecha uma verificação: falhou se ela acrescentou blocker ou wait desde a anterior."""
@@ -1371,6 +1372,7 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
             b.append("contém submódulos; revise antes")
         check("tudo commitado")
         ref = default_branch(w.path)
+        main = ref.removeprefix("refs/remotes/").partition("/")[2]
         if not ref:
             b.append("branch principal remota desconhecida (origin/HEAD)")
         else:
@@ -1386,8 +1388,9 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
                              "e há commits não enviados")
                 else:
                     result.pushed = pushed
-        check(f"já na main ({result.merged})" if result.merged
-              else f"enviado a {result.pushed} (conferido nas referências locais de origin)")
+        check(f"já na {main} ({result.merged})" if result.merged
+              else f"enviado a {result.pushed} (conferido nas referências locais de "
+                   f"{result.pushed.partition('/')[0]})")
         ignored = git_at(w.path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
         if ignored is None or ignored.returncode:
             b.append("não foi possível verificar arquivos ignorados")
@@ -1448,6 +1451,8 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
                                     f"{conv.title or conv.session[:8]}")
             if result.sessions:
                 result.waits.append(f"conversa aberta do Claude Code: {', '.join(result.sessions)}")
+            if links is None:
+                b.append("conversas do Claude Code não verificadas")
             if conv_error:
                 b.append(conv_error)
         idle = max(0, int((time.time() - result.last_activity) // 86400))
@@ -1467,9 +1472,10 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
     return result
 
 
-def gather_worktrees(root: Path, days: int) -> tuple[list[Worktree], list[str]]:
-    root = root.expanduser().resolve()
-    found, warnings, repos = {}, [], set()
+def find_repos(root: Path) -> tuple[list[Path], list[str]]:
+    """Checkout principal de cada repositório achado sob root (uma vez por repositório), ordenado, e avisos.
+    Não desce em pastas de dependências nem para dentro de um repositório."""
+    warnings, mains, seen = [], set(), set()
     def walk_error(error: OSError) -> None:
         warnings.append(str(error))
     for directory, dirs, files in os.walk(root, onerror=walk_error):
@@ -1481,36 +1487,92 @@ def gather_worktrees(root: Path, days: int) -> tuple[list[Worktree], list[str]]:
                 warnings.append(f"não consegui inspecionar {repo}")
                 continue
             key = (repo / common.stdout.strip()).resolve()
-            if key in repos:
+            if key in seen:
                 continue
-            repos.add(key)
+            seen.add(key)
             try:
-                for record in registered_worktrees(repo)[1:]:
-                    path = Path(record["worktree"]).resolve()
-                    if inside(path, root):
-                        found[path] = Worktree(path, repo)
-            except (RuntimeError, KeyError) as exc:
-                warnings.append(str(exc))
+                mains.add(Path(registered_worktrees(repo)[0]["worktree"]).resolve())
+            except (RuntimeError, KeyError, IndexError):
+                mains.add(repo)
         else:
             dirs[:] = [d for d in dirs if d not in {"node_modules", ".git", "target", ".venv", "vendor"}]
+    return sorted(mains), warnings
+
+
+def conversation_links(rows: list[Worktree], convs: list[Conversation], scope: Path,
+                       repo_dirs: dict[Path, list[Path]]) -> dict[Path, list[ConvLink]]:
+    """Conversas do Claude Code ligadas a cada worktree, da mais recente para a mais antiga:
+    "dentro" (trabalhou numa pasta dentro dele), senão "branch" (trabalhou na branch dele em alguma pasta do
+    mesmo repositório), senão "citou" (citou um caminho dele). `repo_dirs`: pastas registradas de cada
+    repositório, a principal incluída. Menções são relativas a `scope`, com o limite de agent_activity
+    (wt-a não casa com wt-a-2 nem com wt-a.bak)."""
+    rel: dict[str, Path] = {}
+    for w in rows:
+        try:
+            rel[w.path.relative_to(scope).as_posix()] = w.path
+        except ValueError:  # fora do escopo: as menções não o alcançam
+            pass
+    alts = sorted(rel, key=len, reverse=True)
+    rx = (re.compile("^(" + "|".join(map(re.escape, alts)) + r")(?![A-Za-z0-9_-])(?!\.[A-Za-z0-9_-])")
+          if alts else None)
+    links: dict[Path, list[ConvLink]] = {w.path: [] for w in rows}
+    for c in convs:
+        cwds = [Path(x) for x in c.cwds]
+        cited = {rel[m.group(1)] for m in map(rx.match, c.mentions) if m} if rx else set()
+        for w in rows:
+            own = w.branch.removeprefix("refs/heads/")
+            dirs = repo_dirs.get(w.repo, [])
+            if any(inside(x, w.path) for x in cwds):
+                how = "dentro"
+            elif own and any(b == own and any(inside(Path(cwd), d) for d in dirs) for cwd, b in c.branches):
+                how = "branch"
+            elif w.path in cited:
+                how = "citou"
+            else:
+                continue
+            links[w.path].append(ConvLink(c, how, bool(c.start) and inside(Path(c.start), w.path)))
+    for items in links.values():
+        items.sort(key=lambda link: link.conv.last, reverse=True)
+    return links
+
+
+def gather_worktrees(root: Path, days: int) -> tuple[list[Worktree], list[str]]:
+    root = root.expanduser().resolve()
+    repos, warnings = find_repos(root)
+    found: dict[Path, Worktree] = {}
+    repo_dirs: dict[Path, list[Path]] = {}
+    for repo in repos:
+        try:
+            records = registered_worktrees(repo)
+            repo_dirs[repo] = [Path(r["worktree"]).resolve() for r in records]
+            for record in records[1:]:
+                path = Path(record["worktree"]).resolve()
+                if inside(path, root):
+                    found[path] = Worktree(path, repo, head=record.get("HEAD", ""), branch=record.get("branch", ""))
+        except (RuntimeError, KeyError) as exc:
+            warnings.append(str(exc))
     usage = worktree_usage() if found else ([], "", [])
     agents = agent_activity(SESSION_WINDOW_DAYS, list(found))
-    # Um checkout usado para consultar o Git pode ser removido: use o principal como âncora.
-    for w in found.values():
-        try:
-            w.repo = Path(registered_worktrees(w.repo)[0]["worktree"])
-        except (RuntimeError, KeyError, IndexError):
-            pass
+    convs, conv_error = claude_conversations(root) if found else ([], "")
+    links = conversation_links(list(found.values()), convs, root, repo_dirs)
+    stale_days = setting("stale_worktree_days")
     def inspect(w: Worktree) -> Worktree:
         w.size = du(w.path)
-        return inspect_worktree(w, days, usage, agents)
+        return inspect_worktree(w, days, usage, agents, links=links[w.path], conv_error=conv_error,
+                                stale_days=stale_days)
     with ThreadPoolExecutor(max_workers=8) as pool:
         rows = list(pool.map(inspect, found.values()))
     return sorted(rows, key=lambda w: -w.size), warnings
 
 
-def remove_worktree(w: Worktree, days: int) -> None:
-    current = inspect_worktree(w, days, worktree_usage())
+def remove_worktree(w: Worktree, days: int, scope: Path | None = None) -> None:
+    """Reconfere tudo, inclusive conversas lidas agora, e remove sem --force; a branch fica."""
+    scope = (scope or projects_root() or w.path.parent).expanduser().resolve()
+    convs, conv_error = claude_conversations(scope)
+    dirs = [Path(r["worktree"]).resolve() for r in registered_worktrees(w.repo) if "worktree" in r]
+    links = conversation_links([w], convs, scope, {w.repo: dirs})
+    current = inspect_worktree(w, days, worktree_usage(), links=links[w.path], conv_error=conv_error,
+                               stale_days=setting("stale_worktree_days"))
     if not current.eligible or (current.head, current.branch) != (w.head, w.branch):
         raise RuntimeError(current.reason if not current.eligible else "HEAD ou branch mudou desde a análise")
     r = git_at(w.repo, "worktree", "remove", str(w.path))
@@ -1709,7 +1771,7 @@ def clean_worktrees(con: Console, rows: list[Worktree], days: int, root: Path | 
     for w in chosen:
         try:
             with con.status(f"Removendo {where(w, root)}…"):
-                remove_worktree(w, days)
+                remove_worktree(w, days, root)
         except (OSError, RuntimeError) as exc:
             kept.append((w, str(exc)))
             con.print(Text(f"  ↷ {where(w, root)}: mantido, {exc}", style="yellow"))
