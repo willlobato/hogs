@@ -1822,5 +1822,40 @@ class WorktreeTest(unittest.TestCase):
         self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/aaa")
         self.assertEqual(hogs.pushed_ref(self.path, head, "refs/heads/feature"), "")
 
+
+class WorktreeReportTest(unittest.TestCase):
+    DEV = Path("/dev")
+
+    def rows(self):
+        conv = hogs.Conversation("s-123", "Relatório mensal", str(self.DEV / "shop-api-relatorio"),
+                                 time.time() - 41 * 86400, live=True)
+        parado = hogs.Worktree(self.DEV / "shop-api-relatorio", self.DEV / "shop-api", branch="refs/heads/feat/relatorio",
+                               size=int(1.2e9), last_activity=time.time() - 41 * 86400, eligible=True,
+                               pushed="origin/feat/rel", conversations=[hogs.ConvLink(conv, "dentro", True)])
+        andamento = hogs.Worktree(self.DEV / "shop-api-cupom", self.DEV / "shop-api", branch="refs/heads/feat/cupom",
+                                  waits=["sem merge, mexido há 3 d (em andamento; prazo 30 d)"])
+        return [parado, andamento]
+
+    def text(self, fn, *args):
+        out = io.StringIO()
+        fn(hogs.Console(file=out, width=300, force_terminal=False), *args)   # largo: nenhuma célula quebra
+        return out.getvalue()
+
+    def test_table_shows_conversation_pushed_and_new_verdicts(self):
+        text = self.text(hogs.worktrees_report, self.rows(), self.DEV, 0, 30)
+        for expected in ("Conversa", "● Relatório mensal", "reabra antes de apagar", "✓ enviado (origin/feat/rel)",
+                         "seguro · #1", "a pasta sai, a branch fica", "EM ANDAMENTO",
+                         "está sem merge e foi mexido nos últimos 30 dias",
+                         "cd /dev/shop-api-relatorio && claude --resume s-123", "Merge e envio conferidos"):
+            self.assertIn(expected, text)
+
+    def test_clean_warns_to_reopen_before_confirm(self):
+        with mock.patch.object(hogs.Prompt, "ask", return_value="a"), \
+                mock.patch.object(hogs.Confirm, "ask", return_value=False):
+            text = self.text(hogs.clean_worktrees, self.rows(), 0, self.DEV)
+        self.assertIn("⚠ reabra antes de apagar “Relatório mensal”: "
+                      "cd /dev/shop-api-relatorio && claude --resume s-123", text)
+        self.assertIn("Nada apagado", text)
+
 if __name__ == "__main__":
     unittest.main()
