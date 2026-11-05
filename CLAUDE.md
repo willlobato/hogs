@@ -33,8 +33,10 @@ The interactive screen (`App`, opened by `hogs`/`hogs --clean` in a terminal) on
   main checkouts, detached/locked worktrees and submodules block deletion. Files outside Git (untracked, and
   ignored outside `REGENERABLE`) block it too, with one exception: a merged worktree whose only obstacle is
   them is `trashable` (🟠 verdict `avaliar`, `EVAL` item `kind="worktree_sobras"`, never 🟢, never in `a`).
-  Its action (`trash_and_remove_worktree`) rechecks everything, refuses if any file outside Git is not in
-  the list shown at confirmation, moves each listed entry to the Trash (`move_to_trash`; a symlink is only
+  A leftover inside or containing a folder mounted by any container, running or stopped
+  (`all_container_mounts`), or mounts unknown, keeps it ⚪. Its action (`trash_and_remove_worktree`) rechecks
+  everything, refuses if any file under the leftovers (`leftover_files`, recursive) is not in what the
+  confirmation showed, moves each listed entry to the Trash (`move_to_trash`; a symlink is only
   unlinked, its target never touched) and then runs `git worktree remove` without force. The confirmation
   lists every one of those entries.
 - An unmerged worktree is 🟢 only when untouched for `stale_worktree_days`, HEAD contained in a local

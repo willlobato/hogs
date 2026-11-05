@@ -212,7 +212,9 @@ que mudou desde a análise fica, com o motivo.
 
 Os 🟠 também têm caixinha, mas o `a` não os pega: marque um por um. A confirmação lista cada arquivo fora
 do Git que vai para a Lixeira. Na hora de apagar, tudo é conferido de novo; se apareceu um arquivo fora do
-Git que não estava na lista, nada é mexido. Um link simbólico fora do Git sai só como atalho: o arquivo
+Git que não estava na lista (mesmo dentro de uma pasta já listada), nada é mexido. Uma pasta usada por um
+container, mesmo parado (o banco de um `docker compose`, por exemplo), nunca vai para a Lixeira: o worktree
+fica ⚪. Um link simbólico fora do Git sai só como atalho: o arquivo
 para onde ele aponta fica onde está. Depois, a pasta sai com `git worktree remove`, sem `--force`.
 
 Um worktree 🟢 precisa passar por **todas** as condições:

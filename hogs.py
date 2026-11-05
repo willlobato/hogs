@@ -868,6 +868,7 @@ class Worktree:
     checks: list[tuple[bool, str]] = field(default_factory=list)  # cada verificação: (passou, texto)
     leftovers: list[str] = field(default_factory=list)     # fora do Git (não versionados e ignorados que não
                                                            # voltam), relativos à pasta; só num worktree mergeado
+    leftover_files: set[str] = field(default_factory=set)  # tudo o que há dentro deles (files_under), na análise
 
     @property
     def trashable(self) -> bool:
@@ -898,6 +899,35 @@ def git_at(path: Path, *args: str) -> subprocess.CompletedProcess | None:
 
 def inside(path: Path, parent: Path) -> bool:
     return path == parent or parent in path.parents
+
+
+def all_container_mounts() -> tuple[list[Path], bool]:
+    """Pastas do host montadas por qualquer container, rodando ou parado (bind e volume nomeado com bind), e se a
+    lista é confiável. Sem Docker instalado: nenhuma. Docker sem responder: a última lista salva, senão desconhecida."""
+    if not shutil.which("docker"):
+        return [], True
+    try:
+        r = sh(["docker", "ps", "-aq"])
+        if r is None or r.returncode:
+            raise ValueError("docker ps falhou")
+        ids = r.stdout.split()
+        found, volumes = [], []
+        if ids:
+            r = sh(["docker", "inspect", "--format", "{{json .Mounts}}", *ids])
+            if r is None or r.returncode:
+                raise ValueError("docker inspect falhou")
+            for line in filter(str.strip, r.stdout.splitlines()):
+                for m in json.loads(line) or []:
+                    if m.get("Type") == "bind" and m.get("Source"):
+                        found.append(Path(m["Source"]).resolve())
+                    elif m.get("Type") == "volume" and m.get("Name") and m["Name"] not in volumes:
+                        volumes.append(m["Name"])
+        return sorted(set(found + bind_volume_folders(volumes))), True
+    except (ValueError, TypeError, AttributeError, KeyError, OSError, RuntimeError):
+        saved = read_json(MOUNTS_FILE).get("mounts")
+        if isinstance(saved, list) and all(isinstance(m, str) and m for m in saved):
+            return [Path(m) for m in saved], True
+        return [], False
 
 
 def worktree_usage() -> tuple[list[tuple[Path, str]], str, list[tuple[Path, str]]]:
@@ -1013,6 +1043,29 @@ def split_status(out: str) -> tuple[list[str], int]:
         if "R" in token[:2] or "C" in token[:2]:
             n += 1
     return untracked, changed
+
+
+def outermost(entries: list[str]) -> list[str]:
+    """Tira as entradas que já estão dentro de outra pasta da lista ("tmp/.env" some quando há "tmp/")."""
+    dirs = [e for e in entries if e.endswith("/")]
+    return [e for e in entries if not any(e != d and e.startswith(d) for d in dirs)]
+
+
+def files_under(base: Path, entries: list[str]) -> set[str]:
+    """Todos os arquivos (e atalhos) de cada entrada, relativos a `base`, sem seguir atalhos: a impressão digital
+    do que a confirmação mostrou."""
+    out = set()
+    for entry in entries:
+        p = base / entry
+        if p.is_symlink() or not p.is_dir():
+            out.add(entry.rstrip("/"))
+            continue
+        for root, dirs, files in os.walk(p, onerror=raise_error):
+            rel = Path(root).relative_to(base)
+            out.update(str(rel / f) for f in files)
+            out.update(str(rel / d) for d in dirs if (Path(root) / d).is_symlink())
+            out.add(str(rel) + "/")
+    return out
 
 
 def leftover_line(w: Worktree, entry: str) -> str:
@@ -1473,7 +1526,8 @@ SESSION_WINDOW_DAYS = 7  # janela das sessões do Codex e das pastas do Claude m
 
 def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]], str, list[tuple[Path, str]]],
                      agents: Agents | None = None, links: list[ConvLink] | None = None, conv_error: str = "",
-                     stale_days: int = DEFAULTS["stale_worktree_days"]) -> Worktree:
+                     stale_days: int = DEFAULTS["stale_worktree_days"],
+                     mounts: tuple[list[Path], bool] | None = None) -> Worktree:
     """Coleta todos os sinais e decide: 🟢 seguro, 🟡 depois (em uso ou recente) ou ⚪ manter.
 
     🟢 é mergeado na principal, ou sem merge mas enviado (HEAD numa ref remota local) e parado há mais de
@@ -1550,9 +1604,19 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
                 b.append(f"ignorados que não voltam pelo Git: {leftover_text(kept)}")
         check("sem .env nem arquivo que o Git não recupera")
         if result.merged and (untracked or kept):
-            result.leftovers = untracked + kept
+            result.leftovers = outermost(untracked + kept)
+            result.leftover_files = files_under(w.path, result.leftovers)
             result.checks[-1] = (False, f"{len(result.leftovers)} fora do Git, vão para a Lixeira: "
                                         f"{leftover_text(result.leftovers)}")
+            # Pasta de um container, mesmo parado (o banco de um compose, por exemplo), nunca vai para a Lixeira.
+            folders, known = mounts if mounts is not None else all_container_mounts()
+            if not known:
+                b.append("Docker não respondeu: não sei se algum arquivo fora do Git é pasta de container")
+            else:
+                mounted = [e for e in result.leftovers if under_mount(w.path / e, folders)]
+                if mounted:
+                    b.append(f"pasta usada por um container (mesmo parado): {leftover_text(mounted)}")
+            check("nenhum arquivo fora do Git usado por container")
 
         # Quem usa a pasta. Sessões do Claude Code e do Codex que trabalharam nele são só informação: o
         # trabalho delas já está na main. Trava apenas o que roda dentro da pasta agora (dev server,
@@ -1753,13 +1817,14 @@ def gather_worktrees(root: Path, days: int) -> tuple[list[Worktree], list[str]]:
             if inside(path, root):
                 found[path] = Worktree(path, repo, head=record.get("HEAD", ""), branch=record.get("branch", ""))
     usage = worktree_usage() if found else ([], "", [])
+    mounts = all_container_mounts() if found else ([], True)
     agents = agent_activity(SESSION_WINDOW_DAYS, list(found))
     links, conv_error = linked_conversations(list(found.values()), root, repo_dirs)
     stale_days = setting("stale_worktree_days")
     def inspect(w: Worktree) -> Worktree:
         w.size = du(w.path)
         return inspect_worktree(w, days, usage, agents, links=links[w.path], conv_error=conv_error,
-                                stale_days=stale_days)
+                                stale_days=stale_days, mounts=mounts)
     with ThreadPoolExecutor(max_workers=8) as pool:
         rows = list(pool.map(inspect, found.values()))
     return sorted(rows, key=lambda w: -w.size), warnings
@@ -1770,7 +1835,7 @@ def recheck_worktree(w: Worktree, days: int, scope: Path | None) -> Worktree:
     scope = (scope or projects_root() or w.path.parent).expanduser().resolve()
     links, conv_error = linked_conversations([w], scope, {w.repo: registered_dirs(registered_worktrees(w.repo))})
     current = inspect_worktree(w, days, worktree_usage(), links=links[w.path], conv_error=conv_error,
-                               stale_days=setting("stale_worktree_days"))
+                               stale_days=setting("stale_worktree_days"), mounts=all_container_mounts())
     if (current.head, current.branch) != (w.head, w.branch):
         raise RuntimeError("HEAD ou branch mudou desde a análise")
     return current
@@ -1799,11 +1864,13 @@ def trash_and_remove_worktree(w: Worktree, days: int, scope: Path | None = None)
         return
     if not current.trashable:
         raise RuntimeError(current.reason)
-    new = [e for e in current.leftovers if e not in w.leftovers]
+    new = sorted(current.leftover_files - w.leftover_files)
     if new:
         raise RuntimeError(f"apareceu arquivo fora do Git desde a análise: {leftover_text(new)}")
     for entry in current.leftovers:
         p = w.path / entry
+        if not os.path.lexists(p):
+            continue
         if p.is_symlink():
             p.unlink()        # só o atalho: pelo Finder, "as alias" poderia mandar o destino para a Lixeira
         else:

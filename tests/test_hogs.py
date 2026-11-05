@@ -1703,6 +1703,9 @@ class WorktreeTest(unittest.TestCase):
         self.path = self.root / "feature with spaces"
         self.git(self.repo, "worktree", "add", "-b", "feature", str(self.path))
         self.w = hogs.Worktree(self.path, self.repo)
+        self.mounts = mock.patch.object(hogs, "all_container_mounts", return_value=([], True))
+        self.mounts.start()
+        self.addCleanup(self.mounts.stop)
         self.age()
 
     def git(self, path, *args):
@@ -2122,6 +2125,71 @@ class WorktreeTest(unittest.TestCase):
         self.assertEqual(moved, [], "o atalho não passa pelo Finder")
         self.assertFalse(self.path.exists())
         self.assertEqual(shared.read_text(), "SEGREDO=1\n", "o destino do atalho fica intacto")
+
+    def test_folder_of_a_stopped_container_never_goes_to_trash(self):
+        (self.path / "dados").mkdir()
+        (self.path / "dados" / "banco.mdf").write_text("dados do banco\n")
+        self.age()
+        self.assertTrue(self.inspect().trashable, "sem container, é 🟠")
+        stopped = ([(self.path / "dados").resolve()], True)    # docker ps -a: o container parado monta a pasta
+        with mock.patch.object(hogs, "all_container_mounts", return_value=stopped):
+            row = self.inspect()
+            self.assertEqual(row.verdict, "manter")
+            self.assertIn("container", row.reason)
+        with mock.patch.object(hogs, "all_container_mounts", return_value=([self.path.resolve()], True)):
+            self.assertEqual(self.inspect().verdict, "manter", "montar a pasta inteira também segura")
+        with mock.patch.object(hogs, "all_container_mounts", return_value=([], False)):
+            self.assertEqual(self.inspect().verdict, "manter", "Docker sem responder: na dúvida, segura")
+        row = self.inspect()
+        self.quiet()
+        _, moved = self.fake_trash()
+        with mock.patch.object(hogs, "all_container_mounts", return_value=stopped):
+            with self.assertRaisesRegex(RuntimeError, "container"):
+                hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [])
+        self.assertTrue((self.path / "dados" / "banco.mdf").exists())
+
+    def test_ignored_file_inside_untracked_folder_is_listed_once_and_removal_finishes(self):
+        (self.path / "tmp").mkdir()
+        (self.path / "tmp" / "a.txt").write_text("a\n")
+        (self.path / "tmp" / ".env").write_text("TOKEN=x\n")
+        self.age()
+        row = self.inspect()
+        self.assertEqual(row.leftovers, ["tmp/"])
+        self.quiet()
+        trash, moved = self.fake_trash()
+        hogs.trash_and_remove_worktree(row, 0)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(sorted(p.name for p in (trash / "tmp").iterdir()), [".env", "a.txt"])
+
+    def test_new_file_inside_a_listed_folder_is_refused(self):
+        self.leftovers()
+        row = self.inspect()
+        (self.path / "tmp" / "novo.log").write_text("depois da confirmação\n")
+        self.quiet()
+        _, moved = self.fake_trash()
+        with self.assertRaisesRegex(RuntimeError, "tmp/novo.log"):
+            hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [])
+
+    def test_all_container_mounts_reads_stopped_containers_and_falls_back(self):
+        self.mounts.stop()
+        calls = []
+        def fake(cmd, timeout=60):
+            calls.append(cmd)
+            if cmd[:3] == ["docker", "ps", "-aq"]:
+                return subprocess.CompletedProcess(cmd, 0, "c1\nc2\n", "")
+            return subprocess.CompletedProcess(cmd, 0, '[{"Type":"bind","Source":"/tmp"}]\n[]\n', "")
+        with mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(hogs, "sh", fake):
+            self.assertEqual(hogs.all_container_mounts(), ([Path("/tmp").resolve()], True))
+        self.assertEqual(calls[0], ["docker", "ps", "-aq"], "parados incluídos")
+        failed = lambda cmd, timeout=60: subprocess.CompletedProcess(cmd, 1, "", "erro")
+        with mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"), \
+                mock.patch.object(hogs, "sh", failed), \
+                mock.patch.object(hogs, "MOUNTS_FILE", self.root / "nao-existe.json"):
+            self.assertEqual(hogs.all_container_mounts(), ([], False))
+        self.mounts.start()
 
     def test_split_status_counts_renames_once(self):
         out = "?? tmp/\0R  novo.txt\0velho.txt\0 M file.txt\0?? a b.md\0"
