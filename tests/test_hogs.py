@@ -2435,6 +2435,93 @@ class ListModelTest(unittest.TestCase):
 
 # ---- Task 4
 
+class RenderTest(unittest.TestCase):
+    COLS = [hogs.Column("O quê", ratio=4), hogs.Column("Libera", "right"), hogs.Column("Risco"),
+            hogs.Column("Por quê", ratio=3)]
+
+    def rows(self, n=30):
+        out = []
+        for k in range(n):
+            label = f"🗂  ação/{k} " + "caminho-muito-longo/" * 10
+            i = hogs.Item("apps", label, k * 1e9, hogs.SAFE, lambda: None)
+            out.append(hogs.Row(hogs.item_key(i), [label, hogs.fmt(i.size), "🟢", "por quê " * 20], i))
+        return out
+
+    def frame(self, width=100, height=30, state=None, rows=None):
+        rows = self.rows() if rows is None else rows
+        vis = hogs.visible_rows(rows, set())
+        st = state or hogs.ListState()
+        flex = hogs.Flex("rec", lambda h: hogs.list_panel("✨ Recomendado agora", self.COLS, vis, st, set(), h,
+                                                          empty="Nada recomendado agora. 🎉"), st.scroll, len(vis))
+        return hogs.stack(width, height, [hogs.Text("topo"), flex, hogs.Text("rodapé")])
+
+    def test_exact_height_and_one_line_per_row(self):
+        f = self.frame()
+        self.assertEqual(len(f.lines), 30)
+        widths = {hogs.cell_len(f.lines[y]) for y in f.rows}
+        self.assertEqual(len(widths), 1, "todas as linhas da lista com a mesma largura")
+        for y, (name, idx) in f.rows.items():
+            self.assertEqual(name, "rec")
+            self.assertIn(f"ação/{idx} ", f.lines[y])
+
+    def test_rows_map_follows_scroll(self):
+        st = hogs.ListState(cursor=20, scroll=15)
+        f = self.frame(state=st)
+        first = min(f.rows)
+        self.assertEqual(f.rows[first], ("rec", 15))
+        self.assertIn("ação/15 ", f.lines[first])
+
+    def test_too_small_and_empty(self):
+        for w, h in ((40, 30), (100, 10)):
+            f = self.frame(w, h)
+            self.assertEqual(len(f.lines), h)
+            self.assertIn("Janela pequena demais", "\n".join(f.lines))
+            self.assertEqual(f.rows, {})
+        f = self.frame(rows=[])
+        self.assertIn("Nada recomendado agora", "\n".join(f.lines))
+        self.assertEqual(f.rows, {})
+
+    def test_detail_panel_wraps_and_caps(self):
+        lines = [hogs.Text("x" * 250)] + [hogs.Text(f"linha {k}") for k in range(30)]
+        out = "\n".join(hogs.render_lines(hogs.detail_panel("🔎 Por que é seguro", lines, 100, 40), 100))
+        self.assertEqual(out.count("x"), 250)
+        capped = hogs.render_lines(hogs.detail_panel("🔎", lines, 100, 8), 100)
+        self.assertEqual(len(capped), 8)
+        self.assertIn("mais", capped[-2])
+
+    def test_tab_bar_ranges(self):
+        text, ranges = hogs.tab_bar(["✨ Recomendado", "🌳 Worktrees", "🐳 Docker", "💾 Disco"], 1)
+        self.assertEqual([r[2] for r in ranges], [0, 1, 2, 3])
+        plain = text.plain
+        for x0, x1, idx in ranges:
+            self.assertLess(x0, x1)
+        self.assertIn("2 🌳 Worktrees", plain)
+
+    def test_stack_never_crashes_and_keeps_height(self):
+        for w, h in ((1, 1), (5, 3), (59, 19), (60, 20), (200, 8)):
+            f = self.frame(w, h)
+            self.assertEqual(len(f.lines), h)
+
+    def test_cursor_row_is_reversed_and_marks_shown(self):
+        vis = hogs.visible_rows(self.rows(3), set())
+        panel = hogs.list_panel("t", self.COLS, vis, hogs.ListState(cursor=1), {vis[0].row.item and
+                                hogs.item_key(vis[0].row.item)}, 12)
+        lines = hogs.render_lines(panel, 100, "standard")
+        self.assertIn("[x]", lines[hogs.LIST_TOP])
+        self.assertIn("\x1b[7m", lines[hogs.LIST_TOP + 1])
+        self.assertNotIn("\x1b[7m", lines[hogs.LIST_TOP])
+        self.assertEqual(len(lines), 12)
+
+    def test_group_arrows_and_depth(self):
+        child = self.rows(1)[0]
+        grp = hogs.Row("g", ["Grupo", "", "", ""], children=[child], kind="group")
+        for expanded, arrow in ((set(), "▸ "), ({"g"}, "▾ ")):
+            vis = hogs.visible_rows([grp], expanded)
+            lines = hogs.render_lines(hogs.list_panel("t", self.COLS, vis,
+                                                      hogs.ListState(expanded=expanded), set(), 10), 100)
+            self.assertIn(arrow + "Grupo", lines[hogs.LIST_TOP])
+        self.assertIn("  🗂", lines[hogs.LIST_TOP + 1])
+
 
 # ---- Task 5
 
