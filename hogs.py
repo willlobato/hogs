@@ -2246,10 +2246,24 @@ def growth_table(s: Snapshot, records: list[dict]) -> Table | Text:
     return t
 
 
+CLAUDE_KEEP_DAYS = 365
+CLAUDE_DEFAULT_DAYS = 30
+
+
+def claude_retention() -> tuple[bool, str, str] | None:
+    """Quanto tempo o Claude Code guarda as conversas. Só lê; None se não há ~/.claude."""
+    if not (HOME / ".claude").is_dir():
+        return None
+    days = read_json(HOME / ".claude" / "settings.json").get("cleanupPeriodDays")
+    if isinstance(days, int) and not isinstance(days, bool) and days > CLAUDE_DEFAULT_DAYS:
+        return True, f"Conversas do Claude Code guardadas por {days} dias", ""
+    n = days if isinstance(days, int) and not isinstance(days, bool) and days > 0 else CLAUDE_DEFAULT_DAYS
+    return (False, f"Conversas do Claude Code: apagadas depois de {n} dias",
+            f'para guardar mais, ponha "cleanupPeriodDays": {CLAUDE_KEEP_DAYS} em ~/.claude/settings.json (o hogs não altera)')
+
+
 def prevention_panel(s: Snapshot) -> Panel | None:
     d = s.docker
-    if not d.running and not d.raw_real:
-        return None
     cfg = load_config()
     grid = Table.grid(padding=(0, 1))
     grid.add_column(no_wrap=True)
@@ -2259,31 +2273,38 @@ def prevention_panel(s: Snapshot) -> Panel | None:
         icon = Text("✔", style="green") if ok else Text("ℹ", style="blue") if ok is None else Text("!", style="bold yellow")
         grid.add_row(icon, Text.assemble(text, (f"  {hint}" if hint else "", "dim")))
 
-    gc_gb = cfg.get("builder_cache_gb")
-    if gc_gb:
-        row(True, f"Limite do cache de build: no máximo {gc_gb:g} GB por builder", "o hogs confere a cada 1h")
-    else:
-        row(False, "Limite do cache de build: desligado", "ligue com: hogs --docker-gc 20")
-
-    daemon_gc = read_json(DAEMON_JSON).get("builder", {}).get("gc", {})
-    builder = next((b for b in d.builders if b["name"] == d.current_builder), None)
-    if daemon_gc.get("enabled"):
-        text = f"Limpeza automática do Docker (daemon.json): mantém {daemon_gc.get('defaultKeepStorage', '?')}"
-        if builder and builder["driver"] != "docker":
-            ignores = f"o builder ativo ({builder['name']}) roda num container e ignora essa regra"
-            row(bool(gc_gb), text, f"{ignores}; o --docker-gc cobre ele" if gc_gb else f"mas {ignores}")
+    if d.running or d.raw_real:
+        gc_gb = cfg.get("builder_cache_gb")
+        if gc_gb:
+            row(True, f"Limite do cache de build: no máximo {gc_gb:g} GB por builder", "o hogs confere a cada 1h")
         else:
-            row(True, text)
-    else:
-        row(bool(gc_gb), "Limpeza automática do Docker (daemon.json): desligada",
-            "o --docker-gc cobre isso" if gc_gb else "Docker › Settings › Docker Engine")
+            row(False, "Limite do cache de build: desligado", "ligue com: hogs --docker-gc 20")
 
-    if docker_trim_off():
-        row(False, "TRIM desligado: o espaço apagado no Docker não volta pro macOS",
-            "Docker › Settings › Resources › Advanced")
-    if d.raw_limit:
-        row(None, f"Teto do disco do Docker: {fmt(d.raw_limit)} ({d.raw_limit / s.total:.0%} do seu disco)",
-            "é só um limite; reduzir apaga todas as imagens, containers e volumes")
+        daemon_gc = read_json(DAEMON_JSON).get("builder", {}).get("gc", {})
+        builder = next((b for b in d.builders if b["name"] == d.current_builder), None)
+        if daemon_gc.get("enabled"):
+            text = f"Limpeza automática do Docker (daemon.json): mantém {daemon_gc.get('defaultKeepStorage', '?')}"
+            if builder and builder["driver"] != "docker":
+                ignores = f"o builder ativo ({builder['name']}) roda num container e ignora essa regra"
+                row(bool(gc_gb), text, f"{ignores}; o --docker-gc cobre ele" if gc_gb else f"mas {ignores}")
+            else:
+                row(True, text)
+        else:
+            row(bool(gc_gb), "Limpeza automática do Docker (daemon.json): desligada",
+                "o --docker-gc cobre isso" if gc_gb else "Docker › Settings › Docker Engine")
+
+        if docker_trim_off():
+            row(False, "TRIM desligado: o espaço apagado no Docker não volta pro macOS",
+                "Docker › Settings › Resources › Advanced")
+        if d.raw_limit:
+            row(None, f"Teto do disco do Docker: {fmt(d.raw_limit)} ({d.raw_limit / s.total:.0%} do seu disco)",
+                "é só um limite; reduzir apaga todas as imagens, containers e volumes")
+
+    claude = claude_retention()
+    if claude:
+        row(*claude)
+    if not grid.row_count:
+        return None
     return Panel(grid, title="[bold]🛡  Prevenção[/]", title_align="left", border_style="grey50", padding=(0, 2))
 
 

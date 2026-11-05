@@ -38,6 +38,7 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
   only while the app is closed, sized as one copy per old version; unknown installed version → nothing offered.
 - "App open" guards (`process_running`) never miss an open app: the name is regex-escaped and matches by full
   name, by the name cut at `MAXCOMLEN` (16) or by the `…/Contents/MacOS/<exe>` path; any match counts as open.
+- hogs only reads `~/.claude` (transcripts, sessions, settings); `cleanupPeriodDays` is a recommendation, never written.
 
 New invariants get a test in `tests/test_hogs.py` (see `DockerCleanItemsTest`).
 

@@ -908,6 +908,38 @@ class BreakdownTest(unittest.TestCase):
         self.assertEqual(dict(snap.others)[hogs.short(dev)], 50e9)
 
 
+class PreventionTest(unittest.TestCase):
+    def panel(self, settings, docker=hogs.Docker()):
+        home = Path(tempfile.mkdtemp())
+        if settings is not None:
+            (home / ".claude").mkdir()
+            (home / ".claude" / "settings.json").write_text(json.dumps(settings))
+        snap = hogs.Snapshot(494e9, 28e9, docker, [], [])
+        with mock.patch.object(hogs, "HOME", home), mock.patch.object(hogs, "load_config", return_value={}):
+            p = hogs.prevention_panel(snap)
+        if settings is not None:
+            self.assertEqual(json.loads((home / ".claude" / "settings.json").read_text()), settings)  # nunca altera
+        if p is None:
+            return None
+        con = hogs.Console(file=io.StringIO(), width=200)
+        con.print(p)
+        return con.file.getvalue()
+
+    def test_recommends_keeping_conversations_only_when_needed(self):
+        text = self.panel({})
+        self.assertIn("apagadas depois de 30 dias", text)
+        self.assertIn('"cleanupPeriodDays": 365', text)
+        self.assertIn("apagadas depois de 7 dias", self.panel({"cleanupPeriodDays": 7}))
+        text = self.panel({"cleanupPeriodDays": 400})
+        self.assertIn("guardadas por 400 dias", text)
+        self.assertNotIn("365", text)
+
+    def test_without_claude_code_no_line(self):
+        self.assertIsNone(self.panel(None))
+        text = self.panel(None, hogs.Docker(running=True))
+        self.assertNotIn("Claude", text)
+
+
 class HistoryTest(unittest.TestCase):
     def setUp(self):
         tmp = Path(tempfile.mkdtemp())
