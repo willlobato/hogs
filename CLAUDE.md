@@ -36,8 +36,12 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
 - macOS advice (restart, apply update) is text only: never executed, never an `Item`.
 - "com o recomendado" and "✨ Recomendado agora" count only 🟢 (`SAFE`) `clean_items`; ↻ advice and 🟡 `EVAL`
   are listed apart and never add to it. `breakdown()` parts never exceed the used space (no double counting).
-  With Docker's TRIM off (`DiskTRIM` false), Docker items don't add to "com o recomendado" (the space stays in
-  `Docker.raw`) and the header says so.
+  With Docker's TRIM off (`DiskTRIM` false), Docker items don't add to "com o recomendado" nor to the
+  "Dá pra liberar" totals, and the 🐳 group in "✨ Recomendado agora" shows no total (the space stays in
+  `Docker.raw`); each place says so.
+- The main report's 🟢 worktrees are one `Item` (`worktree_item`); its action removes each one through
+  `remove_worktree` (full recheck) and raises if any was kept. `breakdown()` counts worktrees once (inside
+  Projetos' measurement, capped by it).
 - App code-sign clones (`*.code_sign_clone`) are offered only for versions different from the installed app's,
   only while the app is closed, sized as one copy per old version; unknown installed version → nothing offered.
 - "App open" guards (`process_running`) never miss an open app: the name is regex-escaped and matches by full

@@ -81,6 +81,7 @@ class ToolCacheTest(unittest.TestCase):
                 mock.patch.object(hogs, "gather_system", return_value=None), \
                 mock.patch.object(hogs, "sign_clone_root", return_value=None), \
                 mock.patch.object(hogs, "stale_personal", return_value=[]), \
+                mock.patch.object(hogs, "projects_root", return_value=None), \
                 mock.patch.object(hogs, "load_config", return_value={}):
             snap = hogs.gather(Console(file=io.StringIO()))
         return snap, hogs.short(big)
@@ -813,6 +814,134 @@ class BreakdownTest(unittest.TestCase):
         con.print(hogs.header(s))
         self.assertIn("com o recomendado: 28,0 GB livres", con.file.getvalue())
 
+    def wt(self, size, verdict):
+        w = hogs.Worktree(Path(f"/dev/wt-{size}-{verdict}"), Path("/dev/shop-api"), size=int(size))
+        w.eligible = verdict == "seguro"
+        w.waits = ["em uso agora: node"] if verdict == "depois" else []
+        w.blockers = ["1 alterações locais ou arquivos não versionados"] if verdict == "manter" else []
+        w.merged = "merge em origin/main" if w.eligible else ""
+        return w
+
+    def test_worktrees_split_from_projects_without_double_counting(self):
+        for wts, expect in (((20e9, 5e9), (25e9, 35e9)), ((50e9, 30e9), (60e9, 0))):
+            s = self.snap(92e9, 18e9, 60e9)
+            s.projects, s.worktrees = int(60e9), [self.wt(x, "seguro") for x in wts]
+            parts = dict((k, v) for k, v, _ in hogs.breakdown(s))
+            self.assertEqual((parts["Worktrees"], parts["Projetos"]), expect)
+            self.assertAlmostEqual(sum(v for k, v in parts.items() if k != "Livre"), 466e9, delta=1e6)
+            self.assertGreaterEqual(parts["Não identificado"], 0)
+        self.assertEqual([k for k, _, _ in hogs.breakdown(s)],
+                         ["Docker", "Worktrees", "Caches de dev", "Apps e dados", "Projetos", "macOS e swap",
+                          "Outras pastas", "Não identificado", "Livre"])
+
+    def test_worktrees_shrink_with_the_data_volume_parts(self):
+        s = self.snap(300e9, 100e9, 200e9)
+        s.projects, s.worktrees = int(60e9), [self.wt(40e9, "seguro")]
+        parts = dict((k, v) for k, v, _ in hogs.breakdown(s))
+        self.assertLess(parts["Worktrees"], 40e9)
+        self.assertAlmostEqual(sum(v for k, v in parts.items() if k != "Livre"), 466e9, delta=1e6)
+        self.assertGreaterEqual(parts["Não identificado"], 0)
+
+    def test_worktrees_line_and_group_item(self):
+        rows = [self.wt(1e9, "seguro"), self.wt(2e9, "seguro"), self.wt(4e9, "depois"), self.wt(8e9, "manter")]
+        self.assertEqual(hogs.verdict_counts(rows),
+                         {"seguro": (2, int(3e9)), "depois": (1, int(4e9)), "manter": (1, int(8e9))})
+        self.assertEqual(hogs.verdict_counts([]), {"seguro": (0, 0), "depois": (0, 0), "manter": (0, 0)})
+        self.assertEqual(hogs.worktrees_line(rows, Path("/dev")).plain.split("  detalhes")[0],
+                         "🌳 Worktrees: 4 · 15,0 GB · 2 podem sair (3,0 GB) · 1 em andamento · 1 com trabalho só aqui")
+        self.assertIn("  detalhes: hogs --worktrees /dev", hogs.worktrees_line(rows, Path("/dev")).plain)
+        self.assertIn("· 1 pode sair (1,0 GB) ·", hogs.worktrees_line(rows[:1], Path("/dev")).plain)
+        self.assertEqual(hogs.worktrees_line([], Path("/dev"), "git sumiu").plain,
+                         "🌳 Worktrees: não consegui conferir (git sumiu)")
+        self.assertIn("hogs --worktrees PASTA", hogs.worktrees_line([], None).plain)
+        self.assertEqual(hogs.worktrees_line([], Path("/dev")).plain, "🌳 Worktrees: nenhum em /dev")
+        item = hogs.worktree_item(rows, Path("/dev"))
+        self.assertEqual((item.label, item.size, item.risk), ("Worktrees que podem sair (2)", int(3e9), hogs.SAFE))
+        self.assertIn("a branch fica", item.hint)
+        calls = []
+        def remove(w, days, scope):
+            calls.append((w.size, days, scope))
+            if w.size == int(1e9):
+                raise RuntimeError("HEAD ou branch mudou desde a análise")
+        with mock.patch.object(hogs, "remove_worktree", remove):
+            with self.assertRaisesRegex(RuntimeError, "1 de 2 mantidos: wt-1000000000.0-seguro: HEAD ou branch"):
+                item.action()
+        self.assertEqual(sorted(calls), [(int(1e9), 0, Path("/dev")), (int(2e9), 0, Path("/dev"))])
+        self.assertIsNone(hogs.worktree_item([self.wt(4e9, "depois")], Path("/dev")))
+
+    def test_worktree_item_hint_counts_merged_pushed_and_conversations_to_reopen(self):
+        merged, pushed, other = self.wt(1e9, "seguro"), self.wt(2e9, "seguro"), self.wt(3e9, "seguro")
+        pushed.merged, other.merged = "", ""
+        conv = hogs.Conversation("3f2a9c1e", "Relatório mensal", "/dev/wt-x")
+        pushed.conversations = [hogs.ConvLink(conv, "dentro", True)]
+        other.conversations = [hogs.ConvLink(hogs.Conversation("aa"), "citou", False)]
+        item = hogs.worktree_item([merged, pushed, other], Path("/dev"))
+        self.assertEqual(item.hint, "a branch fica · 1 na main · 2 enviados e parados · reabra 1 conversa antes")
+        self.assertEqual(hogs.worktree_item([merged], Path("/dev")).hint, "a branch fica · 1 na main")
+
+    def test_group_counts_as_recommended(self):
+        s = self.snap(92e9, 0, 0)
+        s.items.append(hogs.worktree_item([self.wt(5e9, "seguro")], Path("/dev")))
+        con = hogs.Console(file=io.StringIO(), width=140)
+        con.print(hogs.header(s))
+        self.assertIn("com o recomendado: 33,0 GB livres", con.file.getvalue())
+
+    def test_report_shows_worktrees_line_group_and_what_it_keeps(self):
+        s = self.snap(92e9, 0, 0)
+        rows = [self.wt(1e9, "seguro"), self.wt(4e9, "depois"), self.wt(8e9, "manter"), self.wt(9e9, "manter")]
+        s.worktrees, s.worktrees_root, s.projects = rows, Path("/dev"), int(30e9)
+        s.items.append(hogs.worktree_item(rows, Path("/dev")))
+        out = self.render_report(s)
+        self.assertIn("🌳 Worktrees: 4 · 22,0 GB · 1 pode sair (1,0 GB)", out.split("✨ Recomendado agora")[0])
+        recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        self.assertIn("🌳 Worktrees", recommended)
+        self.assertIn("Worktrees que podem sair (1)", recommended)
+        protected = " ".join(out.split("🛡 Não mexo")[1].split())
+        self.assertIn("1 worktree em andamento e 2 com trabalho só aqui: não mexo", protected)
+        for rows, expect in (([self.wt(8e9, "manter"), self.wt(9e9, "manter")], "2 worktrees com trabalho só aqui"),
+                             ([self.wt(4e9, "depois")], "1 worktree em andamento")):
+            s = self.snap(92e9, 0, 0)
+            s.worktrees = rows
+            con = hogs.Console(file=io.StringIO(), width=160)
+            con.print(hogs.protected_panel(s))
+            protected = " ".join(con.file.getvalue().split())
+            self.assertIn(f"{expect}: não mexo", protected)
+            self.assertNotIn("0 ", protected.split("Não mexo")[1])
+        s = self.snap(92e9, 0, 0)
+        out = self.render_report(s)
+        self.assertIn("escolha a pasta dos seus projetos com hogs --worktrees PASTA", " ".join(out.split()))
+        self.assertNotIn("não mexo", out.split("🛡 Não mexo")[1])
+
+    def test_trim_off_docker_is_not_reclaimable_in_panels(self):
+        tmp = Path(tempfile.mkdtemp())
+
+        def render(trim):
+            s = self.snap(92e9, 0, 0)
+            s.items += [hogs.Item("docker", "Docker: cache de build", 10e9, hogs.SAFE, lambda: None),
+                        hogs.Item("docker", "Imagem do Docker Hub", 4e9, hogs.REDOWN, lambda: None),
+                        hogs.Item("apps", "Lixeira", 2e9, hogs.SAFE, lambda: None)]
+            (tmp / "settings.json").write_text(json.dumps({"DiskTRIM": trim}))
+            with mock.patch.object(hogs, "DOCKER_SETTINGS", tmp / "settings.json"):
+                return self.render_report(s)
+        note = "Docker não devolve espaço: TRIM desligado"
+        out = render(True)
+        recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        group = next(line for line in recommended.splitlines() if "🐳 Docker" in line)
+        self.assertIn("10,0 GB", group)
+        last = " ".join(out.split("Dá pra liberar")[-1].split())
+        self.assertIn("🟢 12,0 GB sem risco", last)
+        self.assertIn("🟡 4,0 GB que baixam de novo", last)
+        self.assertNotIn(note, last)
+        out = render(False)
+        recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        group = next(line for line in recommended.splitlines() if "🐳 Docker" in line)
+        self.assertNotIn("10,0 GB", group)
+        self.assertIn(note, group)
+        last = " ".join(out.split("Dá pra liberar")[-1].split())
+        self.assertIn("🟢 2,0 GB sem risco", last)
+        self.assertIn("🟡 0 kB que baixam de novo", last)
+        self.assertIn(f"({note})", last)
+
     def test_trim_off_docker_space_is_not_recommended_space(self):
         s = self.snap(92e9, 0, 0)
         cleanable = [hogs.Item("docker", "Docker: cache de build", 10e9, hogs.SAFE, lambda: None),
@@ -959,11 +1088,19 @@ class BreakdownTest(unittest.TestCase):
         self.assertIn("Cópias antigas do Navegador", sizes)
         self.assertNotIn("Parado: ~/a.mov", sizes)
         self.assertEqual(sizes["Projetos"], 7e9)
+        self.assertNotIn("Worktrees", sizes)
+        s.worktrees = [self.wt(2e9, "seguro"), self.wt(1e9, "manter")]
+        s.items.append(hogs.worktree_item(s.worktrees, Path("/dev")))
+        sizes = hogs.snapshot_sizes(s)
+        self.assertEqual((sizes["Worktrees"], sizes["Projetos"]), (3e9, 4e9))
+        self.assertNotIn("Worktrees que podem sair", sizes)
 
-    def _gather(self, root, known, candidates, sizes):
+    def _gather(self, root, known, candidates, sizes, worktrees=None):
         si = hogs.SystemInfo({"Preboot": 5e9}, 13e9, 30, False)
         stale = mock.Mock(return_value=[])
+        worktrees = worktrees or mock.Mock(return_value=([], []))
         with mock.patch.object(hogs, "gather_docker", return_value=hogs.Docker()), \
+                mock.patch.object(hogs, "gather_worktrees", worktrees), \
                 mock.patch.object(hogs, "scan_candidates", return_value=candidates), \
                 mock.patch.object(hogs, "du", side_effect=lambda p: sizes.get(p, 0)), \
                 mock.patch.object(hogs, "gather_apps", return_value=[]), \
@@ -993,6 +1130,31 @@ class BreakdownTest(unittest.TestCase):
         snap, _ = self._gather(tmp / "nao-existe", True, [dev, other], sizes)
         self.assertEqual(snap.projects, 0)
         self.assertEqual(dict(snap.others)[hogs.short(dev)], 50e9)
+
+    def test_gather_brings_worktrees_only_with_a_projects_folder(self):
+        tmp = Path(tempfile.mkdtemp())
+        rows = [self.wt(1e9, "seguro"), self.wt(2e9, "seguro"), self.wt(4e9, "depois")]
+        found = mock.Mock(return_value=(rows, []))
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, found)
+        found.assert_called_once_with(tmp, 0)
+        self.assertEqual((snap.worktrees, snap.worktrees_root), (rows, tmp))
+        self.assertIn("Worktrees que podem sair (2)", [i.label for i in snap.items])
+        found = mock.Mock(return_value=(rows, []))
+        snap, _ = self._gather(tmp / "nao-existe", True, [], {}, found)
+        found.assert_not_called()
+        self.assertEqual((snap.worktrees, snap.worktrees_root), ([], None))
+        self.assertFalse([i for i in snap.items if i.cat == "worktree"])
+        self.assertEqual(snap.worktrees_error, "")
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(side_effect=RuntimeError("git sumiu")))
+        self.assertEqual((snap.worktrees, snap.worktrees_error), ([], "git sumiu"))
+        self.assertFalse([i for i in snap.items if i.cat == "worktree"])
+        line = hogs.worktrees_line(snap.worktrees, snap.worktrees_root, snap.worktrees_error).plain
+        self.assertEqual(line, "🌳 Worktrees: não consegui conferir (git sumiu)")
+        self.assertNotIn("nenhum", line)
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(return_value=([], ["não consegui inspecionar x"])))
+        self.assertEqual(snap.worktrees_error, "não consegui inspecionar x")
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(return_value=(rows, ["aviso qualquer"])))
+        self.assertEqual(snap.worktrees_error, "")
 
 
 class PreventionTest(unittest.TestCase):
@@ -1057,6 +1219,29 @@ class HistoryTest(unittest.TestCase):
         rows = hogs.growth({"docker": 30 * 10**9, "npm": 4 * 10**9, "new": 2 * 10**9, "tiny": 10**9},
                            {"docker": 13 * 10**9, "npm": 5 * 10**9, "tiny": 10**9 - 10})
         self.assertEqual(rows, [("docker", 17 * 10**9), ("new", 2 * 10**9)])
+
+    def test_growth_compares_projects_with_worktrees_against_old_records(self):
+        # Registros antigos têm os worktrees dentro de "Projetos" e nenhum "Worktrees": não é crescimento.
+        current = {"Projetos": 50 * 10**9, "Worktrees": 10 * 10**9}
+        self.assertEqual(hogs.growth(current, {"Projetos": 60 * 10**9}), [])
+        self.assertEqual(hogs.growth(current, {"docker": 10**9}), [])
+        self.assertEqual(hogs.growth(current, {"Projetos": 55 * 10**9}), [("Projetos", 5 * 10**9)])
+        self.assertEqual(hogs.growth(current, {"Projetos": 50 * 10**9, "Worktrees": 8 * 10**9}),
+                         [("Worktrees", 2 * 10**9)])
+
+    def test_growth_table_has_no_false_worktrees_row_after_upgrade(self):
+        s = hogs.Snapshot(494e9, 28e9, hogs.Docker(), [], [], projects=int(60e9))
+        w = hogs.Worktree(Path("/dev/wt-a"), Path("/dev/shop-api"), size=int(10e9))
+        s.worktrees = [w]
+        records = [{"t": self.now - 26 * 3600, "full": True, "free": 1, "sizes": {"Projetos": int(57e9)}}]
+        con = hogs.Console(file=io.StringIO(), width=160)
+        with mock.patch.object(hogs.time, "time", return_value=self.now):
+            con.print(hogs.growth_table(s, records))
+        out = con.file.getvalue()
+        self.assertNotIn("Worktrees", out)
+        self.assertIn("Projetos", out)
+        self.assertIn("+3,0 GB", out)
+        self.assertIn("60,0 GB", out)
 
     def test_value_at_picks_last_record_before_time(self):
         records = [{"t": 10, "free": 1}, {"t": 20}, {"t": 30, "free": 3}, {"t": 40, "free": 4}]
