@@ -17,6 +17,7 @@ import math
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -931,14 +932,19 @@ def live_claude_transcripts() -> tuple[list[tuple[str, Path]], str]:
 
 
 def claude_work(line: bytes) -> bytes:
-    """Parte de uma linha da transcrição do Claude Code que é trabalho na sessão: o que o assistente fez ou
-    escreveu (comandos, caminhos, texto) e o que o usuário digitou. Saída de ferramenta (tool_result, como
-    `git worktree list`) e anexos de contexto não contam. Linha ilegível conta inteira."""
+    """Parte de uma linha da transcrição do Claude Code que é trabalho na sessão (ver claude_work_record).
+    Linha ilegível conta inteira."""
     try:
-        record = json.loads(line)
-        kind, content = record.get("type"), (record.get("message") or {}).get("content")
+        return claude_work_record(json.loads(line))
     except (ValueError, AttributeError):
         return line
+
+
+def claude_work_record(record: dict) -> bytes:
+    """O que o assistente fez ou escreveu (comandos, caminhos, texto) e o que o usuário digitou, num registro já
+    lido. Saída de ferramenta (tool_result, como `git worktree list`) e anexos de contexto não contam.
+    Registro fora do formato levanta AttributeError."""
+    kind, content = record.get("type"), (record.get("message") or {}).get("content")
     if kind == "assistant":
         return json.dumps(content, ensure_ascii=False).encode()
     if kind == "user":
@@ -948,6 +954,172 @@ def claude_work(line: bytes) -> bytes:
             return json.dumps([c for c in content if not (isinstance(c, dict) and c.get("type") == "tool_result")],
                               ensure_ascii=False).encode()
     return b""
+
+
+CONVERSATIONS_CACHE = DATA_DIR / "conversations.json"
+MENTION_PARTS = 8
+MENTION_END = re.compile(rb"[^\"'`\\\n\t<>|;&()\[\]{}]*")
+
+
+@dataclass
+class Conversation:
+    """Uma conversa do Claude Code (transcrição principal + subagentes)."""
+    session: str
+    title: str = ""
+    start: str = ""                                                   # primeiro cwd: de onde `--resume` a acha
+    last: float = 0.0
+    cwds: set[str] = field(default_factory=set)
+    branches: set[tuple[str, str]] = field(default_factory=set)       # (cwd, gitBranch)
+    mentions: set[str] = field(default_factory=set)                   # caminhos citados, relativos ao escopo
+    live: bool = False
+
+
+@dataclass
+class ConvLink:
+    conv: Conversation
+    how: str        # "dentro", "branch" ou "citou"
+    reopen: bool    # a conversa começou dentro do worktree
+
+
+def mention_tails(work: bytes, scope: Path) -> set[str]:
+    """Caminhos citados abaixo de `scope`, relativos a ele e cortados em MENTION_PARTS partes. Espaço não
+    termina o caminho (pastas com espaço); aspas, barra invertida, quebra de linha e operadores de shell sim."""
+    needle = bytes(scope) + b"/"
+    found: set[str] = set()
+    at = work.find(needle)
+    while at >= 0:
+        m = MENTION_END.match(work, at + len(needle))
+        tail = m.group().decode("utf-8", errors="replace").rstrip(" .,:")
+        tail = "/".join(tail.split("/")[:MENTION_PARTS])
+        if tail:
+            found.add(tail)
+        at = work.find(needle, m.end())
+    return found
+
+
+def parse_iso(ts: str) -> float | None:
+    """Data ISO das transcrições ("2026-11-04T12:34:56.789Z") em epoch; ilegível → None."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def read_transcript(path: Path, entry: dict | None, scope: Path) -> dict:
+    """Entrada de cache de uma transcrição. Se `entry` ainda vale (mesmo inode, arquivo não encolheu e os bytes
+    antes de `offset` batem com `tail`), lê só o que foi acrescentado; senão lê do início. Só linhas completas."""
+    st = path.stat()
+    sub = path.parent.name == "subagents"
+    needle = bytes(scope) + b"/"
+    quick = needle if json.dumps(str(scope) + "/")[1:-1].encode() == needle else b""  # ASCII sem escapes
+    with path.open("rb") as f:
+        state = None
+        try:
+            offset, tail = entry["offset"], bytes.fromhex(entry["tail"])
+            if entry["ino"] == st.st_ino and isinstance(offset, int) and len(tail) <= offset <= st.st_size:
+                f.seek(offset - len(tail))
+                if f.read(len(tail)) == tail:
+                    state = (offset, str(entry["start"]), str(entry["title"]), float(entry["last"]),
+                             {str(c) for c in entry["cwds"]}, {(str(c), str(b)) for c, b in entry["branches"]},
+                             {str(m) for m in entry["mentions"]})
+        except (TypeError, KeyError, ValueError, AttributeError):  # sem cache ou cache fora do formato
+            pass
+        offset, start, title, last, cwds, branches, mentions = state or (0, "", "", 0.0, set(), set(), set())
+        f.seek(offset)
+        for line in f:
+            if not line.endswith(b"\n"):
+                break
+            offset += len(line)
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            kind, cwd, branch = record.get("type"), record.get("cwd"), record.get("gitBranch")
+            if isinstance(cwd, str) and cwd:
+                start = start or cwd
+                cwds.add(cwd)
+                if isinstance(branch, str) and branch and branch != "HEAD":
+                    branches.add((cwd, branch))
+            if kind == "ai-title" and isinstance(record.get("aiTitle"), str):
+                title = record["aiTitle"]
+            if kind in ("user", "assistant"):
+                ts = parse_iso(record.get("timestamp"))
+                if ts is not None:
+                    last = max(last, ts)
+            if not quick or quick in line:
+                try:
+                    work = claude_work_record(record)
+                except AttributeError:
+                    work = line
+                mentions |= mention_tails(work, scope)
+        f.seek(max(0, offset - 32))
+        tail = f.read(offset - max(0, offset - 32))
+    return {"ino": st.st_ino, "offset": offset, "tail": tail.hex(),
+            "session": path.parent.parent.name if sub else path.stem, "main": not sub, "start": start,
+            "title": title, "last": last, "cwds": sorted(cwds), "branches": sorted(branches),
+            "mentions": sorted(mentions)}
+
+
+def claude_conversations(scope: Path, projects: Path | None = None,
+                         cache: Path | None = None) -> tuple[list[Conversation], str]:
+    """Todas as conversas do Claude Code (~/.claude/projects), com cache incremental: cada transcrição é lida
+    só a partir de onde parou na última vez. Menções são relativas a `scope`; trocar o escopo relê tudo."""
+    projects = HOME / ".claude" / "projects" if projects is None else projects
+    cache = CONVERSATIONS_CACHE if cache is None else cache
+    if not projects.is_dir():
+        return [], ""
+    saved = read_json(cache)
+    known = saved.get("files") if saved.get("v") == 1 and saved.get("scope") == str(scope) else None
+    known = known if isinstance(known, dict) else {}
+    entries: dict[str, dict] = {}
+    try:
+        for f in sorted([*projects.glob("*/*.jsonl"), *projects.glob("*/*/subagents/*.jsonl")]):
+            try:
+                entries[str(f)] = read_transcript(f, known.get(str(f)), scope)
+            except FileNotFoundError:
+                continue
+        by: dict[str, list[tuple[str, dict]]] = {}
+        for f, e in entries.items():
+            by.setdefault(e["session"], []).append((f, e))
+        live = {s.get("sessionId") for s in live_claude_sessions()[0]}
+        convs = []
+        for session, files in by.items():
+            mains = [(f, e) for f, e in files if e["main"]]
+            if not mains:
+                continue
+            c = Conversation(session, live=session in live)
+            for f, e in files:
+                c.last = max(c.last, e["last"])
+                c.cwds.update(e["cwds"])
+                c.branches.update((cwd, b) for cwd, b in e["branches"])
+                c.mentions.update(e["mentions"])
+            for f, e in mains:
+                c.start = c.start or e["start"]
+                c.title = e["title"] or c.title
+            if not c.last:
+                try:
+                    c.last = Path(mains[0][0]).stat().st_mtime
+                except FileNotFoundError:
+                    pass
+            convs.append(c)
+    except OSError as exc:
+        return [], f"não foi possível ler as conversas do Claude Code: {exc}"
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_name(f"{cache.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"v": 1, "scope": str(scope), "files": entries}))
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+    return sorted(convs, key=lambda c: c.last, reverse=True), ""
+
+
+def resume_command(c: Conversation) -> str:
+    if not c.start:
+        return f"claude --resume {c.session}"
+    return f"cd {shlex.quote(c.start)} && claude --resume {c.session}"
 
 
 def codex_work(line: bytes) -> bytes:
