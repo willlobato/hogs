@@ -1951,7 +1951,7 @@ class WorktreeTableTest(unittest.TestCase):
         self.assertIn("✗ sem merge", text)
         self.assertIn("🟡 depois", text)
         self.assertIn("⚪ manter", text)
-        self.assertIn("✗ não comprovado", text)
+        self.assertEqual(text.count("✗ não"), 2)
         self.assertIn("● Título", text)
 
 if __name__ == "__main__":
