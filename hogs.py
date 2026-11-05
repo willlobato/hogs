@@ -1417,6 +1417,100 @@ def gather(con: Console) -> Snapshot:
     return Snapshot(usage.total, usage.free, docker, items, others, apps)
 
 
+# ---------------------------------------------------------------- sistema
+
+SWAP_HIGH = 4e9
+UPTIME_LONG_DAYS = 14
+PREBOOT_NORMAL = 6e9
+UPDATE_SNAPSHOT = "com.apple.os.update-MSUPrepareUpdate"
+
+
+@dataclass
+class SystemInfo:
+    volumes: dict[str, int]
+    swap_used: int
+    uptime_days: float
+    update_pending: bool
+
+
+def parse_apfs(data: bytes, container: str) -> dict[str, int]:
+    """CapacityInUse por papel (Roles[0]) dos volumes do container; volumes sem papel ficam de fora."""
+    try:
+        info = plistlib.loads(data)
+    except Exception:
+        return {}
+    out: dict[str, int] = {}
+    for c in info.get("Containers", []):
+        if c.get("ContainerReference") != container:
+            continue
+        for v in c.get("Volumes", []):
+            roles = v.get("Roles") or []
+            if roles:
+                out[roles[0]] = out.get(roles[0], 0) + int(v.get("CapacityInUse", 0))
+    return out
+
+
+def parse_swap(text: str) -> int:
+    m = re.search(r"used\s*=\s*([\d.,]+)M", text)
+    if not m:
+        return 0
+    try:
+        return int(float(m.group(1).replace(",", ".")) * 2**20)
+    except ValueError:
+        return 0
+
+
+def parse_boottime(text: str, now: float) -> float:
+    m = re.search(r"sec\s*=\s*(\d+)", text)
+    if not m:
+        return 0.0
+    return max(0.0, (now - int(m.group(1))) / 86400)
+
+
+def _plist_out(cmd: list[str]) -> dict | None:
+    r = sh(cmd)
+    if not r or r.returncode != 0 or not r.stdout:
+        return None
+    try:
+        d = plistlib.loads(r.stdout.encode())
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def gather_system(now: float) -> SystemInfo | None:
+    info = _plist_out(["diskutil", "info", "-plist", "/"])
+    container = (info or {}).get("APFSContainerReference")
+    if not container:
+        return None
+    r = sh(["diskutil", "apfs", "list", "-plist"])
+    if not r or r.returncode != 0 or not r.stdout:
+        return None
+    volumes = parse_apfs(r.stdout.encode(), container)
+    snaps = _plist_out(["diskutil", "apfs", "listSnapshots", "-plist", "/"])
+    if snaps is None:
+        return None
+    pending = any(s.get("SnapshotName") == UPDATE_SNAPSHOT for s in snaps.get("Snapshots", []))
+    sw = sh(["sysctl", "-n", "vm.swapusage"])
+    swap = parse_swap(sw.stdout) if sw and sw.returncode == 0 else 0
+    bt = sh(["sysctl", "-n", "kern.boottime"])
+    days = parse_boottime(bt.stdout, now) if bt and bt.returncode == 0 else 0.0
+    return SystemInfo(volumes, swap, days, pending)
+
+
+def system_advice(si: SystemInfo) -> list[tuple[str, int, str]]:
+    """Só texto: (rótulo, estimativa em bytes, como fazer). Nunca executado, nunca um Item."""
+    out: list[tuple[str, int, str]] = []
+    if si.swap_used >= SWAP_HIGH and si.uptime_days >= UPTIME_LONG_DAYS:
+        out.append(("Reiniciar o Mac", si.swap_used,
+                    f"swap {fmt(si.swap_used)} · ligado há {int(si.uptime_days)} dias"))
+    if si.update_pending:
+        out.append(("Aplicar a atualização do macOS",
+                    int(max(0, si.volumes.get("Preboot", 0) - PREBOOT_NORMAL)),
+                    "Ajustes do Sistema › Geral › Atualização de Software"))
+    return out
+
+
 # ---------------------------------------------------------------- histórico
 #
 # Duas fontes gravam em history.jsonl: o agente (de hora em hora, só espaço livre e Docker.raw,
