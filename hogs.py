@@ -117,6 +117,8 @@ class Item:
     path: Path | None = None     # onde o item mora no disco (para abrir no Finder e mostrar no 🔎)
     worktree: Worktree | None = None   # o worktree, quando o item é um só
     refs: list[str] = field(default_factory=list)   # imagens do Docker (image_ref) que o item remove
+    checks: list[tuple[bool, str]] = field(default_factory=list)   # o que o hogs conferiu: (passou, texto), no 🔎
+    guard_app: str = ""          # o app que a guarda confere; com ela passando, o 🔎 diz "<app> fechado"
 
 
 # ---------------------------------------------------------------- utilidades
@@ -743,6 +745,7 @@ class Rollback(NamedTuple):
     size: int       # quanto libera
     risk: Risk
     hint: str
+    checks: tuple = ()   # o que foi conferido, para o 🔎: (passou, texto)
 
 
 RECENT_ROLLBACK = "o QA pode estar em andamento"
@@ -766,12 +769,14 @@ def rollback_info(d: Docker) -> dict[int, Rollback]:
         if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
             hint = "mesma imagem da atual: só remove a tag"
         risk = SAFE if old else EVAL
+        checks = [(True, f"a imagem atual {image_ref(current)} existe"), (old, f"mais de {days} dias (tem {int(age)})")]
         branch = d.released.get(current["name"])
         if branch:   # o commit da imagem atual já está na branch padrão: voltar não perde nada
             risk, hint = SAFE, f"o commit da {current['name']} já está na {branch}"
+            checks.append((True, f"o commit da {current['name']} já está na {branch}"))
             if same:
                 hint = "mesma imagem da atual: só remove a tag"
-        out[id(img)] = Rollback(img, 0 if same else img["size"], risk, hint)
+        out[id(img)] = Rollback(img, 0 if same else img["size"], risk, hint, tuple(checks))
     return out
 
 
@@ -817,7 +822,7 @@ def docker_clean_items(d: Docker) -> list[Item]:
     for rb in rollbacks.values():
         items.append(Item("docker", f"Ponto de volta {rb.img['name']}", rb.size, rb.risk,
                           lambda ref=image_ref(rb.img): run_all([["docker", "rmi", ref]]), rb.hint,
-                          kind="ponto_de_volta", refs=[image_ref(rb.img)]))
+                          kind="ponto_de_volta", refs=[image_ref(rb.img)], checks=list(rb.checks)))
 
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):
@@ -837,7 +842,7 @@ def docker_clean_items(d: Docker) -> list[Item]:
         items.append(Item("docker", f"Imagens pequenas de registry/Hub ({len(names)})",
                           sum(i["size"] for i in small_pullable), REDOWN,
                           lambda refs=refs: run_all([["docker", "rmi", r] for r in refs]),
-                          preview([n.rsplit("/", 1)[-1] for n in names]), kind="imagem", refs=refs))
+                          preview([n.rsplit("/", 1)[-1] for n in names]), kind="imagens_pequenas", refs=refs))
     return items
 
 
@@ -865,6 +870,10 @@ class Worktree:
     @property
     def verdict(self) -> str:
         return "seguro" if self.eligible else ("manter" if self.blockers or not self.waits else "depois")
+
+    def latest_conversation(self) -> ConvLink | None:
+        """A conversa ligada mais recente (pela última mensagem); None sem conversa."""
+        return max(self.conversations, key=lambda link: link.conv.last) if self.conversations else None
 
 
 def branch_name(w: Worktree) -> str:
@@ -1147,6 +1156,11 @@ class Conversation:
     branches: set[tuple[str, str]] = field(default_factory=set)       # (cwd, gitBranch)
     mentions: set[str] = field(default_factory=set)                   # caminhos citados, relativos ao escopo
     live: bool = False
+
+    @property
+    def name(self) -> str:
+        """Como a conversa aparece: o título ou, sem ele, o começo do id da sessão."""
+        return self.title or self.session[:8]
 
 
 @dataclass
@@ -1531,7 +1545,7 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
             if recent:
                 conv = max(recent, key=lambda c: c.last)
                 result.waits.append(f"conversa do Claude Code {elapsed(conv.last)}: "
-                                    f"{conv.title or conv.session[:8]}")
+                                    f"{conv.name}")
             if result.sessions:
                 result.waits.append(f"conversa aberta do Claude Code: {', '.join(result.sessions)}")
             if links is None:
@@ -1739,7 +1753,7 @@ def conversation_cell(w: Worktree) -> Text:
     """A conversa mais recente ligada ao worktree; embaixo, há quanto tempo, quantas outras e o aviso de reabrir."""
     if not w.conversations:
         return Text("—")
-    last = max(w.conversations, key=lambda link: link.conv.last).conv
+    last = w.latest_conversation().conv
     head = ("● " if last.live else "") + (last.title or "(sem título)")
     foot = elapsed(last.last)
     if len(w.conversations) > 1:
@@ -2033,6 +2047,16 @@ def make_guard(pd: PathDef) -> Callable[[], str | None] | None:
     return lambda: f"feche o {pd.guard_proc} antes" if process_running(pd.guard_proc) else None
 
 
+RECREATES = "o app ou a ferramenta recria quando precisar"
+
+
+def path_item(pd: PathDef, sizes: dict[Path, int]) -> Item:
+    """O Item de uma pasta conhecida; as que se apagam (rm ou comando da ferramenta) voltam sozinhas."""
+    checks = [(True, RECREATES)] if pd.action is not None and pd.action != "empty" else []
+    return Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk, make_action(pd), pd.hint,
+                make_guard(pd), path=pd.paths[0], checks=checks, guard_app=pd.guard_proc or "")
+
+
 # Pastas varridas pra achar o que não está na lista acima.
 SCAN_ROOTS = [HOME, APP_SUPPORT, CONTAINERS, GROUP_CONTAINERS, CACHES]
 
@@ -2064,7 +2088,7 @@ def big_cache_paths(sizes: dict[Path, int], mounts: list[Path]) -> list[Path]:
 def cache_items(sizes: dict[Path, int], mounts: list[Path]) -> list[Item]:
     """Caches grandes em ~/Library/Caches que a lista não cobre; o app recria quando precisar."""
     return [Item("dev", f"Cache: {p.name}", int(sizes[p]), REDOWN, lambda p=p: shutil.rmtree(p),
-                 "cache do app; ele recria quando precisar", path=p)
+                 "cache do app; ele recria quando precisar", path=p, checks=[(True, RECREATES)])
             for p in big_cache_paths(sizes, mounts)]
 
 
@@ -2234,8 +2258,9 @@ def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
             return f"feche o {g.app} antes" if process_running(g.executable) else None
 
         hint = f"versões {', '.join(sorted(old))}; a instalada é {g.installed}"
+        checks = [(True, f"versão {v} ≠ instalada {g.installed}") for v in sorted(old)]
         items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard,
-                          path=copies[0]))
+                          path=copies[0], checks=checks, guard_app=g.app))
     return items
 
 
@@ -2295,7 +2320,8 @@ def personal_items(found: list[tuple[Path, int, float]], now: float) -> list[Ite
     for p, size, last in found:
         meses = int((now - last) // (30 * 86400))
         items.append(Item("apps", f"Parado: {short(p)}", size, EVAL, lambda p=p: move_to_trash(p),
-                          f"sem abrir há {meses} meses · vai para a Lixeira", kind="pessoal", path=p))
+                          f"sem abrir há {meses} meses · vai para a Lixeira", kind="pessoal", path=p,
+                          checks=[(True, f"sem abrir há {meses} meses"), (True, "vai para a Lixeira")]))
     return items
 
 
@@ -2380,8 +2406,7 @@ def gather(con: Console) -> Snapshot:
                 except Exception as exc:   # o relatório nunca cai por causa dos worktrees: diz que não conferiu
                     worktrees_error = str(exc) or type(exc).__name__
 
-    items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
-                  make_action(pd), pd.hint, make_guard(pd), path=pd.paths[0]) for pd in PATH_DEFS]
+    items = [path_item(pd, sizes) for pd in PATH_DEFS]
     shown: set[Path] = set()
     if mounts_known:
         cand_sizes = {p: sizes.get(p, 0) for p in candidates}
@@ -3152,8 +3177,12 @@ class Terminal:
         raw[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
         raw[0] &= ~(termios.IXON | termios.ICRNL)
         termios.tcsetattr(self.fd, termios.TCSANOW, raw)
-        self.out.write(SCREEN_ON + (MOUSE_ON if self.mouse else ""))
-        self.out.flush()
+        try:
+            self.out.write(SCREEN_ON + (MOUSE_ON if self.mouse else ""))
+            self.out.flush()
+        except BaseException:   # sem a tela, o terminal não pode ficar cru
+            termios.tcsetattr(self.fd, termios.TCSAFLUSH, self._saved)
+            raise
 
     def _stop(self) -> None:
         try:
@@ -3246,6 +3275,7 @@ class Row:
     resume: Conversation | None = None
     how: str = ""
     group: str = ""
+    size: int = 0          # o tamanho que a linha mostra; a linha "… mais N" soma o dos escondidos
 
 
 def item_key(i: Item) -> str:
@@ -3267,7 +3297,7 @@ class ListState:
 
 
 def _hidden_size(hidden: list[Row]) -> int:
-    return sum(c.item.size for c in hidden if c.item is not None)
+    return sum(c.size for c in hidden)
 
 
 def visible_rows(rows: list[Row], expanded: set[str]) -> list[Visible]:
@@ -3299,6 +3329,13 @@ def checkable(row: Row) -> bool:
     return row.item is not None and row.item.action is not None and row.kind == "item"
 
 
+def safe_row(row: Row) -> bool:
+    """Linha 🟢: um item seguro, ou um grupo só de linhas 🟢 (o 🔎 dela diz "Por que é seguro")."""
+    if row.item is not None and row.kind == "item":
+        return row.item.risk is SAFE
+    return bool(row.children) and all(safe_row(c) for c in row.children)
+
+
 def leaf_items(row: Row) -> list[Item]:
     out: list[Item] = []
     if checkable(row):
@@ -3308,8 +3345,15 @@ def leaf_items(row: Row) -> list[Item]:
     return out
 
 
-def mark_box(row: Row, marked: set[str]) -> str:
+def box_items(row: Row) -> list[Item]:
+    """O que a caixinha da linha marca: o próprio item; num grupo, só os 🟢 dele (🟡 e 🔴 só um por um)."""
     leaves = leaf_items(row)
+    return leaves if row.kind == "item" else [i for i in leaves if i.risk is SAFE]
+
+
+def mark_box(row: Row, marked: set[str]) -> str:
+    """A caixinha reflete o que ela marca: grupo sem nenhum 🟢 não tem caixinha."""
+    leaves = box_items(row)
     if not leaves:
         return ""
     n = sum(1 for i in leaves if item_key(i) in marked)
@@ -3317,7 +3361,7 @@ def mark_box(row: Row, marked: set[str]) -> str:
 
 
 def toggle(row: Row, marked: set[str]) -> None:
-    keys = {item_key(i) for i in leaf_items(row)}
+    keys = {item_key(i) for i in box_items(row)}
     if not keys:
         return
     if keys <= marked:
@@ -3432,11 +3476,21 @@ def apply_items(items: list[Item], notify: Callable[[Item, bool, str], None]) ->
     return max(0, shutil.disk_usage(DATA_VOLUME).free - before)
 
 
+WT_KEYS = "o abrir no Finder · c copiar · r reabrir a conversa"
+
+
+def check_line(ok: bool, text: str) -> Text:
+    return Text(f"✓ {text}", style="green") if ok else Text(f"✗ {text}", style="yellow")
+
+
+def path_line(path: Path) -> Text:
+    return Text(f"📁 {short(path)}", style=f"link file://{path}")
+
+
 def worktree_detail(w: Worktree, root: Path | None) -> list[Text]:
-    lines = [Text(f"{where(w, root)} · {branch_name(w)}", style="bold"),
+    lines = [Text(f"{where(w, root)} · {branch_name(w)}", style="bold"), path_line(w.path),
              Text(f"{fmt(w.size)} · mexido {elapsed(w.last_activity)}")]
-    for ok, text in w.checks:
-        lines.append(Text(f"✓ {text}", style="green") if ok else Text(f"✗ {text}", style="yellow"))
+    lines += [check_line(ok, text) for ok, text in w.checks]
     if w.users:
         lines.append(Text(f"▶ em uso por: {', '.join(w.users)}"))
     lines += [Text(f"🟡 {t}") for t in w.waits]
@@ -3448,24 +3502,30 @@ def worktree_detail(w: Worktree, root: Path | None) -> list[Text]:
     lines.append(Text(verdict, style=color))
     for link in sorted(w.conversations, key=lambda l: -l.conv.last):
         c = link.conv
-        lines.append(Text(f"💬 {'● ' if c.live else ''}“{c.title or c.session[:8]}” · última msg {elapsed(c.last)}"))
+        lines.append(Text(f"💬 {'● ' if c.live else ''}“{c.name}” · última msg {elapsed(c.last)}"))
         lines.append(Text(resume_command(c), style="cyan"))
         if link.reopen:
             lines.append(Text("⚠ reabra antes de apagar: depois da remoção ela não abre mais", style="yellow"))
+    if w.conversations:
+        lines.append(Text(WT_KEYS, style="grey62"))
     return lines
 
 
 def item_detail(i: Item, guard_text: str | None = None) -> list[Text]:
+    """O 🔎 de um item: risco, dica, o que o hogs conferiu (✓/✗) e a guarda (`guard_text`: o motivo, se falhou)."""
     lines = [Text(i.label, style="bold"),
              Text(f"{fmt(i.size)} · {i.risk.icon} {i.risk.label}: {RISK_WHY[i.risk.label]}")]
     if i.hint:
         lines.append(Text(i.hint))
+    lines += [check_line(ok, text) for ok, text in i.checks]
     if guard_text:
-        lines.append(Text(f"✗ {guard_text}", style="yellow"))
-    if i.path:
-        lines.append(Text(f"📁 {short(i.path)}", style=f"link file://{i.path}"))
+        lines.append(check_line(False, guard_text))
+    elif i.guard is not None:
+        lines.append(check_line(True, f"{i.guard_app or 'o app'} fechado"))
     if i.worktree:
         lines += worktree_detail(i.worktree, None)
+    elif i.path:
+        lines.append(path_line(i.path))
     return lines
 
 
@@ -3502,7 +3562,7 @@ def list_panel(title: str, columns: list[Column], vis: list[Visible], state: Lis
         for j in range(len(columns)):
             cell = row.cells[j] if j < len(row.cells) else ""
             if j == 0:
-                arrow = ("▾ " if row.key in state.expanded else "▸ ") if row.kind == "group" else ""
+                arrow = ("▾ " if row.key in state.expanded else "▸ ") if row.kind == "group" or row.children else ""
                 prefix = "  " * v.depth + arrow
                 cell = prefix + cell if isinstance(cell, str) else Text(prefix) + cell
             cells.append(Text(cell) if isinstance(cell, str) else cell)
@@ -3604,17 +3664,16 @@ def run_guards(items: list[Item]) -> dict[str, str | None]:
 
 def item_row(i: Item, guards: dict[str, str | None]) -> Row:
     guard = guards.get(item_key(i))
-    resume = None
-    if i.worktree and i.worktree.conversations:
-        resume = max(i.worktree.conversations, key=lambda link: link.conv.last).conv
+    link = i.worktree.latest_conversation() if i.worktree else None
     return Row(item_key(i), [i.label, fmt(i.size), i.risk.icon, Text(guard, style="yellow") if guard else i.hint],
-               i, detail=item_detail(i, guard), title=i.label, path=i.path, resume=resume, group=f"disk/{i.cat}")
+               i, detail=item_detail(i, guard), title=i.label, path=i.path, resume=link.conv if link else None,
+               group=f"disk/{i.cat}", size=i.size)
 
 
 def _group_row(key: str, title: str, total_cell: str, risk: str, note: str, kids: list[Row], detail: list,
-               limit: int = 0) -> Row:
+               limit: int = 0, size: int = 0) -> Row:
     return Row(key, [title, total_cell, risk, note], children=kids, limit=limit, kind="group", title=title,
-               detail=detail)
+               detail=detail, size=size)
 
 
 def recommended_tree(s: Snapshot, items: list[Item], trim_off: bool,
@@ -3638,7 +3697,7 @@ def recommended_tree(s: Snapshot, items: list[Item], trim_off: bool,
         groups.append((total, _group_row(f"rec/{cat}", title, "—" if trapped else fmt(total), "🟢",
                                          TRIM_OFF_NOTE if trapped else "",
                                          [item_row(i, guards) for i in group], detail,
-                                         limit=5 if cat == "worktree" else 0)))
+                                         limit=5 if cat == "worktree" else 0, size=total)))
     rows = [r for _, r in sorted(groups, key=lambda g: -g[0])]
     for n, (label, size, how) in enumerate(s.advice):
         rows.append(Row(f"rec/advice/{n}", [f"💻 {label}", f"~{fmt(size)}" if size else "",
@@ -3654,7 +3713,8 @@ def recommended_tree(s: Snapshot, items: list[Item], trim_off: bool,
             label = f"{title} ({len(group)})"
             rows.append(_group_row(key, label, fmt(total), "🟡", note, [item_row(i, guards) for i in group],
                                    [Text(label, style="bold"),
-                                    Text(f"{plural(len(group), 'item', 'itens')} · {fmt(total)}"), Text(note)]))
+                                    Text(f"{plural(len(group), 'item', 'itens')} · {fmt(total)}"), Text(note)],
+                                   size=total))
     if not s.mounts_known:
         rows.append(Row("rec/note/mounts",
                         [Text("Docker não respondeu: não sei quais pastas os containers usam, "
@@ -3662,8 +3722,8 @@ def recommended_tree(s: Snapshot, items: list[Item], trim_off: bool,
     return REC_COLUMNS, rows
 
 
-def _info_row(key: str, cells: list) -> Row:
-    return Row(key, cells, kind="info", title=str(cells[0]), detail=[str(c) for c in cells if str(c)])
+def _info_row(key: str, cells: list, size: int = 0) -> Row:
+    return Row(key, cells, kind="info", title=str(cells[0]), detail=[str(c) for c in cells if str(c)], size=size)
 
 
 def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
@@ -3676,15 +3736,17 @@ def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
         total = sum(c.item.size for c in kids)
         infos = [i for i in s.items if i.cat == cat and i.action is None and i.size >= MIN_SHOW]
         for i in sorted(infos, key=lambda i: -i.size):
-            kids.append(_info_row(f"disk/info/{cat}/{i.label}", [i.label, fmt(i.size), "⚪", i.hint]))
+            kids.append(_info_row(f"disk/info/{cat}/{i.label}", [i.label, fmt(i.size), "⚪", i.hint], i.size))
             total += i.size
         if cat == "system":
             si = s.system
             if si:
                 if si.swap_used:
-                    kids.append(_info_row("disk/system/swap", ["Swap em uso", fmt(si.swap_used), "⚪", ""]))
+                    kids.append(_info_row("disk/system/swap", ["Swap em uso", fmt(si.swap_used), "⚪", ""],
+                                          si.swap_used))
                 for role, size in sorted(si.volumes.items(), key=lambda kv: -kv[1]):
-                    kids.append(_info_row(f"disk/system/apfs/{role}", [f"Volume APFS: {role}", fmt(size), "⚪", ""]))
+                    kids.append(_info_row(f"disk/system/apfs/{role}", [f"Volume APFS: {role}", fmt(size), "⚪", ""],
+                                          size))
                 if si.uptime_days is not None:
                     kids.append(_info_row("disk/system/uptime", ["Tempo ligado", "", "⚪",
                                                                   f"{int(si.uptime_days)} dias"]))
@@ -3696,7 +3758,7 @@ def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
         if cat == "others":
             for label, size in s.others:
                 if size >= GB:
-                    kids.append(_info_row(f"disk/others/{label}", [label, fmt(size), "⚪", ""]))
+                    kids.append(_info_row(f"disk/others/{label}", [label, fmt(size), "⚪", ""], size))
                     total += size
         if kids:
             count = plural(len(kids), "item", "itens")
@@ -3706,7 +3768,8 @@ def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
             else:
                 size_cell, note = fmt(total), Text(TRIM_OFF_NOTE, style="yellow") if trim_trapped(cat, trim_off) else count
                 head = Text(f"{fmt(total)} · {count}")
-            rows.append(_group_row(f"disk/{cat}", title, size_cell, "", note, kids, [Text(title, style="bold"), head]))
+            rows.append(_group_row(f"disk/{cat}", title, size_cell, "", note, kids, [Text(title, style="bold"), head],
+                                   size=0 if cat == "system" else total))
     return DISK_COLUMNS, rows
 
 
@@ -3719,18 +3782,15 @@ WT_FILTER_LABELS = {"": "todos", "seguro": "🟢 podem sair", "depois": "🟡 em
 
 
 def _wt_merge_cell(w: Worktree) -> Text:
-    if w.merged:
-        return Text(f"✓ {w.merged}", style="green")
-    if w.pushed:
-        return Text("✗ sem merge · ✓ enviado", style="yellow")
-    return Text("✗ não comprovado", style="yellow")
+    return Text(" · ").join(merge_cell(w).split("\n"))   # a coluna do relatório, numa linha só
 
 
 def _wt_conv_cell(w: Worktree) -> Text:
-    if not w.conversations:
+    link = w.latest_conversation()
+    if link is None:
         return Text("—", style="dim")
-    c = max(w.conversations, key=lambda l: l.conv.last).conv
-    return Text(f"{'● ' if c.live else ''}{c.title or c.session[:8]} · {elapsed(c.last)}")
+    c = link.conv
+    return Text(f"{'● ' if c.live else ''}{c.name} · {elapsed(c.last)}")
 
 
 def _wt_group_detail(repo: Path, kids: list[Worktree]) -> list[Text]:
@@ -3752,7 +3812,7 @@ def worktrees_tree(rows: list[Worktree], root: Path | None, days: int = 0, flt: 
     if conversations:
         cols.append(Column("Conversa", ratio=3))
     cols.append(Column("Veredito", ratio=2))
-    safe = {id(w): i for w, i in zip(safe_worktrees(rows), worktree_items(rows, root, days))} if root else {}
+    safe = {id(i.worktree): i for i in worktree_items(rows, root, days)} if root else {}
     order = {v: n for n, v in enumerate(VERDICTS)}
     by_repo: dict[Path, list[Worktree]] = {}
     for w in rows:
@@ -3774,13 +3834,14 @@ def worktrees_tree(rows: list[Worktree], root: Path | None, days: int = 0, flt: 
             if conversations:
                 wcells.append(_wt_conv_cell(w))
             wcells.append(Text(f"{icon} {VERDICT_LABELS[w.verdict]}", style=color))
-            link = max(w.conversations, key=lambda l: l.conv.last) if w.conversations else None
+            link = w.latest_conversation()
             children.append(Row(key=item_key(item) if item else f"wt/{w.path}", cells=wcells, item=item,
                                 detail=worktree_detail(w, root), title=f"{w.repo.name} / {where(w, root)}",
                                 path=w.path, resume=link.conv if link else None,
-                                how=link.how if link else ""))
+                                how=link.how if link else "", size=w.size))
         out.append(Row(key=f"wt/{repo}", cells=cells, children=children, limit=8, kind="group",
-                       detail=_wt_group_detail(repo, kids), title=repo.name, path=repo))
+                       detail=_wt_group_detail(repo, kids), title=repo.name, path=repo,
+                       size=sum(w.size for w in kids)))
     return cols, out
 
 
@@ -3798,6 +3859,7 @@ def worktree_totals(rows: list[Worktree], flt: str = "") -> Text:
 DOCKER_FILTERS = ["", "em_uso", "sem_uso", "local"]
 DOCKER_FILTER_LABELS = {"": "todas", "em_uso": "em uso", "sem_uso": "sem uso", "local": "construídas aqui"}
 DOCKER_COLUMNS = [Column("O quê", ratio=4), Column("Tamanho", "right"), Column("Risco"), Column("Detalhe", ratio=4)]
+DOCKER_STOPPED = "Docker parado: abra o Docker Desktop pra ver o detalhe"
 
 
 def image_users(img: dict, containers: list[dict]) -> list[dict]:
@@ -3820,6 +3882,12 @@ def _image_detail(img: dict, users: list[dict]) -> Text:
     return Text(" · ".join(p for p in parts if p))
 
 
+def _image_row(img: dict, detail: Text, risk: str) -> Row:
+    """Uma imagem só como informação (⚪): origem, quem usa e os dados montados."""
+    return Row(f"dk/image/{image_ref(img)}", [Text(img["name"]), fmt(img["size"]), risk, detail], kind="info",
+               title=img["name"], detail=[img["name"], fmt(img["size"]), detail.plain], size=img["size"])
+
+
 def _image_passes(img: dict, flt: str) -> bool:
     return (flt == "" or (flt == "em_uso" and img["used"]) or (flt == "sem_uso" and not img["used"])
             or (flt == "local" and img["origin"] == "local"))
@@ -3833,7 +3901,8 @@ def docker_tree(d: Docker, items: list[Item], guards: dict[str, str | None],
 
     def group(key: str, title: str, kids: list[Row], size: int, note: str = "") -> Row:
         return _group_row(key, f"{title} ({len(kids)})", fmt(size), "", note, kids,
-                          [Text(title, style="bold"), Text(f"{plural(len(kids), 'item', 'itens')} · {fmt(size)}")])
+                          [Text(title, style="bold"), Text(f"{plural(len(kids), 'item', 'itens')} · {fmt(size)}")],
+                          size=size)
 
     def item_group(key: str, title: str, kinds: tuple, note: str = "") -> Row | None:
         sel = sorted((i for i in mine if i.kind in kinds), key=lambda i: -i.size)
@@ -3846,36 +3915,33 @@ def docker_tree(d: Docker, items: list[Item], guards: dict[str, str | None],
         if r:
             rows.append(r)
 
-    rollback_names = {i.label for i in mine if i.kind == "ponto_de_volta"}
-    by_label = {i.label: i for i in mine if i.kind == "imagem"}
-    grouped = next((i for i in mine if i.kind == "imagem" and i.label.startswith("Imagens pequenas")), None)
-    small = set()
-    if grouped:   # as imagens pequenas aparecem juntas, na linha do item agrupado
-        small = {img["name"] for img in d.images
-                 if not img["used"] and img["origin"] not in ("none", "local") and img["size"] < BIG_ITEM
-                 and f"Imagem {img['name']}" not in by_label and f"Ponto de volta {img['name']}" not in rollback_names}
+    by_ref = {ref: i for i in mine for ref in i.refs}   # a imagem casa com o item pelas referências que ele remove
     entries: list[tuple[int, Row]] = []
     total = 0
+    small: dict[str, tuple[Item, list[Row]]] = {}
     for img in d.images:
-        if img["tag"] == "<none>" or f"Ponto de volta {img['name']}" in rollback_names or img["name"] in small:
+        item = by_ref.get(image_ref(img))
+        if item is not None and item.kind not in ("imagem", "imagens_pequenas"):
+            continue   # sem tag e pontos de volta têm grupo próprio
+        if (item is None and img["tag"] == "<none>") or not _image_passes(img, flt):
             continue
-        if not _image_passes(img, flt):
+        detail = _image_detail(img, image_users(img, d.containers))
+        if item is not None and item.kind == "imagens_pequenas":   # cada uma numa linha, dentro do item agrupado
+            small.setdefault(item_key(item), (item, []))[1].append(_image_row(img, detail, "⚪"))
             continue
-        users = image_users(img, d.containers)
-        detail = _image_detail(img, users)
-        item = by_label.get(f"Imagem {img['name']}")
-        if item:
+        if item is not None:
             row = item_row(item, guards)
             row.cells = list(row.cells)
             row.cells[3] = detail
         else:
-            row = Row(f"dk/image/{img['name']}", [Text(img["name"]), fmt(img["size"]), "⚪" if img["used"] else "", detail],
-                      kind="info", title=img["name"], detail=[img["name"], fmt(img["size"]), detail.plain])
+            row = _image_row(img, detail, "⚪" if img["used"] else "")
         entries.append((img["size"], row))
         total += img["size"]
-    if grouped and _image_passes({"used": False, "origin": "registry"}, flt):
-        entries.append((grouped.size, item_row(grouped, guards)))
-        total += grouped.size
+    for item, kids in small.values():
+        row = item_row(item, guards)
+        row.children = sorted(kids, key=lambda r: -r.size)
+        entries.append((item.size, row))
+        total += item.size
     if entries:
         rows.append(group("dk/images", "🖼 Imagens", [r for _, r in sorted(entries, key=lambda e: -e[0])], total))
 
@@ -3886,23 +3952,25 @@ def docker_tree(d: Docker, items: list[Item], guards: dict[str, str | None],
         prot.append(_info_row(f"dk/live/{name}", [Text(f"● {name}"), "", "⚪", Text(note)]))
     for v in d.volumes:
         prot.append(_info_row(f"dk/volume/{v['name']}", [Text(f"volume {v['name']}"), fmt(v["size"]), "⚪",
-                                                          "em uso" if v["used"] else "sem uso: revise à mão"]))
+                                                          "em uso" if v["used"] else "sem uso: revise à mão"],
+                              v["size"]))
     if prot:
+        vol_size = sum(v["size"] for v in d.volumes)
         rows.append(_group_row("dk/protected", f"🛡 Containers rodando e volumes ({len(prot)})",
-                               fmt(sum(v["size"] for v in d.volumes)), "⚪", "nunca apagados", prot,
+                               fmt(vol_size), "⚪", "nunca apagados", prot,
                                [Text("🛡 Containers rodando e volumes", style="bold"),
-                                Text("o hogs nunca apaga estes")]))
+                                Text("o hogs nunca apaga estes")], size=vol_size))
     return DOCKER_COLUMNS, rows
 
 
 def docker_totals(d: Docker, items: list[Item], trim_off: bool, flt: str = "") -> Text:
     if not d.running:
-        return Text("Docker parado: abra o Docker Desktop pra ver o detalhe")
+        return Text(DOCKER_STOPPED)
     mine = [i for i in items if i.cat == "docker"]
     safe = sum(i.size for i in mine if i.risk is SAFE)
     mid = sum(i.size for i in mine if i.risk in (EVAL, REDOWN))
     loss = sum(i.size for i in mine if i.risk is LOSS)
-    busy = sum(i["size"] for i in d.images if i["used"]) + sum(v["size"] for v in d.volumes)
+    busy = sum(i["size"] for i in d.images if i["used"]) + sum(v["size"] for v in d.volumes if v["used"])
     line = f"Docker.raw {fmt(d.raw_real)}" + (f" de {fmt(d.raw_limit)}" if d.raw_limit else "")
     line += f"   🟢 {fmt(safe)} · 🟡 {fmt(mid)} · 🔴 {fmt(loss)} · ⚪ em uso {fmt(busy)}"
     if trim_off:
@@ -3918,11 +3986,12 @@ def docker_totals(d: Docker, items: list[Item], trim_off: bool, flt: str = "") -
 TABS = ["✨ Recomendado", "🌳 Worktrees", "🐳 Docker", "💾 Disco"]
 TAB_TITLES = ["✨ Recomendado agora", "🌳 Worktrees", "🐳 Docker", "💾 Disco"]
 MODE_KEYS = {"list": "↑↓ mover · →← abrir · espaço marcar · a 🟢 · Enter apagar · ? ajuda · q sair",
-             "help": "qualquer tecla volta", "confirm": "s apaga · n ou Esc volta", "done": "qualquer tecla volta"}
+             "help": "qualquer tecla volta", "confirm": "↑↓ rolam · s apaga · n ou Esc volta",
+             "done": "qualquer tecla volta"}
 HELP_LINES = [
     "↑↓ mover · →← abrir/fechar · espaço marcar · a marcar todos 🟢 · Enter apagar",
     "c copiar · o abrir no Finder · r reabrir conversa · e explorar · f filtro",
-    "1–4/Tab abas · ? ajuda · q sair",
+    "1–4/Tab abas · ? ajuda · Esc fecha a ajuda e a confirmação · q sair",
     "",
     "clique foca · clique na caixinha marca · rodinha rola · Option+arrastar seleciona texto no iTerm2",
     "--no-mouse desliga o mouse",
@@ -3986,11 +4055,14 @@ class App:
         self.free_after = 0
         self.last: Frame | None = None
         self.list_height = 10
+        self.confirm_scroll = 0      # primeira linha da lista da confirmação à vista
+        self.confirm_max = 0         # quanto ela rola, medido no último desenho
+        self.confirm_page = 1
         self.states[1].expanded = {r.key for r in self.tree(1)[1]}
 
     # ---- dados
 
-    def left(self) -> list[Item]:
+    def remaining_items(self) -> list[Item]:
         return [i for i in self.items if item_key(i) not in self.gone]
 
     def worktrees_left(self) -> list[Worktree]:
@@ -4009,10 +4081,10 @@ class App:
         if self.s is None:
             return [], []
         if n == 0:
-            return recommended_tree(self.s, self.left(), self.trim_off, self.guards)
+            return recommended_tree(self.s, self.remaining_items(), self.trim_off, self.guards)
         if n == 2:
-            return docker_tree(self.docker_left(), self.left(), self.guards, self.states[2].flt)
-        return disk_tree(self.s, self.left(), self.trim_off, self.guards)
+            return docker_tree(self.docker_left(), self.remaining_items(), self.guards, self.states[2].flt)
+        return disk_tree(self.s, self.remaining_items(), self.trim_off, self.guards)
 
     def trees(self) -> list[tuple[list[Column], list[Row]]]:
         return [self.tree(n) for n in range(len(TABS))]
@@ -4050,13 +4122,13 @@ class App:
             return f"Nenhum worktree em {short(self.root)}"
         if self.tab == 2:
             if not self.s.docker.running:
-                return "Docker parado: abra o Docker Desktop pra ver o detalhe"
+                return DOCKER_STOPPED
             return "Nada no Docker com este filtro (f troca)" if self.states[2].flt else "Nada no Docker agora."
         return "Nada grande para mostrar no disco."
 
     def detail(self, row: Row, width: int, height: int) -> Panel:
         title = row.title or (_plain(row.cells[0]) if row.cells else "")
-        prefix = "🔎 Por que é seguro · " if self.tab == 0 else "🔎 "
+        prefix = "🔎 Por que é seguro · " if safe_row(row) else "🔎 Detalhe · "
         lines = [Text(l) if isinstance(l, str) else l for l in row.detail] or [Text(title)]
         why = self.skipped.get(item_key(row.item)) if row.item else None
         if why:
@@ -4075,16 +4147,38 @@ class App:
         return Panel(Group(*head, *tail), title=title, title_align="left", border_style=border,
                      padding=(0, 1), height=height)
 
+    def scrolled(self, title: str, body: RenderableType, tail: list, width: int, height: int, border: str) -> Panel:
+        """Painel de altura `height`: o fim (`tail`) sempre à vista; o corpo rola por `confirm_scroll`, sem cortar."""
+        inner = max(width - 4, 1)
+        console = Console(file=io.StringIO(), width=inner, legacy_windows=False)
+        lines = []
+        for segs in console.render_lines(body, console.options.update_width(inner), pad=False):
+            line = Text(no_wrap=True, overflow="crop")
+            for seg in segs:
+                line.append(seg.text, seg.style)
+            lines.append(line)
+        room = max(height - 2 - len(render_lines(Group(*tail), inner)), 1)
+        if len(lines) <= room:
+            self.confirm_scroll = self.confirm_max = 0
+            shown = lines
+        else:
+            view = max(room - 1, 1)
+            self.confirm_page, self.confirm_max = view, len(lines) - view
+            self.confirm_scroll = max(0, min(self.confirm_scroll, self.confirm_max))
+            top = self.confirm_scroll
+            shown = lines[top:top + view] + [
+                _line(f"↑↓ rolam a lista · linhas {top + 1}–{top + view} de {len(lines)}", "grey62")]
+        return Panel(Group(*shown, *tail), title=title, title_align="left", border_style=border,
+                     padding=(0, 1), height=height)
+
     def confirm_panel(self, width: int, height: int) -> Panel:
         items = self.marked_items()
-        head = []
+        grid = Table.grid(expand=True, padding=(0, 1))
+        grid.add_column(no_wrap=True)
+        grid.add_column(ratio=1, overflow="fold")      # rótulo longo quebra a linha: nada cortado
+        grid.add_column(justify="right", no_wrap=True)
         for i in items:
-            grid = Table.grid(expand=True, padding=(0, 1))
-            grid.add_column(no_wrap=True)
-            grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-            grid.add_column(justify="right", no_wrap=True)
             grid.add_row(i.risk.icon, Text(i.label), Text(fmt(i.size), style="bold"))
-            head.append(grid)
         tail = [Text(""), Text(f"Total: {fmt(sum(i.size for i in items))}", style="bold")]
         if any(i.risk is LOSS for i in items):
             tail.append(Text("Atenção: tem item 🔴 na lista, ele não volta.", style="red"))
@@ -4092,12 +4186,12 @@ class App:
             for link in (i.worktree.conversations if i.worktree else []):
                 if link.reopen:
                     c = link.conv
-                    tail.append(Text(f"⚠ reabra antes de apagar “{c.title or c.session[:8]}”: {resume_command(c)}",
+                    tail.append(Text(f"⚠ reabra antes de apagar “{c.name}”: {resume_command(c)}",
                                      style="yellow"))
         if any(i.kind == "pessoal" for i in items):
             tail.append(Text("Arquivos vão para a Lixeira."))
         tail.append(Text("s apaga · n ou Esc volta", style="bold"))
-        return self.fitted("🗑 Vou apagar", head, tail, width, height, "red")
+        return self.scrolled("🗑 Vou apagar", grid, tail, width, height, "red")
 
     def done_panel(self, width: int, height: int) -> Panel:
         head = [_line(e, "green" if e.startswith("✔") else "yellow") for e in self.log]
@@ -4108,6 +4202,10 @@ class App:
                                             f" · livre agora: {fmt(self.free_after)}")]
             if any(i.cat == "docker" for i in self.done_items):
                 tail.append(Text(DOCKER_RAW_NOTE, style="dim"))
+            w = next((i.worktree for i in self.done_items if i.worktree is not None), None)
+            if w is not None:
+                tail.append(Text(f"Para recriar um: git -C {short(w.repo)} worktree add {short(w.path)} "
+                                 f"{branch_name(w)}", style="dim"))
             tail.append(Text("números da última medição; rode hogs de novo para medir · qualquer tecla volta",
                              style="grey62"))
         return self.fitted("🧹 Resultado", head, tail, width, height, "green", keep_end=True)
@@ -4148,12 +4246,13 @@ class App:
         elif self.tab == 1:
             parts.append(worktree_totals(self.worktrees_left(), st.flt))
         elif s is not None and self.tab == 2:
-            parts.append(docker_totals(self.docker_left(), self.left(), self.trim_off, st.flt))
+            parts.append(docker_totals(self.docker_left(), self.remaining_items(), self.trim_off, st.flt))
         parts.append(self.middle(cols, vis, st, width))
-        if vis:
-            parts.append(self.detail(vis[st.cursor].row, width, height))
-        if s is not None and self.tab == 0:
-            parts.append(protected_panel(s))
+        if self.mode == "list":   # na ajuda, na confirmação e no resultado, o painel do meio fica com o espaço
+            if vis:
+                parts.append(self.detail(vis[st.cursor].row, width, height))
+            if s is not None and self.tab == 0:
+                parts.append(protected_panel(s))
         parts.append(self.footer(width))
         return parts
 
@@ -4179,10 +4278,15 @@ class App:
                 self.mode = "list"
             return True
         if self.mode == "confirm":
+            page = self.confirm_page
+            steps = {"up": -1, "down": 1, "wheel_up": -3, "wheel_down": 3, "pgup": -page, "pgdn": page,
+                     "home": -self.confirm_max, "end": self.confirm_max}
             if name == "s":
                 self.execute()
             elif name in ("n", "esc"):
                 self.mode = "list"
+            elif name in steps:
+                self.confirm_scroll = max(0, min(self.confirm_scroll + steps[name], self.confirm_max))
             return True
         return self.list_key(key, height)
 
@@ -4223,16 +4327,18 @@ class App:
             if row is None or row.resume is None:
                 self.status = "esta linha não tem conversa do Claude Code"
         elif name == "enter":
-            if self.marked_items():
-                self.mode = "confirm"
-            elif row is not None and row.kind == "advice":
+            if row is not None and row.kind == "advice":   # ↻: Enter só mostra como fazer
                 self.status = row.how
+            elif self.marked_items():
+                self.mode, self.confirm_scroll = "confirm", 0
             else:
                 self.status = "marque com espaço (a marca todos 🟢) e tecle Enter"
         elif name == "?":
             self.mode = "help"
-        elif name in ("q", "esc"):
+        elif name == "q":
             return False
+        elif name == "esc":   # Esc só fecha ajuda e confirmação; na lista, sair é com q
+            self.status = "q sai"
         elif name == "click":
             self.click(key, vis, st, height)
         return True
@@ -4244,18 +4350,12 @@ class App:
         leaves = leaf_items(row)
         if not leaves:
             return
-        if row.kind == "item":
-            toggle(row, self.marked)
-            return
-        keys = {item_key(i) for i in leaves if i.risk is SAFE}
-        if not keys:
+        safe = box_items(row)
+        if not safe:
             self.status = SAFE_ONLY
             return
-        if keys <= self.marked:
-            self.marked -= keys
-        else:
-            self.marked |= keys
-        if len(keys) < len(leaves):
+        toggle(row, self.marked)
+        if len(safe) < len(leaves):
             self.status = f"só os 🟢 do grupo; {SAFE_ONLY}"
 
     def cycle_filter(self) -> None:
@@ -4348,27 +4448,38 @@ class App:
             self.status = "não achei o comando claude; use c para copiar o comando"
 
     def run(self, term: Terminal) -> None:
-        drawn = None
-        while True:
-            w, h = term.size()
-            lines = self.frame(w, h).lines
+        """Desenha, lê e reage. Depois de cada tecla o quadro é refeito antes da próxima (o clique usa o mapa de
+        linhas do que está na tela); parado, só redesenha se a janela mudar de tamanho."""
+        drawn: list[str] | None = None
+        size = (0, 0)
+
+        def redraw() -> None:
+            nonlocal drawn, size
+            size = term.size()
+            lines = self.frame(*size).lines
             if lines != drawn:
                 term.draw(lines)
                 drawn = lines
-            for key in term.read(0.25):
+
+        redraw()
+        while True:
+            keys = term.read(0.25)
+            if not keys:
+                if term.size() != size:
+                    redraw()
+                continue
+            for key in keys:
+                row = self.focused() if self.mode == "list" and key.name == "r" else None
                 if self.mode == "confirm" and key.name == "s":
                     self.execute(lambda: term.draw(self.frame(*term.size()).lines))
                     drawn = None
-                    continue
-                if self.mode == "list" and key.name == "r":
-                    row = self.focused()
-                    if row is not None and row.resume is not None:
-                        self.status = ""
-                        self.reopen(term, row.resume)
-                        drawn = None
-                        continue
-                if not self.handle(key, self.list_height):
+                elif row is not None and row.resume is not None:
+                    self.status = ""
+                    self.reopen(term, row.resume)
+                    drawn = None
+                elif not self.handle(key, self.list_height):
                     return
+                redraw()
 
 
 def run_tui(app: App, mouse: bool) -> None:
@@ -4599,6 +4710,14 @@ def interactive() -> bool:
 
 
 NEEDS_TTY = "A escolha do que apagar precisa de um terminal interativo."
+REPORT_ONLY = "--report só imprime o relatório; rode hogs sem --report para escolher o que apagar."
+
+
+def clean_refused(report_flag: bool) -> None:
+    """`--clean` sem a tela: explica no stderr por quê e sai com código 2."""
+    Console(stderr=True).print(REPORT_ONLY if report_flag else NEEDS_TTY, markup=False, highlight=False,
+                               soft_wrap=True)
+    sys.exit(2)
 
 
 def run() -> None:
@@ -4656,8 +4775,7 @@ def run() -> None:
             con.print(Text(warning, style="yellow"))
         worktrees_report(con, rows, root, args.worktree_days, setting("stale_worktree_days"))
         if args.clean:
-            con.print(NEEDS_TTY)
-            sys.exit(2)
+            clean_refused(args.report)
         return
     if args.apps:
         with con.status("[bold]🐷 Vendo quais apps você não abre há tempo…[/]", spinner="dots"):
@@ -4673,8 +4791,7 @@ def run() -> None:
                            color_system=con.color_system), not args.no_mouse)
     report(con, snapshot, records)
     if args.clean:
-        con.print(NEEDS_TTY)
-        sys.exit(2)
+        clean_refused(args.report)
 
 
 if __name__ == "__main__":

@@ -2419,14 +2419,17 @@ class ListModelTest(unittest.TestCase):
         rows, marked = self.tree(), set()
         self.assertEqual(hogs.mark_all_safe(rows, marked), 2)
         self.assertEqual(marked, {"docker|a", "docker|b"})
-        self.assertEqual(hogs.mark_box(rows[0], marked), "[-]")
+        self.assertEqual(hogs.mark_box(rows[0], marked), "[x]", "a caixinha do grupo reflete só os 🟢")
         self.assertEqual(hogs.mark_box(rows[1], marked), "")
 
     def test_toggle_group_and_leaf(self):
         rows, marked = self.tree(), set()
         hogs.toggle(rows[0], marked)
-        self.assertEqual(len(marked), 4)
+        self.assertEqual(marked, {"docker|a", "docker|b"}, "no grupo, só os 🟢")
         self.assertEqual(hogs.mark_box(rows[0], marked), "[x]")
+        hogs.toggle(rows[0].children[2], marked)
+        self.assertIn("docker|c", marked, "🟡 um por um")
+        hogs.toggle(rows[0].children[2], marked)
         hogs.toggle(rows[0], marked)
         self.assertEqual(marked, set())
         hogs.toggle(rows[1], marked)
@@ -3075,7 +3078,7 @@ class AppTest(unittest.TestCase):
     def test_quit_keys_and_small_window_and_empty(self):
         app = self.app()
         self.assertIs(app.handle(hogs.Key("q")), False)
-        self.assertIs(app.handle(hogs.Key("esc")), False)
+        self.assertIs(app.handle(hogs.Key("esc")), True, "Esc na lista não sai")
         for mode in ("list", "help", "confirm", "done"):
             app.mode = mode
             self.assertIs(app.handle(hogs.Key("ctrl_c")), False)
@@ -3207,9 +3210,9 @@ class AppRulingsTest(unittest.TestCase):
         rows = WorktreesTreeTest.rows(AppTest)[:1]
         rows[0].path = AppTest.ROOT / "shop-api" / "[x]"
         app = hogs.App(None, [], rows, AppTest.ROOT, tab=1)
-        self.assertIn("🔎 shop-api", self.text_of(app))
+        self.assertIn("🔎 Por que é seguro · shop-api", self.text_of(app))
         app.states[1].cursor = 1
-        self.assertIn("🔎 shop-api / shop-api/[x]", self.text_of(app))
+        self.assertIn("🔎 Por que é seguro · shop-api / shop-api/[x]", self.text_of(app))
 
     def text_of(self, app):
         return "\n".join(app.frame(120, 40).lines)
@@ -3228,8 +3231,9 @@ class CliTest(unittest.TestCase):
                 mock.patch.object(hogs, "gather", return_value=hogs.Snapshot(1, 1, hogs.Docker(), [], [])) as gather, \
                 mock.patch.object(hogs, "record_snapshot"), mock.patch.object(hogs, "history_load", return_value=[]), \
                 mock.patch.object(hogs, "run_tui") as tui, mock.patch.object(hogs, "report") as rep, \
-                mock.patch.object(sys, "stdout", io.StringIO()) as out:
-            self.gather, self.out = gather, out
+                mock.patch.object(sys, "stdout", io.StringIO()) as out, \
+                mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.gather, self.out, self.err = gather, out, err
             try:
                 hogs.run()
                 code = 0
@@ -3262,7 +3266,7 @@ class CliTest(unittest.TestCase):
         tui.assert_not_called()
         rep.assert_called_once()
         self.assertEqual(code, 2)
-        self.assertIn("A escolha do que apagar precisa de um terminal interativo.", self.out.getvalue())
+        self.assertIn("A escolha do que apagar precisa de um terminal interativo.", self.err.getvalue())
         _, _, code = self.run_cli("--clean", "--report")
         self.assertEqual(code, 2)
 
@@ -3287,7 +3291,7 @@ class CliTest(unittest.TestCase):
                 tui.assert_not_called()
                 wr.assert_called_once()
                 self.assertEqual(code, 2)
-                self.assertIn("precisa de um terminal interativo", self.out.getvalue())
+                self.assertIn("precisa de um terminal interativo", self.err.getvalue())
 
     def test_interactive_needs_both_ttys_and_a_real_term(self):
         def check(stdin, stdout, term):
@@ -3324,10 +3328,326 @@ class CliTest(unittest.TestCase):
         self.assertIn("Rode hogs num terminal para escolher o que apagar.", text)
         self.assertNotIn("--clean", text)
 
+    # H13
+    def test_h13_clean_with_report_and_exit_2_messages_go_to_stderr(self):
+        tui, rep, code = self.run_cli("--clean", "--report")
+        self.assertEqual(code, 2)
+        tui.assert_not_called()
+        self.assertIn(hogs.REPORT_ONLY, self.err.getvalue())
+        self.assertEqual(hogs.REPORT_ONLY,
+                         "--report só imprime o relatório; rode hogs sem --report para escolher o que apagar.")
+        self.assertNotIn("terminal interativo", self.err.getvalue())
+        self.assertNotIn("--report só", self.out.getvalue())
+        _, _, code = self.run_cli("--clean", tty=False)
+        self.assertEqual(code, 2)
+        self.assertIn(hogs.NEEDS_TTY, self.err.getvalue())
+        self.assertNotIn(hogs.NEEDS_TTY, self.out.getvalue())
+
     def test_version_is_0_6_0_in_both_places(self):
         self.assertEqual(hogs.__version__, "0.6.0")
         toml = (Path(hogs.__file__).parent / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('version = "0.6.0"', toml)
+
+
+# ---- Revisão final da fase 3 (H1–H16)
+
+class FinalReviewTest(unittest.TestCase):
+    ROOT = Path("/dev")
+    ADVICE = AppTest.ADVICE
+    setUp, items, app, vis, text = AppTest.setUp, AppTest.items, AppTest.app, AppTest.vis, AppTest.text
+
+    def detail(self, item, guard=None):
+        return "\n".join(str(t) for t in hogs.item_detail(item, guard))
+
+    # H1
+    def test_h1_confirm_scrolls_the_whole_list_and_wraps_long_labels(self):
+        items = [hogs.Item("dev", f"Cache: item-{k:02d}", 1e9, hogs.SAFE, lambda: None) for k in range(59)]
+        long = "Parado: ~/Documents/" + "ж" * 200
+        items.append(hogs.Item("apps", long, 2e9, hogs.EVAL, lambda: None, kind="pessoal"))
+        app = hogs.App(hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(), items, []), [], [], None,
+                       trim_off=False)
+        app.marked = {hogs.item_key(i) for i in items}
+        app.handle(hogs.Key("enter"))
+        self.assertEqual(app.mode, "confirm")
+        frames = []
+        for _ in range(80):
+            text = "\n".join(app.frame(120, 30).lines)
+            frames.append(text)
+            for always in ("Total:", "s apaga · n ou Esc volta", "Arquivos vão para a Lixeira."):
+                self.assertIn(always, text)
+            app.handle(hogs.Key("down"))
+        joined = "\n".join(frames)
+        for k in range(59):
+            self.assertIn(f"Cache: item-{k:02d}", joined)
+        self.assertTrue(any(f.count("ж") == 200 for f in frames), "rótulo de 200 caracteres inteiro")
+        self.assertNotIn("Cache: item-58", frames[0])
+        app.handle(hogs.Key("home"))
+        self.assertIn("Cache: item-00", "\n".join(app.frame(120, 30).lines))
+        app.handle(hogs.Key("wheel_down"))
+        self.assertGreater(app.confirm_scroll, 0)
+        app.handle(hogs.Key("end"))
+        self.assertIn("Cache: item-58", "\n".join(app.frame(120, 30).lines))
+        self.assertEqual(app.mode, "confirm")
+
+    # H2
+    def rollback_docker(self, tag):
+        d = hogs.Docker(running=True)
+        img = lambda name, size: {"repo": "acme/api", "tag": name.split(":")[1], "id": name[-6:], "name": name,
+                                  "ref": name, "size": size, "used": False, "origin": "local",
+                                  "created": "3 days ago", "labels": {}}
+        d.images = [img("acme/api:latest", 2e9), img(f"acme/api:{tag}", 1e9)]
+        return d
+
+    def rollback_item(self, d, seen):
+        with mock.patch.object(hogs, "first_seen", return_value={i["name"]: seen for i in d.images}):
+            return next(i for i in hogs.docker_clean_items(d) if i.kind == "ponto_de_volta")
+
+    def test_h2_rollback_checks(self):
+        old = self.rollback_item(self.rollback_docker("antes-x"), time.time() - 10 * 86400)
+        self.assertIn((True, "a imagem atual acme/api:latest existe"), old.checks)
+        self.assertIn((True, "mais de 2 dias (tem 10)"), old.checks)
+        text = self.detail(old)
+        self.assertIn("✓ a imagem atual acme/api:latest existe", text)
+        recent = self.rollback_item(self.rollback_docker("antes-x"), time.time())
+        self.assertIn((False, "mais de 2 dias (tem 0)"), recent.checks)
+        self.assertIn("✗ mais de 2 dias (tem 0)", self.detail(recent))
+        d = self.rollback_docker("antes-x")
+        d.released = {"acme/api:latest": "main"}
+        released = self.rollback_item(d, time.time())
+        self.assertIs(released.risk, hogs.SAFE)
+        self.assertIn((True, "o commit da acme/api:latest já está na main"), released.checks)
+        lines = hogs.item_detail(old)
+        check = next(t for t in lines if str(t).startswith("✓ a imagem atual"))
+        self.assertEqual(str(check.style), "green")
+        bad = next(t for t in hogs.item_detail(recent) if str(t).startswith("✗ mais de"))
+        self.assertEqual(str(bad.style), "yellow")
+
+    def test_h2_sign_clone_checks_and_guard_ok(self):
+        group = hogs.CloneGroup("Navegador", "Navegador", "122.0", {"120.0": [Path("/x/c1")]})
+        with mock.patch.object(hogs, "du", return_value=2e9):
+            item = hogs.sign_clone_items([group])[0]
+        self.assertIn((True, "versão 120.0 ≠ instalada 122.0"), item.checks)
+        self.assertIn("✓ Navegador fechado", self.detail(item))
+        closed = self.detail(item, "feche o Navegador antes")
+        self.assertIn("✗ feche o Navegador antes", closed)
+        self.assertNotIn("Navegador fechado", closed)
+
+    def test_h2_personal_cache_and_path_def_checks(self):
+        now = time.time()
+        p = hogs.personal_items([(Path("/tmp/x.mov"), 2e9, now - 200 * 86400)], now)[0]
+        self.assertEqual(p.checks, [(True, "sem abrir há 6 meses"), (True, "vai para a Lixeira")])
+        c = Path("/tmp/caches/com.acme.app")
+        with mock.patch.object(hogs, "CACHES", c.parent):
+            cache = hogs.cache_items({c: 2e9}, [])[0]
+        self.assertEqual(cache.checks, [(True, hogs.RECREATES)])
+        self.assertIn(f"✓ {hogs.RECREATES}", self.detail(cache))
+        by = {pd.label: pd for pd in hogs.PATH_DEFS}
+        npm = hogs.path_item(by["npm"], {})
+        self.assertEqual(npm.checks, [(True, hogs.RECREATES)])
+        self.assertEqual(hogs.path_item(by["WhatsApp"], {}).checks, [])
+        vm = hogs.path_item(by["Claude (VM do Cowork)"], {})
+        self.assertIn("✓ Claude fechado", self.detail(vm))
+        self.assertEqual(hogs.path_item(by["Lixeira"], {}).checks, [])
+
+    # H3
+    def test_h3_enter_on_advice_shows_how_even_with_marked_items(self):
+        app = self.app()
+        self.assertTrue(app.handle(hogs.Key("a")))
+        vis = self.vis(app)
+        app.states[0].cursor = next(n for n, v in enumerate(vis) if v.row.kind == "advice")
+        app.handle(hogs.Key("enter"))
+        self.assertEqual((app.mode, app.status), ("list", "Menu  › Reiniciar"))
+
+    # H4
+    def test_h4_more_row_sums_hidden_worktrees_without_items(self):
+        rows = []
+        for k in range(10):
+            ok = k < 8
+            rows.append(hogs.Worktree(self.ROOT / "acme" / f"x{k}", self.ROOT / "acme", "abc", f"refs/heads/x{k}",
+                                      1e9 * (k + 1), time.time() - 3 * 86400, eligible=ok,
+                                      merged="origin/main" if ok else "", waits=[] if ok else ["mexido há 3 d"]))
+        _, tree = hogs.worktrees_tree(rows, self.ROOT, conversations=False)
+        vis = hogs.visible_rows(tree, {tree[0].key})
+        more = vis[-1].row
+        self.assertEqual(more.kind, "more")
+        self.assertEqual(str(more.cells[1]), hogs.fmt(9e9 + 10e9))
+        self.assertEqual(tree[0].size, sum(w.size for w in rows))
+        self.assertEqual(tree[0].children[0].size, rows[7].size)
+
+    # H5
+    def test_h5_group_box_reflects_only_safe_items(self):
+        app = self.app()
+        app.tab = 3
+        vis = self.vis(app)
+        dev = next(n for n, v in enumerate(vis) if v.row.key == "disk/dev")
+        self.assertEqual(hogs.mark_box(vis[dev].row, app.marked), "", "grupo só 🟡: sem caixinha")
+        app.states[3].cursor = dev
+        app.handle(hogs.Key("space"))
+        self.assertEqual(app.marked, set())
+        self.assertIn("🟡 e 🔴 se marcam um por um", app.status)
+        docker = next(v.row for v in vis if v.row.key == "disk/docker")
+        app.states[3].cursor = next(n for n, v in enumerate(vis) if v.row.key == "disk/docker")
+        app.handle(hogs.Key("space"))
+        self.assertEqual(hogs.mark_box(docker, app.marked), "[x]", "o 🔴 do grupo não conta na caixinha")
+        app.marked.add("docker|Imagem acme/api:dev")
+        app.handle(hogs.Key("space"))
+        self.assertEqual(app.marked, {"docker|Imagem acme/api:dev"}, "espaço no grupo não desmarca o 🔴")
+
+    # H6
+    def test_h6_esc_never_quits_from_the_list(self):
+        app = self.app()
+        self.assertIs(app.handle(hogs.Key("esc")), True)
+        self.assertEqual(app.status, "q sai")
+        app.handle(hogs.Key("a"))
+        app.handle(hogs.Key("enter"))
+        self.assertEqual(app.mode, "confirm")
+        self.assertIs(app.handle(hogs.Key("esc")), True)
+        self.assertEqual(app.mode, "list")
+        self.assertIs(app.handle(hogs.Key("esc")), True)
+        self.assertIs(app.handle(hogs.Key("q")), False)
+
+    # H7
+    def test_h7_docker_tree_matches_images_by_refs_and_lists_small_images(self):
+        d = DockerTreeTest.docker(None)
+        for name in ("tiny:1", "tiny:2"):
+            d.images.append({"repo": "tiny", "tag": name[-1], "id": f"t{name[-1]}", "name": name, "ref": name,
+                             "size": 2e6, "used": False, "origin": "hub", "created": "1 day ago", "labels": {}})
+        with mock.patch.object(hogs, "first_seen", return_value={"acme/api:antes-20260101-1200": 0}):
+            items = hogs.docker_clean_items(d)
+        latest = next(i for i in items if i.refs == ["acme/api:latest"])
+        latest.label = "Imagem com outro rótulo"
+        _, rows = hogs.docker_tree(d, items, {})
+        images = next(r for r in rows if r.key == "dk/images")
+        by = {str(c.cells[0]): c for c in images.children}
+        self.assertIn("Imagem com outro rótulo", by)
+        self.assertNotIn("acme/api:latest", by, "a imagem do item não aparece de novo como informação")
+        small = next(c for c in images.children if str(c.cells[0]).startswith("Imagens pequenas"))
+        self.assertTrue(hogs.checkable(small))
+        self.assertEqual([c.key for c in small.children], ["dk/image/tiny:1", "dk/image/tiny:2"])
+        for c in small.children:
+            self.assertEqual((c.kind, str(c.cells[2])), ("info", "⚪"))
+            self.assertIn("Docker Hub", str(c.cells[3]))
+            self.assertFalse(hogs.checkable(c))
+        self.assertEqual(hogs.mark_box(small, set()), "[ ]")
+        vis = hogs.visible_rows([small], {small.key})
+        self.assertEqual(len(vis), 3)
+        line = hogs.render_lines(hogs.list_panel("t", hogs.DOCKER_COLUMNS, vis, hogs.ListState(expanded={small.key}),
+                                                 set(), 10), 120)[hogs.LIST_TOP]
+        self.assertIn("▾ Imagens pequenas", line)
+
+    # H8
+    def test_h8_worktree_rows_match_items_by_worktree(self):
+        rows = WorktreesTreeTest.rows(self)
+        real = hogs.worktree_items
+        with mock.patch.object(hogs, "worktree_items", lambda *a, **k: list(reversed(real(*a, **k)))):
+            _, tree = hogs.worktrees_tree(rows, self.ROOT, conversations=False)
+        for r in hogs._all_rows(tree):
+            if r.item is not None:
+                self.assertIs(r.item.worktree.path, r.path)
+
+    # H9
+    def test_h9_docker_totals_busy_counts_only_used_images_and_volumes(self):
+        d = DockerTreeTest.docker(None)
+        d.volumes = [{"name": "pgdata", "size": 5e9, "used": True}, {"name": "velho", "size": 7e9, "used": False}]
+        line = hogs.docker_totals(d, [], False).plain
+        self.assertIn(f"⚪ em uso {hogs.fmt(3e9 + 5e9)}", line)
+
+    # H10
+    def test_h10_click_after_tab_switch_uses_the_new_frame(self):
+        y = next(y for y, (_, idx) in self.app(tab=1).frame(120, 40).rows.items() if idx == 1)
+        app = self.app()
+        frames = []
+        real = app.frame
+
+        class Term:
+            keys = [[hogs.Key("2"), hogs.Key("click", 2, y)], [], [], [hogs.Key("q")]]
+
+            def size(self):
+                return 120, 40
+
+            def draw(self, lines):
+                pass
+
+            def read(self, timeout):
+                return self.keys.pop(0)
+
+        with mock.patch.object(app, "frame", side_effect=lambda w, h: frames.append(1) or real(w, h)):
+            app.run(Term())
+        self.assertEqual(app.tab, 1)
+        self.assertEqual(app.states[1].cursor, 1)
+        self.assertEqual(app.marked, {"worktree|shop-api / shop-api/a"})
+        self.assertEqual(len(frames), 3, "um quadro ao abrir e um por tecla; parado, nenhum")
+
+    # H11
+    def test_h11_start_restores_termios_when_the_first_write_fails(self):
+        import termios
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+
+        class Broken(io.StringIO):
+            def write(self, s):
+                raise OSError("saída fechada")
+
+        before = termios.tcgetattr(slave)
+        with self.assertRaises(OSError):
+            with hogs.Terminal(mouse=True, fd=slave, out=Broken()):
+                self.fail("não devia entrar")
+        self.assertEqual(termios.tcgetattr(slave), before)
+
+    # H12
+    def test_h12_detail_title_only_says_safe_on_green_rows(self):
+        app = self.app()
+        self.assertIn("🔎 Por que é seguro · 🐳 Docker", self.text(app))
+        vis = self.vis(app)
+        app.states[0].cursor = next(n for n, v in enumerate(vis) if v.row.key == "rec/eval/pessoal")
+        text = self.text(app)
+        self.assertIn("🔎 Detalhe · 🗂", text)
+        self.assertNotIn("Por que é seguro", text)
+        app.tab = 3
+        vis = self.vis(app)
+        app.states[3].cursor = next(n for n, v in enumerate(vis) if v.row.key == "disk/docker")
+        self.assertIn("🔎 Detalhe · 🐳", self.text(app))
+
+    # H14
+    def test_h14_done_panel_tells_how_to_recreate_a_removed_worktree(self):
+        app = self.app()
+        for k in ("2", "down", "space", "enter"):
+            app.handle(hogs.Key(k))
+        with mock.patch.object(hogs, "remove_worktree"):
+            app.handle(hogs.Key("s"))
+        self.assertEqual(app.log, ["✔ shop-api / shop-api/a"])
+        text = " ".join(self.text(app).split())
+        self.assertIn("Para recriar um: git -C /dev/shop-api worktree add /dev/shop-api/a feat/a", text)
+
+    # H15
+    def test_h15_worktree_detail_has_full_path_and_keys(self):
+        rows = WorktreesTreeTest.rows(self)
+        with_conv = [str(t) for t in hogs.worktree_detail(rows[1], self.ROOT)]
+        self.assertIn("📁 /dev/shop-api/b", with_conv)
+        path_line = next(t for t in hogs.worktree_detail(rows[1], self.ROOT) if str(t).startswith("📁"))
+        self.assertIn("link file:///dev/shop-api/b", str(path_line.style))
+        self.assertIn("o abrir no Finder · c copiar · r reabrir a conversa", with_conv)
+        without = [str(t) for t in hogs.worktree_detail(rows[0], self.ROOT)]
+        self.assertNotIn("o abrir no Finder · c copiar · r reabrir a conversa", without)
+        item = hogs.worktree_items(rows[:1], self.ROOT)[0]
+        self.assertEqual(self.detail(item).count("📁"), 1)
+
+    # H16
+    def test_h16_helpers(self):
+        conv = hogs.Conversation("abcdef123456", "")
+        self.assertEqual(conv.name, "abcdef12")
+        self.assertEqual(hogs.Conversation("s", "Checkout").name, "Checkout")
+        rows = WorktreesTreeTest.rows(self)
+        self.assertIsNone(rows[0].latest_conversation())
+        old = hogs.ConvLink(hogs.Conversation("s-1", "Velha", last=1.0), "citou", False)
+        rows[1].conversations.append(old)
+        self.assertEqual(rows[1].latest_conversation().conv.session, "s-9")
+        self.assertNotIn("\n", hogs._wt_merge_cell(hogs.Worktree(Path("/x"), Path("/r"), pushed="origin/x")).plain)
+        self.assertEqual(hogs.docker_totals(hogs.Docker(), [], False).plain, hogs.DOCKER_STOPPED)
+        app = self.app()
+        self.assertTrue(hasattr(app, "remaining_items"))
+        self.assertFalse(hasattr(app, "left"))
 
 
 if __name__ == "__main__":

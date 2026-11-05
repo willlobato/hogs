@@ -22,8 +22,10 @@ The interactive screen (`App`, opened by `hogs`/`hogs --clean` in a terminal) on
 - Every deletion goes through mark → Enter → confirmation screen → `s` (`App`), with a per-item recheck at
   execution time (`apply_items`: runs the item's guard again; any exception or guard reason → ↷ with the
   reason, never ✔). Nothing is marked when the screen opens; `a` marks only 🟢 (`SAFE`); space on a group
-  marks/unmarks only its 🟢 items; 🟡/🔴 are marked one by one. There is no other deletion path (the old
-  numbered `--clean` flow is gone; `--clean` opens the screen).
+  marks/unmarks only its 🟢 items and its box reflects only them (no 🟢 → no box); 🟡/🔴 are marked one by
+  one. The confirmation scrolls and wraps labels: every marked item is readable before `s`, with the total and
+  warnings always visible. Enter on a ↻ row only shows how; Esc never quits from the list (only `q`/Ctrl-C).
+  There is no other deletion path (the old numbered `--clean` flow is gone; `--clean` opens the screen).
 - Personal files are only moved to the Trash (Finder, path via `argv`), never deleted; they are always 🟡 `EVAL`, never in `a`; size is allocated blocks (iCloud dataless files never count).
 - Worktree deletion uses `git worktree remove` without force and preserves branches. Recheck HEAD,
   branch, merge, activity, ignored/untracked files, process/container usage, pushed state and linked
@@ -55,11 +57,12 @@ The interactive screen (`App`, opened by `hogs`/`hogs --clean` in a terminal) on
 - "App open" guards (`process_running`) never miss an open app: the name is regex-escaped and matches by full
   name, by the name cut at `MAXCOMLEN` (16) or by the `…/Contents/MacOS/<exe>` path; any match counts as open.
 - The screen never opens without a TTY (`interactive()`: stdin and stdout TTY, `TERM` not empty/`dumb`) or
-  with `--report`; then the static report prints, and `--clean` adds a message and exits 2. It always
+  with `--report`; then the static report prints, and `--clean` adds a message on stderr and exits 2. It always
   restores the terminal on any exit, including exceptions, Ctrl-C and EOF (alt screen off, cursor visible,
-  mouse off, `termios` restored).
+  mouse off, `termios` restored), also when the very first write to the terminal fails.
 - On the screen, ↻ (macOS advice) and ⚪ (information) rows never have a box. The Docker tab shows running
-  containers and volumes only as information; removed items' images disappear by `Item.refs`.
+  containers and volumes only as information; images match their `Item` only by `Item.refs` (never by
+  label), and removed items' images disappear by them.
 - hogs only reads `~/.claude`, or `CLAUDE_CONFIG_DIR` when set (`claude_dir()`: transcripts, sessions, settings);
   `cleanupPeriodDays` is a recommendation, never written.
 

@@ -67,7 +67,7 @@ Confira com `hogs --version`.
 | `hogs --worktrees PASTA --report` | Imprime o quadro por projeto: quem usa cada worktree, quando mudou, merge, envio, conversa do Claude Code e se é seguro apagar |
 | `hogs --worktrees PASTA --worktree-days 3` | Só considera seguro o que está há 3 dias sem mudança (padrão: sem mínimo) |
 | `hogs --no-mouse` | A tela sem mouse (só teclado) |
-| `hogs --clean` | O mesmo que `hogs`: abre a tela para escolher o que apagar. Fora de um terminal, imprime o relatório e avisa que a escolha precisa de um terminal (sai com código 2) |
+| `hogs --clean` | O mesmo que `hogs`: abre a tela para escolher o que apagar. Fora de um terminal (ou com `--report`), imprime o relatório e avisa no stderr por que não abriu a tela (sai com código 2) |
 | `hogs --apps [N]` | Os N apps que você menos usa (padrão: 20) |
 | `hogs --docker-gc 20` | Mantém o cache de build de cada builder abaixo de 20 GB, conferindo de hora em hora |
 | `hogs --docker-gc off` | Desliga o limite do cache de build |
@@ -83,11 +83,13 @@ Enter, confere a lista e confirma com `s`.
 
 - **✨ Recomendado:** a barra do disco, o histórico e só os itens 🟢, agrupados por bloco (os worktrees 🟢
   entram um por um no grupo 🌳); as ações do macOS (↻) e, à parte, os 🟡 para avaliar. Embaixo, o 🔎 diz
-  por que cada item é seguro, e o 🛡 o que o hogs não mexe.
+  por que cada item é seguro, com o que o hogs conferiu (✓ passou, ✗ não passou), e o 🛡 o que o hogs não mexe.
 - **🌳 Worktrees:** um grupo por projeto, com tamanho, quando mudou, merge, quem usa, conversa e veredito
   de cada worktree. `f` filtra por veredito.
-- **🐳 Docker:** cache e sobras de build, pontos de volta, containers parados, todas as imagens (`f` filtra:
-  em uso, sem uso, construídas aqui) e, só como informação, os containers rodando e os volumes.
+- **🐳 Docker:** cache e sobras de build, pontos de volta, containers parados, todas as imagens com origem,
+  quem usa e os dados montados (`f` filtra: em uso, sem uso, construídas aqui; as pequenas do registry/Hub
+  saem juntas num item, com cada uma listada dentro dele) e, só como informação, os containers rodando e os
+  volumes.
 - **💾 Disco:** todos os itens por bloco (Docker, caches de dev, apps e dados, worktrees, macOS e swap,
   outros grandes), com qualquer risco: é aqui que ficam os 🟡 e os 🔴.
 
@@ -97,9 +99,9 @@ Enter, confere a lista e confirma com `s`.
 |---|---|
 | ↑ ↓ | move o cursor (PgUp/PgDn, Home/End também) |
 | → ← | abre e fecha um grupo |
-| espaço | marca ou desmarca; num grupo, só os 🟢 dele (🟡 e 🔴 só um por um) |
+| espaço | marca ou desmarca; num grupo, só os 🟢 dele (🟡 e 🔴 só um por um; grupo sem 🟢 não tem caixinha) |
 | `a` | marca todos os 🟢 da aba |
-| Enter | mostra a lista do que vai sair, o total e os avisos; `s` apaga, `n` ou Esc volta |
+| Enter | mostra a lista do que vai sair (↑↓, PgUp/PgDn e a rodinha rolam), o total e os avisos; `s` apaga, `n` ou Esc volta. Numa linha ↻, só mostra como fazer |
 | `c` | copia o comando de reabrir a conversa do Claude Code, ou o caminho |
 | `o` | mostra a pasta no Finder |
 | `r` | reabre a conversa do Claude Code ligada ao worktree (`claude --resume`) |
@@ -107,15 +109,16 @@ Enter, confere a lista e confirma com `s`.
 | `f` | troca o filtro (abas Worktrees e Docker) |
 | `1`–`4`, Tab | troca de aba |
 | `?` | ajuda |
-| `q` | sai (Esc e Ctrl-C também) |
+| `q` | sai (Ctrl-C também; Esc só fecha a ajuda e a confirmação) |
 
 **Mouse:** clique numa linha leva o foco até ela; clique na caixinha `[ ]` marca; clique numa aba troca de
 aba; a rodinha rola. Para selecionar texto com o mouse ligado, segure Option enquanto arrasta (iTerm2).
 `hogs --no-mouse` desliga o mouse.
 
 Na hora de apagar, cada item é conferido de novo (app aberto, worktree mexido, comando que falha): o que
-saiu aparece com ✔ e some da tela; o que ficou aparece com ↷ e o motivo, e continua na lista. Os números do
-topo são os da última medição: rode `hogs` de novo para medir. A tela nunca abre sem um terminal de verdade
+saiu aparece com ✔ e some da tela; o que ficou aparece com ↷ e o motivo, e continua na lista. Depois de
+remover worktrees, o resultado mostra o comando para recriar um (`git -C <repo> worktree add <pasta> <branch>`).
+Os números do topo são os da última medição: rode `hogs` de novo para medir. A tela nunca abre sem um terminal de verdade
 e, ao sair (inclusive por erro ou Ctrl-C), o terminal volta ao normal.
 
 ### O que o relatório mostra
@@ -255,7 +258,7 @@ A verificação de merge usa as referências **locais**, sem rede nem `fetch` au
 resolvido, commit depois do merge) aparece como “merge não comprovado”.
 
 A remoção usa `git worktree remove`, sem `--force`. As branches permanecem e permitem recriar o
-checkout. Os tamanhos são estimativas (blocos compartilhados no APFS). Nada é removido automaticamente.
+checkout: o resultado na tela mostra o comando (`git -C <repo> worktree add <pasta> <branch>`). Os tamanhos são estimativas (blocos compartilhados no APFS). Nada é removido automaticamente.
 
 ## Prevenção: o Docker para de inchar
 
