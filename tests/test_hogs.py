@@ -1136,6 +1136,36 @@ class BreakdownTest(unittest.TestCase):
         self.assertEqual(snap.worktrees, [])
         self.assertFalse([i for i in snap.items if i.cat == "worktree"])
 
+    def test_gather_marks_released_images_with_the_repos_under_the_projects_folder(self):
+        # a regra OCI (Task 7) roda no gather, com os clones de `worktrees_root`, antes de rollback_info usar
+        tmp = Path(tempfile.mkdtemp())
+        repos = [tmp / "shop-api", tmp / "loja-web"]
+        found = mock.Mock(return_value=(repos, []))
+        released = mock.Mock(return_value={"shop-api:latest"})
+        with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released):
+            snap, _ = self._gather(tmp, True, [], {tmp: 20e9})
+        found.assert_called_once_with(tmp)
+        released.assert_called_once_with(snap.docker, repos)
+        self.assertEqual(snap.docker.released, {"shop-api:latest"})
+        for boom in (mock.Mock(side_effect=RuntimeError("git sumiu")), found):
+            with mock.patch.object(hogs, "find_repos", boom), \
+                    mock.patch.object(hogs, "released_images", mock.Mock(side_effect=OSError("sem git"))):
+                snap, _ = self._gather(tmp, True, [], {tmp: 20e9})
+            self.assertEqual(snap.docker.released, set())   # o relatório nunca cai: só fica sem a regra
+
+    def test_gather_without_projects_folder_runs_no_git_for_released_images(self):
+        tmp = Path(tempfile.mkdtemp())
+        found, released, git = mock.Mock(return_value=([], [])), mock.Mock(return_value={"x"}), mock.Mock()
+        sh = mock.Mock(side_effect=hogs.sh)
+        with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released), \
+                mock.patch.object(hogs, "git_at", git), mock.patch.object(hogs, "sh", sh):
+            snap, _ = self._gather(tmp / "nao-existe", True, [], {})
+        found.assert_not_called()
+        released.assert_not_called()
+        git.assert_not_called()
+        self.assertFalse([c for c in sh.call_args_list if c.args and c.args[0][:1] == ["git"]])
+        self.assertEqual(snap.docker.released, set())
+
 
 class PreventionTest(unittest.TestCase):
     def panel(self, settings, docker=hogs.Docker()):

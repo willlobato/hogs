@@ -42,7 +42,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -2300,6 +2300,10 @@ def gather(con: Console) -> Snapshot:
             apps = gather_apps()
             status.update("[bold]🐷 Perguntando pro Docker…[/]")
             docker = fut_docker.result()
+            try:   # regra OCI: antes de rollback_info e docker_clean_items lerem `docker.released`
+                docker.released = released_images(docker, find_repos(root)[0]) if root else set()
+            except Exception:   # o relatório nunca cai por causa dela: os pontos de volta ficam pelo prazo
+                docker.released = set()
             mounts, mounts_known = known_mounts(docker)
             personal: list[Item] = []
             if mounts_known:

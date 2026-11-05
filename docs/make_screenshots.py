@@ -72,6 +72,48 @@ items = [
          kind="pessoal"),
 ]
 
+D, H = 86400, 3600
+DEV, T0 = Path("~/Development"), time.time()
+
+
+def wt(repo, name, branch, gb, age, merged="", users=(), sessions=(), blockers=(), waits=(), ok=False,
+       pushed="", conversations=()):
+    w = h.Worktree(DEV / name, DEV / repo, branch=f"refs/heads/{branch}", size=int(gb * GB),
+                   last_activity=T0 - age, eligible=ok, merged=merged, pushed=pushed, users=list(users),
+                   sessions=list(sessions), blockers=list(blockers), waits=list(waits),
+                   conversations=list(conversations))
+    w.reason = (f"{merged} · mexido {h.elapsed(w.last_activity)}" if ok and merged
+                else f"enviado a {pushed} · mexido {h.elapsed(w.last_activity)} · a branch fica" if ok
+                else (w.blockers or w.waits)[0])
+    return w
+
+
+def conv(session, title, start, age, live=False, how="dentro", reopen=False):
+    c = h.Conversation(session, title, start, last=T0 - age, cwds={start}, live=live)
+    return h.ConvLink(c, how, reopen)
+
+
+WORKTREES = [
+    wt("app", "app-fix-login", "fix/login", 0.9, 21 * D, "merge em origin/main", ok=True),
+    wt("app", "app-old-header", "fix/header", 0.4, 12 * D, "squash em origin/main", ok=True),
+    wt("app", "app-preview", "feat/preview", 0.8, 5 * H, "squash em origin/main", ["Claude Code app-12"],
+       ["app-12"], ok=True),
+    wt("app", "app-dashboard", "feat/dashboard", 1.4, 2 * H, users=["Claude Code app-7", "node ×3"],
+       sessions=["app-7"], blockers=["merge não comprovado em origin/main"]),
+    wt("api", "api-infra", "feat/infra", 0.6, 9 * D, "merge em origin/main",
+       blockers=["ignorados que não voltam pelo Git: .terraform/, .env"]),
+    wt("api", "api-cache", "feat/cache", 0.3, 3 * D, "rebase em origin/main", ["node ×2"],
+       waits=["em uso agora: node ×2"]),
+    # Caminho absoluto fictício: resume_command não expande "~".
+    wt("shop-api", "shop-api-relatorio", "feat/relatorio", 1.2, 41 * D, pushed="origin/feat/relatorio", ok=True,
+       conversations=[conv("3f2a9c1e", "Relatório mensal por cliente", "/Users/ana/Development/shop-api-relatorio",
+                           42 * D, reopen=True)]),
+    wt("shop-api", "shop-api-cupom", "feat/cupom", 0.5, 3 * D, pushed="origin/feat/cupom",
+       waits=["sem merge, mexido há 3 d (em andamento; prazo 30 d)"],
+       conversations=[conv("8b41d07a", "Cupom de desconto no checkout", "/Users/ana/Development/shop-api-cupom",
+                           2 * H, live=True)]),
+]
+
 now = datetime.now(timezone.utc)
 apps = [h.AppInfo(name, Path(where) / f"{name}.app", int(size), int(data), now - timedelta(days=days))
         for name, where, size, data, days in [
@@ -90,7 +132,9 @@ snapshot = h.Snapshot(total=int(494.4 * GB), free=int(18.2 * GB), docker=docker,
                       others=[("~/Pictures", int(52.3 * GB)), ("~/Music", int(30.1 * GB)), ("~/Movies", int(15.4 * GB)),
                               ("~/.vscode", int(6.1 * GB))], apps=apps,
                       system=system, advice=h.system_advice(system), projects=int(78.4 * GB),
-                      mounts=[Path("~/Development/shop-api/.data/postgres")])
+                      mounts=[Path("~/Development/shop-api/.data/postgres")],
+                      worktrees=WORKTREES, worktrees_root=DEV)
+snapshot.items.append(h.worktree_item(WORKTREES, DEV))
 
 
 # Uma semana de histórico: Docker estável e um dia ruim de builds (+0,7 GB por hora nas últimas 26h).
@@ -123,34 +167,14 @@ def save(name, render):
 
 
 # Pontos de volta "vistos" há tempo, sem gravar no seen_tags.json da sua máquina.
+# Retenção do Claude Code "não configurada", sem ler o ~/.claude da sua máquina.
+RETENTION = (False, f"Conversas do Claude Code: apagadas depois de {h.CLAUDE_DEFAULT_DAYS} dias",
+             f'para guardar mais, ponha "cleanupPeriodDays": {h.CLAUDE_KEEP_DAYS} em ~/.claude/settings.json '
+             "(o hogs não altera)")
 with mock.patch.object(h, "load_config", return_value={}), \
+        mock.patch.object(h, "claude_retention", return_value=RETENTION), \
         mock.patch.object(h, "read_json", side_effect=lambda path: FAKE_JSON.get(path, {})), \
         mock.patch.object(h, "first_seen", side_effect=lambda refs, now: {r: now - 300 * 86400 for r in refs}):
     save("report.svg", lambda con: h.report(con, snapshot, records))
 save("apps.svg", lambda con: (con.print(h.apps_table(apps, 7)), con.print(h.apps_footer())))
-D, H = 86400, 3600
-DEV, T0 = Path("~/Development"), time.time()
-
-
-def wt(repo, name, branch, gb, age, merged="", users=(), sessions=(), blockers=(), waits=(), ok=False):
-    w = h.Worktree(DEV / name, DEV / repo, branch=f"refs/heads/{branch}", size=int(gb * GB),
-                   last_activity=T0 - age, eligible=ok, merged=merged, users=list(users),
-                   sessions=list(sessions), blockers=list(blockers), waits=list(waits))
-    w.reason = (f"{merged} · mexido {h.elapsed(w.last_activity)}" if ok
-                else (w.blockers or w.waits)[0])
-    return w
-
-
-WORKTREES = [
-    wt("app", "app-fix-login", "fix/login", 0.9, 21 * D, "merge em origin/main", ok=True),
-    wt("app", "app-old-header", "fix/header", 0.4, 12 * D, "squash em origin/main", ok=True),
-    wt("app", "app-preview", "feat/preview", 0.8, 5 * H, "squash em origin/main", ["Claude Code app-12"],
-       ["app-12"], ok=True),
-    wt("app", "app-dashboard", "feat/dashboard", 1.4, 2 * H, users=["Claude Code app-7", "node ×3"],
-       sessions=["app-7"], blockers=["merge não comprovado em origin/main"]),
-    wt("api", "api-infra", "feat/infra", 0.6, 9 * D, "merge em origin/main",
-       blockers=["ignorados que não voltam pelo Git: .terraform/, .env"]),
-    wt("api", "api-cache", "feat/cache", 0.3, 3 * D, "rebase em origin/main", ["node ×2"],
-       waits=["em uso agora: node ×2"]),
-]
 save("worktrees.svg", lambda con: h.worktrees_report(con, WORKTREES, DEV))
