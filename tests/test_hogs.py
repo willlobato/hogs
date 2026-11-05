@@ -2633,7 +2633,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn("2 🌳 Worktrees", plain)
 
     def test_stack_never_crashes_and_keeps_height(self):
-        for w, h in ((1, 1), (5, 3), (59, 19), (60, 20), (200, 8)):
+        for w, h in ((1, 1), (5, 3), (59, 19), (60, 20), (200, 8), (0, 0), (0, 30), (100, 0)):
             f = self.frame(w, h)
             self.assertEqual(len(f.lines), h)
 
@@ -2904,6 +2904,326 @@ class DockerTreeTest(unittest.TestCase):
 
 
 # ---- Task 8
+
+class AppTest(unittest.TestCase):
+    ROOT = Path("/dev")
+    ADVICE = ("Reiniciar o Mac", 20e9, "Menu  › Reiniciar")
+
+    def setUp(self):
+        for name, value in (("process_running", False), ("docker_trim_off", False)):
+            p = mock.patch.object(hogs, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.calls = []
+
+    def items(self):
+        items = RecommendedTreeTest.items(None)
+        for i in items:
+            i.action = lambda label=i.label: self.calls.append(label)
+        return items
+
+    def app(self, rows=None, **kw):
+        rows = WorktreesTreeTest.rows(self)[:3] if rows is None else rows
+        s = hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(running=True), self.items(), [],
+                          advice=[self.ADVICE], worktrees=rows, worktrees_root=self.ROOT)
+        return hogs.App(s, [], rows, self.ROOT, trim_off=False, color_system=None, **kw)
+
+    def press(self, app, *names):
+        out = None
+        for n in names:
+            out = app.handle(hogs.Key(n))
+        return out
+
+    def vis(self, app, tab=None):
+        tab = app.tab if tab is None else tab
+        return hogs.visible_rows(app.trees()[tab][1], app.states[tab].expanded)
+
+    def text(self, app, w=120, h=40):
+        return "\n".join(app.frame(w, h).lines)
+
+    def test_opens_on_recommended_with_nothing_marked(self):
+        app = self.app()
+        f = app.frame(120, 40)
+        self.assertEqual(len(f.lines), 40)
+        text = "\n".join(f.lines)
+        self.assertIn("1 ✨ Recomendado", f.lines[0])
+        for part in ("✨ Recomendado agora", "🔎 Por que é seguro", "🛡 Não mexo"):
+            self.assertIn(part, text)
+        # o brief dizia "0 B"; fmt(0) é "0 kB" (como no resto do relatório)
+        self.assertIn(f"Marcados: {hogs.fmt(0)} (0)", f.lines[-1])
+        self.assertEqual(app.marked, set())
+        self.assertEqual(app.mode, "list")
+
+    def test_a_marks_only_safe_and_enter_confirms_with_total_and_red_warning(self):
+        app = self.app()
+        self.press(app, "a")
+        self.assertEqual(app.marked, {"docker|Docker: cache de build", "apps|Cópias antigas do Chrome (3)",
+                                      "worktree|shop-api / shop-api/a"})
+        self.assertIn("marquei 3 itens 🟢", app.status)
+        self.press(app, "4", "right")
+        idx = [v.row.key for v in self.vis(app)].index("docker|Imagem acme/api:dev")
+        self.press(app, *["down"] * idx)
+        self.press(app, "space", "enter")
+        self.assertIn("docker|Imagem acme/api:dev", app.marked)
+        self.assertEqual(app.mode, "confirm")
+        text = self.text(app)
+        for part in ("Vou apagar", "Total:", "Atenção: tem item 🔴", "s apaga · n ou Esc volta"):
+            self.assertIn(part, text)
+        self.assertNotIn("Arquivos vão para a Lixeira", text)
+        self.press(app, "n")
+        self.assertEqual(app.mode, "list")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(len(app.marked), 4)
+
+    def test_space_on_group_marks_only_its_safe_items(self):
+        app = self.app()
+        self.press(app, "4")   # disk/docker: cache 🟢 e imagem 🔴
+        self.press(app, "space")
+        self.assertEqual(app.marked, {"docker|Docker: cache de build"})
+        self.assertIn("um por um", app.status)
+        app.tab = 0
+        idx = [v.row.key for v in self.vis(app)].index("rec/eval/pessoal")
+        app.states[0].cursor = idx
+        self.press(app, "space")
+        self.assertEqual(app.marked, {"docker|Docker: cache de build"}, "🟡 para avaliar nunca em grupo")
+
+    def test_execute_reports_done_and_skipped_and_removes_done_rows(self):
+        app = self.app()
+        self.press(app, "right", "down", "space", "down", "space", "enter")
+        self.assertEqual(app.mode, "confirm")
+        self.press(app, "s")
+        self.assertEqual(app.mode, "done")
+        self.assertEqual(app.log, ["✔ Docker: cache de build",
+                                   "↷ Cópias antigas do Chrome (3): pulei, feche o Chrome antes"])
+        self.assertEqual(self.calls, ["Docker: cache de build"])
+        self.assertEqual(app.marked, {"apps|Cópias antigas do Chrome (3)"})
+        self.assertIn("feche o Chrome antes", app.status)
+        keys = {r.key for r in hogs._all_rows(app.trees()[0][1])}
+        self.assertNotIn("docker|Docker: cache de build", keys)
+        self.assertIn("apps|Cópias antigas do Chrome (3)", keys)
+        text = self.text(app)
+        self.assertIn("Liberado:", text)
+        self.assertIn("rode hogs de novo para medir", text)
+        self.assertIn("Docker.raw", text)
+        self.press(app, "x")
+        self.assertEqual(app.mode, "list")
+
+    def test_reopen_warning_in_confirm(self):
+        rows = WorktreesTreeTest.rows(self)[:3]
+        conv = hogs.Conversation("s-7", "Checkout v2", "/dev/shop-api/a", time.time() - 86400)
+        rows[0].conversations = [hogs.ConvLink(conv, "dentro", True)]
+        app = self.app(rows)
+        self.press(app, "2", "down", "space", "enter")
+        self.assertEqual(app.mode, "confirm")
+        text = self.text(app)
+        self.assertIn("⚠ reabra antes de apagar “Checkout v2”", text)
+        self.assertIn(hogs.resume_command(conv), text)
+
+    def test_tabs_by_number_tab_and_click(self):
+        app = self.app()
+        self.press(app, "2")
+        self.assertEqual(app.tab, 1)
+        self.press(app, "tab")
+        self.assertEqual(app.tab, 2)
+        self.press(app, "backtab")
+        self.assertEqual(app.tab, 1)
+        f = app.frame(120, 40)
+        x0, x1, idx = f.tabs[3]
+        app.handle(hogs.Key("click", x0 + 1, 0))
+        self.assertEqual(app.tab, 3)
+
+    def test_click_on_row_moves_cursor_and_on_box_toggles(self):
+        app = self.app()
+        f = app.frame(120, 40)
+        y = next(y for y, (_, idx) in f.rows.items() if idx == 2)
+        app.handle(hogs.Key("click", 20, y))
+        self.assertEqual(app.states[0].cursor, 2)
+        self.assertEqual(app.marked, set())
+        app.handle(hogs.Key("click", 2, y))
+        self.assertEqual(app.marked, {"worktree|shop-api / shop-api/a"})
+
+    def test_e_jumps_to_disk_group_and_f_filters(self):
+        app = self.app()
+        self.press(app, "right", "down")
+        self.assertEqual(self.vis(app)[app.states[0].cursor].row.key, "docker|Docker: cache de build")
+        self.press(app, "e")
+        self.assertEqual(app.tab, 3)
+        self.assertIn("disk/docker", app.states[3].expanded)
+        self.assertEqual(self.vis(app)[app.states[3].cursor].row.key, "disk/docker")
+        self.press(app, "2", "down", "e")
+        self.assertEqual((app.tab, app.status), (1, "nada para explorar aqui"))
+        self.press(app, "f")
+        self.assertEqual(app.states[1].flt, "seguro")
+        self.assertIn("filtro: 🟢 podem sair", self.text(app))
+
+    def test_advice_enter_shows_how_and_is_never_marked(self):
+        app = self.app()
+        self.press(app, "down", "down", "down")
+        self.assertEqual(self.vis(app)[app.states[0].cursor].row.kind, "advice")
+        self.press(app, "space")
+        self.assertEqual(app.marked, set())
+        self.press(app, "enter")
+        self.assertEqual(app.status, "Menu  › Reiniciar")
+        self.assertEqual(app.mode, "list")
+
+    def test_c_and_o_and_r_without_conversation(self):
+        app = self.app()
+        with mock.patch.object(hogs, "copy_text", return_value=True) as cp, \
+                mock.patch.object(hogs, "reveal", return_value=True) as rv:
+            self.press(app, "2", "down", "down")
+            row = self.vis(app)[app.states[1].cursor].row
+            self.assertEqual(row.resume.session, "s-9")
+            self.press(app, "c")
+            cp.assert_called_once_with(hogs.resume_command(row.resume))
+            self.assertTrue(app.status.startswith("copiado: "))
+            self.press(app, "o")
+            rv.assert_called_once_with(self.ROOT / "shop-api" / "b")
+            self.press(app, "down", "r")
+            self.assertEqual(app.status, "esta linha não tem conversa do Claude Code")
+            self.press(app, "c")
+            cp.assert_called_with(str(self.ROOT / "shop-api" / "c"))
+
+    def test_quit_keys_and_small_window_and_empty(self):
+        app = self.app()
+        self.assertIs(app.handle(hogs.Key("q")), False)
+        self.assertIs(app.handle(hogs.Key("esc")), False)
+        for mode in ("list", "help", "confirm", "done"):
+            app.mode = mode
+            self.assertIs(app.handle(hogs.Key("ctrl_c")), False)
+        app.mode = "list"
+        self.press(app, "?")
+        self.assertEqual(app.mode, "help")
+        self.assertIn("--no-mouse desliga o mouse", self.text(app))
+        self.assertIs(app.handle(hogs.Key("esc")), True)
+        self.assertEqual(app.mode, "list")
+        self.assertIn("Janela pequena demais", "\n".join(app.frame(40, 10).lines))
+        for w, h in ((0, 0), (120, 0), (0, 40)):
+            self.assertEqual(len(app.frame(w, h).lines), h)
+
+        empty = hogs.App(hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(), [], []), [], [], None,
+                         trim_off=False)
+        expected = ["Nada recomendado agora. 🎉", hogs.worktrees_line([], None).plain,
+                    "Docker parado: abra o Docker Desktop pra ver o detalhe", "Nada grande para mostrar no disco."]
+        for tab, want in enumerate(expected):
+            empty.tab = tab
+            self.assertIn(want, self.text(empty))
+            for k in ("down", "up", "space", "enter", "a", "e", "c", "o", "r", "f", "right", "left", "end"):
+                self.assertTrue(empty.handle(hogs.Key(k)))
+                empty.mode, empty.tab = "list", tab
+            self.assertEqual(empty.marked, set())
+
+    def test_worktrees_only_mode(self):
+        rows = WorktreesTreeTest.rows(self)[:3]
+        app = hogs.App(None, [], rows, self.ROOT, tab=1)
+        text = self.text(app)
+        self.assertIn("📁 shop-api", text)
+        self.assertIn("shop-api/b", text)
+        app.tab = 0
+        self.assertIn("Esta abertura é só dos worktrees de", self.text(app))
+        self.assertEqual(app.trees()[0], ([], []))
+        app.tab = 1
+        self.press(app, "a")
+        self.assertEqual(app.marked, {"worktree|shop-api / shop-api/a"})
+
+    def test_run_loop_draws_and_exits_on_q(self):
+        app = self.app()
+
+        class Term:
+            def __init__(self):
+                self.drawn, self.keys = [], [[hogs.Key("down")], [hogs.Key("q")]]
+
+            def size(self):
+                return 120, 40
+
+            def draw(self, lines):
+                self.drawn.append(lines)
+
+            def read(self, timeout):
+                return self.keys.pop(0)
+
+        term = Term()
+        app.run(term)
+        self.assertGreaterEqual(len(term.drawn), 2)
+        self.assertEqual(app.states[0].cursor, 1)
+        self.assertTrue(all(len(lines) == 40 for lines in term.drawn))
+
+    def test_run_reopens_conversation_suspended_and_executes_with_redraw(self):
+        start = tempfile.mkdtemp()
+        rows = WorktreesTreeTest.rows(self)[:3]
+        rows[1].conversations[0].conv.start = start
+        app = self.app(rows)
+        events = []
+
+        class Term:
+            keys = [[hogs.Key("2"), hogs.Key("down"), hogs.Key("down"), hogs.Key("r")],
+                    [hogs.Key("up"), hogs.Key("space"), hogs.Key("enter")], [hogs.Key("s")], [hogs.Key("q")],
+                    [hogs.Key("q")]]
+
+            def size(self):
+                return 120, 40
+
+            def draw(self, lines):
+                events.append("draw")
+
+            def read(self, timeout):
+                return self.keys.pop(0)
+
+            @hogs.contextmanager
+            def suspended(self):
+                events.append("suspend")
+                yield
+                events.append("resume")
+
+        with mock.patch.object(hogs.subprocess, "run") as run, mock.patch.object(hogs, "remove_worktree") as rm:
+            app.run(Term())
+        run.assert_called_once_with(["claude", "--resume", "s-9"], cwd=start)
+        self.assertEqual(events[events.index("suspend") + 1], "resume")
+        rm.assert_called_once()
+        self.assertEqual(app.log, ["✔ shop-api / shop-api/a"])
+        self.assertGreaterEqual(events.count("draw"), 4)
+
+        gone = hogs.Conversation("s-0", "Velha", "/dev/nao-existe/mais")
+        app.reopen(Term(), gone)
+        self.assertEqual(app.status, "a pasta da conversa não existe mais; use c para copiar o comando")
+
+
+class AppRulingsTest(unittest.TestCase):
+    def test_terminal_read_eof_quits(self):
+        term = hogs.Terminal(mouse=False, fd=0, out=io.StringIO())
+        with mock.patch.object(hogs.select, "select", return_value=([0], [], [])), \
+                mock.patch.object(hogs.os, "read", return_value=b""):
+            self.assertEqual(term.read(0.1), [hogs.Key("ctrl_c")])
+        with mock.patch.object(hogs.select, "select", return_value=([0], [], [])), \
+                mock.patch.object(hogs.os, "read", side_effect=OSError(5, "Input/output error")):
+            self.assertEqual(term.read(0.1), [hogs.Key("ctrl_c")])
+
+    def test_apply_items_turns_any_error_into_skip(self):
+        seen = []
+        boom = hogs.Item("dev", "npm", 10, hogs.SAFE, lambda: {}["x"])
+        ok = hogs.Item("dev", "pip", 10, hogs.SAFE, lambda: None)
+        hogs.apply_items([boom, ok], lambda i, good, msg: seen.append((i.label, good, msg)))
+        self.assertEqual(seen, [("npm", False, "KeyError: 'x'"), ("pip", True, "")])
+
+    def test_copy_text_and_reveal(self):
+        with mock.patch.object(hogs.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertTrue(hogs.copy_text("cd /dev/shop-api && claude --resume s-1"))
+        run.assert_called_once_with(["pbcopy"], input=b"cd /dev/shop-api && claude --resume s-1", timeout=5)
+        with mock.patch.object(hogs.subprocess, "run", side_effect=OSError("sem pbcopy")):
+            self.assertFalse(hogs.copy_text("x"))
+        with mock.patch.object(hogs, "sh", return_value=subprocess.CompletedProcess([], 0)) as sh:
+            self.assertTrue(hogs.reveal(Path("/dev/shop-api")))
+        sh.assert_called_once_with(["open", "-R", "/dev/shop-api"])
+
+    def test_titles_from_data_are_not_markup(self):
+        rows = WorktreesTreeTest.rows(AppTest)[:1]
+        rows[0].path = AppTest.ROOT / "shop-api" / "[x]"
+        app = hogs.App(None, [], rows, AppTest.ROOT, tab=1)
+        self.assertIn("🔎 shop-api", self.text_of(app))
+        app.states[1].cursor = 1
+        self.assertIn("🔎 shop-api / shop-api/[x]", self.text_of(app))
+
+    def text_of(self, app):
+        return "\n".join(app.frame(120, 40).lines)
 
 
 # ---- Task 9

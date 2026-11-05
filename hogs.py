@@ -3311,17 +3311,31 @@ class Terminal:
         self._stop()
         return False
 
+    def _read_bytes(self) -> bytes:
+        try:
+            return os.read(self.fd, 4096)
+        except OSError:   # EIO quando o terminal some: o mesmo que fim da entrada
+            return b""
+
     def read(self, timeout: float) -> list[Key]:
         ready, _, _ = select.select([self.fd], [], [], timeout)
         if not ready:
             keys, self._pending = parse_input(self._pending, final=True) if self._pending == b"\x1b" else ([], self._pending)
             return keys
-        self._pending += os.read(self.fd, 4096)
+        data = self._read_bytes()
+        if not data:   # fim da entrada (terminal fechado): sair em vez de girar em falso
+            self._pending = b""
+            return [Key("ctrl_c")]
+        self._pending += data
         keys, self._pending = parse_input(self._pending)
         if self._pending == b"\x1b":
             more, _, _ = select.select([self.fd], [], [], 0.03)
             if more:
-                self._pending += os.read(self.fd, 4096)
+                data = self._read_bytes()
+                if not data:
+                    self._pending = b""
+                    return keys + [Key("ctrl_c")]
+                self._pending += data
                 extra, self._pending = parse_input(self._pending)
                 keys += extra
             else:
@@ -3542,15 +3556,19 @@ def apply_items(items: list[Item], notify: Callable[[Item, bool, str], None]) ->
     """Roda cada item reconferindo a guarda na hora; devolve os bytes livres a mais no volume de dados."""
     before = shutil.disk_usage(DATA_VOLUME).free
     for i in items:
-        if i.guard and (why := i.guard()):
-            notify(i, False, f"pulei, {why}")
-            continue
+        ok, why = False, ""
         try:
-            i.action()
+            guard = i.guard() if i.guard else None
+            if guard:
+                why = f"pulei, {guard}"
+            else:
+                i.action()
+                ok = True
         except (OSError, RuntimeError) as exc:
-            notify(i, False, str(exc))
-            continue
-        notify(i, True, "")
+            why = str(exc)
+        except Exception as exc:   # um erro inesperado vira ↷ e não interrompe o resto
+            why = f"{type(exc).__name__}: {exc}"
+        notify(i, ok, why)
     return max(0, shutil.disk_usage(DATA_VOLUME).free - before)
 
 
@@ -3683,8 +3701,9 @@ def _too_small(width: int, height: int) -> Frame:
     while cell_len(msg) > width and msg:
         msg = msg[:-1]
     pad = max((width - cell_len(msg)) // 2, 0)
-    lines = [""] * height
-    lines[height // 2] = " " * pad + msg
+    lines = [""] * max(height, 0)
+    if lines:
+        lines[height // 2] = " " * pad + msg
     return Frame(lines, {}, [])
 
 
@@ -4035,6 +4054,466 @@ def docker_totals(d: Docker, items: list[Item], trim_off: bool, flt: str = "") -
 
 
 # ---------------------------------------------------------------- tela: app
+
+TABS = ["✨ Recomendado", "🌳 Worktrees", "🐳 Docker", "💾 Disco"]
+TAB_TITLES = ["✨ Recomendado agora", "🌳 Worktrees", "🐳 Docker", "💾 Disco"]
+MODE_KEYS = {"list": "↑↓ mover · →← abrir · espaço marcar · a 🟢 · Enter apagar · ? ajuda · q sair",
+             "help": "qualquer tecla volta", "confirm": "s apaga · n ou Esc volta", "done": "qualquer tecla volta"}
+HELP_LINES = [
+    "↑↓ mover · →← abrir/fechar · espaço marcar · a marcar todos 🟢 · Enter apagar",
+    "c copiar · o abrir no Finder · r reabrir conversa · e explorar · f filtro",
+    "1–4/Tab abas · ? ajuda · q sair",
+    "",
+    "clique foca · clique na caixinha marca · rodinha rola · Option+arrastar seleciona texto no iTerm2",
+    "--no-mouse desliga o mouse",
+    "",
+    "Nada vem marcado. a marca só os 🟢; 🟡 e 🔴 se marcam um por um.",
+    "Enter mostra a lista antes de apagar; cada item é reconferido na hora (✔ apagado, ↷ pulado com o motivo).",
+    "↻ é conselho do macOS: o hogs nunca reinicia nem atualiza o Mac.",
+]
+DOCKER_RAW_NOTE = "O Docker devolve o espaço do Docker.raw aos poucos; se não mudar, reinicie o Docker Desktop."
+SAFE_ONLY = "🟡 e 🔴 se marcam um por um: abra o grupo com →"
+
+
+def copy_text(text: str) -> bool:
+    try:
+        r = subprocess.run(["pbcopy"], input=text.encode(), timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def reveal(path: Path) -> bool:
+    r = sh(["open", "-R", str(path)])
+    return r is not None and r.returncode == 0
+
+
+def _plain(cell) -> str:
+    return cell.plain if isinstance(cell, Text) else str(cell)
+
+
+def _line(text: str, style: str = "") -> Text:
+    return Text(text, style=style, no_wrap=True, overflow="ellipsis")
+
+
+class App:
+    """A tela interativa: abas, teclas, mouse, confirmação e execução. Desenha por `frame`, reage por `handle`."""
+
+    def __init__(self, s: Snapshot | None, records: list[dict], worktrees: list[Worktree], root: Path | None,
+                 days: int = 0, tab: int = 0, color_system: str | None = None, trim_off: bool | None = None):
+        self.s, self.records, self.worktrees, self.root, self.days = s, records, worktrees, root, days
+        self.color_system = color_system
+        if s is not None:
+            self.items = tui_items(s)
+            self.trim_off = docker_trim_off() if trim_off is None else trim_off
+        else:
+            self.items = worktree_items(worktrees, root, days) if root else []
+            self.trim_off = bool(trim_off)
+        self.guards = run_guards(self.items)
+        self.conversations = claude_dir().is_dir()
+        self.tab = tab
+        self.states = [ListState() for _ in TABS]
+        self.marked: set[str] = set()
+        self.gone: set[str] = set()
+        self.gone_paths: set[Path] = set()
+        self.skipped: dict[str, str] = {}
+        self.mode = "list"
+        self.status = ""
+        self.log: list[str] = []
+        self.done_items: list[Item] = []
+        self.freed: int | None = 0
+        self.free_after = 0
+        self.last: Frame | None = None
+        self.list_height = 10
+        self.states[1].expanded = {r.key for r in self.tree(1)[1]}
+
+    # ---- dados
+
+    def left(self) -> list[Item]:
+        return [i for i in self.items if item_key(i) not in self.gone]
+
+    def worktrees_left(self) -> list[Worktree]:
+        return [w for w in self.worktrees if w.path not in self.gone_paths]
+
+    def docker_left(self) -> Docker:
+        d = self.s.docker
+        gone = {k.split("|", 1)[1] for k in self.gone if k.startswith("docker|")}
+        images = [img for img in d.images
+                  if f"Imagem {img['name']}" not in gone and f"Ponto de volta {img['name']}" not in gone]
+        return Docker(**{**vars(d), "images": images})
+
+    def tree(self, n: int) -> tuple[list[Column], list[Row]]:
+        if n == 1:
+            return worktrees_tree(self.worktrees_left(), self.root, self.days, self.states[1].flt,
+                                  self.conversations)
+        if self.s is None:
+            return [], []
+        if n == 0:
+            return recommended_tree(self.s, self.left(), self.trim_off, self.guards)
+        if n == 2:
+            return docker_tree(self.docker_left(), self.left(), self.guards, self.states[2].flt)
+        return disk_tree(self.s, self.left(), self.trim_off, self.guards)
+
+    def trees(self) -> list[tuple[list[Column], list[Row]]]:
+        return [self.tree(n) for n in range(len(TABS))]
+
+    def marked_items(self) -> list[Item]:
+        pool = {item_key(i): i for i in self.items}
+        for k, i in collect_items(self.tree(1)[1]).items():   # os da aba Worktrees, se a chave não bater
+            pool.setdefault(k, i)
+        return [i for k, i in pool.items() if k in self.marked and k not in self.gone]
+
+    def view(self) -> tuple[list[Column], list[Row], ListState, list[Visible]]:
+        cols, rows = self.tree(self.tab)
+        st = self.states[self.tab]
+        vis = visible_rows(rows, st.expanded)
+        st.cursor = max(0, min(st.cursor, len(vis) - 1))
+        return cols, rows, st, vis
+
+    def focused(self) -> Row | None:
+        vis, st = self.view()[3], self.states[self.tab]
+        return vis[st.cursor].row if vis else None
+
+    # ---- desenho
+
+    def empty_text(self) -> str:
+        if self.s is None and self.tab != 1:
+            where_ = short(self.root) if self.root else "uma pasta"
+            return f"Esta abertura é só dos worktrees de {where_}: rode hogs para o disco todo."
+        if self.tab == 0:
+            return "Nada recomendado agora. 🎉"
+        if self.tab == 1:
+            if self.root is None:
+                return worktrees_line([], None).plain
+            if self.worktrees_left() and self.states[1].flt:
+                return f"Nenhum worktree no filtro {WT_FILTER_LABELS[self.states[1].flt]} (f troca)"
+            return f"Nenhum worktree em {short(self.root)}"
+        if self.tab == 2:
+            if not self.s.docker.running:
+                return "Docker parado: abra o Docker Desktop pra ver o detalhe"
+            return "Nada no Docker com este filtro (f troca)" if self.states[2].flt else "Nada no Docker agora."
+        return "Nada grande para mostrar no disco."
+
+    def detail(self, row: Row, width: int, height: int) -> Panel:
+        title = row.title or (_plain(row.cells[0]) if row.cells else "")
+        prefix = "🔎 Por que é seguro · " if self.tab == 0 else "🔎 "
+        lines = [Text(l) if isinstance(l, str) else l for l in row.detail] or [Text(title)]
+        why = self.skipped.get(item_key(row.item)) if row.item else None
+        if why:
+            lines.append(Text(f"↷ pulado: {why}", style="yellow"))
+        return detail_panel(Text(prefix + title), lines, width, max(5, height // 3))
+
+    def fitted(self, title: str, head: list, tail: list, width: int, height: int, border: str,
+               keep_end: bool = False) -> Panel:
+        """Painel de altura `height`: o fim (`tail`) sempre aparece; do começo (`head`, uma linha cada) cabe o que der."""
+        inner = max(height - 2, 1)
+        room = inner - len(render_lines(Group(*tail), max(width - 4, 1))) if tail else inner
+        if len(head) > room:
+            cut = len(head) - max(room - 1, 0)
+            more = _line(f"… mais {cut}", "grey62")
+            head = [more] + head[cut:] if keep_end else head[:len(head) - cut] + [more]
+        return Panel(Group(*head, *tail), title=title, title_align="left", border_style=border,
+                     padding=(0, 1), height=height)
+
+    def confirm_panel(self, width: int, height: int) -> Panel:
+        items = self.marked_items()
+        head = []
+        for i in items:
+            grid = Table.grid(expand=True, padding=(0, 1))
+            grid.add_column(no_wrap=True)
+            grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+            grid.add_column(justify="right", no_wrap=True)
+            grid.add_row(i.risk.icon, Text(i.label), Text(fmt(i.size), style="bold"))
+            head.append(grid)
+        tail = [Text(""), Text(f"Total: {fmt(sum(i.size for i in items))}", style="bold")]
+        if any(i.risk is LOSS for i in items):
+            tail.append(Text("Atenção: tem item 🔴 na lista, ele não volta.", style="red"))
+        for i in items:
+            for link in (i.worktree.conversations if i.worktree else []):
+                if link.reopen:
+                    c = link.conv
+                    tail.append(Text(f"⚠ reabra antes de apagar “{c.title or c.session[:8]}”: {resume_command(c)}",
+                                     style="yellow"))
+        if any(i.kind == "pessoal" for i in items):
+            tail.append(Text("Arquivos vão para a Lixeira."))
+        tail.append(Text("s apaga · n ou Esc volta", style="bold"))
+        return self.fitted("🗑 Vou apagar", head, tail, width, height, "red")
+
+    def done_panel(self, width: int, height: int) -> Panel:
+        head = [_line(e, "green" if e.startswith("✔") else "yellow") for e in self.log]
+        if self.freed is None:
+            tail = [Text("Apagando…", style="bold")]
+        else:
+            tail = [Text(""), Text.assemble(("Liberado: ", "bold"), (fmt(self.freed), "bold green"),
+                                            f" · livre agora: {fmt(self.free_after)}")]
+            if any(i.cat == "docker" for i in self.done_items):
+                tail.append(Text(DOCKER_RAW_NOTE, style="dim"))
+            tail.append(Text("números da última medição; rode hogs de novo para medir · qualquer tecla volta",
+                             style="grey62"))
+        return self.fitted("🧹 Resultado", head, tail, width, height, "green", keep_end=True)
+
+    def middle(self, cols: list[Column], vis: list[Visible], st: ListState, width: int) -> Flex:
+        name = f"tab{self.tab}"
+        if self.mode == "list":
+            def build(h: int) -> RenderableType:
+                self.list_height = max(h - 4, 1)
+                move(st, len(vis), 0, self.list_height)
+                return list_panel(TAB_TITLES[self.tab], cols if vis else [Column("", ratio=1)], vis, st, self.marked, h,
+                                  empty=self.empty_text())
+            return Flex(name, build, st.scroll, len(vis))
+        if self.mode == "help":
+            return Flex(name, lambda h: self.fitted("❓ Ajuda", [], [Text(l) for l in HELP_LINES], width, h,
+                                                     "cyan"), 0, 0)
+        if self.mode == "confirm":
+            return Flex(name, lambda h: self.confirm_panel(width, h), 0, 0)
+        return Flex(name, lambda h: self.done_panel(width, h), 0, 0)
+
+    def footer(self, width: int) -> Text:
+        items = self.marked_items()
+        base = f"Marcados: {fmt(sum(i.size for i in items))} ({len(items)})   "
+        keys = MODE_KEYS[self.mode]
+        if self.status and cell_len(base + keys + self.status) + 3 > width and self.mode == "list":
+            keys = "? ajuda · q sair"
+        line = Text(base + keys, no_wrap=True, overflow="ellipsis")
+        if self.status:
+            line.append(f"   {self.status}", style="yellow")
+        line.truncate(max(width, 1), overflow="ellipsis")
+        return line
+
+    def parts(self, cols: list[Column], vis: list[Visible], st: ListState, width: int, height: int) -> list:
+        s = self.s
+        parts: list = []
+        if s is not None and self.tab in (0, 3):
+            parts.append(header(s, self.records, self.items, self.trim_off, compact=True))
+        elif self.tab == 1:
+            parts.append(worktree_totals(self.worktrees_left(), st.flt))
+        elif s is not None and self.tab == 2:
+            parts.append(docker_totals(self.docker_left(), self.left(), self.trim_off, st.flt))
+        parts.append(self.middle(cols, vis, st, width))
+        if vis:
+            parts.append(self.detail(vis[st.cursor].row, width, height))
+        if s is not None and self.tab == 0:
+            parts.append(protected_panel(s))
+        parts.append(self.footer(width))
+        return parts
+
+    def frame(self, width: int, height: int) -> Frame:
+        cols, _, st, vis = self.view()
+        bar, ranges = tab_bar(TABS, self.tab)
+        for _ in range(2):   # se a altura da lista mudou a rolagem, desenha de novo com o mapa de linhas certo
+            first = st.scroll
+            f = stack(width, height, [bar] + self.parts(cols, vis, st, width, height), self.color_system, ranges)
+            if st.scroll == first:
+                break
+        self.last = f
+        return f
+
+    # ---- teclas
+
+    def handle(self, key: Key, height: int = 40) -> bool:
+        name = key.name
+        if name == "ctrl_c":
+            return False
+        if self.mode in ("help", "done"):
+            if name not in ("wheel_up", "wheel_down"):
+                self.mode = "list"
+            return True
+        if self.mode == "confirm":
+            if name == "s":
+                self.execute()
+            elif name in ("n", "esc"):
+                self.mode = "list"
+            return True
+        return self.list_key(key, height)
+
+    def list_key(self, key: Key, height: int) -> bool:
+        name = key.name
+        _, rows, st, vis = self.view()
+        row = vis[st.cursor].row if vis else None
+        self.status = ""
+        steps = {"up": -1, "down": 1, "pgup": -height, "pgdn": height, "home": -len(vis), "end": len(vis),
+                 "wheel_up": -3, "wheel_down": 3}
+        if name in steps:
+            move(st, len(vis), steps[name], height)
+        elif name in ("right", "left"):
+            (open_row if name == "right" else close_row)(st, vis)
+            move(st, len(visible_rows(rows, st.expanded)), 0, height)
+        elif name == "space":
+            self.toggle(row)
+        elif name == "a":
+            n = mark_all_safe(rows, self.marked)
+            self.status = f"marquei {plural(n, 'item', 'itens')} 🟢"
+        elif name in ("1", "2", "3", "4"):
+            self.tab = int(name) - 1
+        elif name in ("tab", "backtab"):
+            self.tab = (self.tab + (1 if name == "tab" else -1)) % len(TABS)
+        elif name == "f":
+            self.cycle_filter()
+        elif name == "e":
+            self.explore(row, height)
+        elif name == "c":
+            self.copy(row)
+        elif name == "o":
+            if row is not None and row.path is not None:
+                ok = reveal(row.path)
+                self.status = f"abri no Finder: {short(row.path)}" if ok else "não consegui abrir no Finder"
+            else:
+                self.status = "esta linha não tem pasta"
+        elif name == "r":
+            if row is None or row.resume is None:
+                self.status = "esta linha não tem conversa do Claude Code"
+        elif name == "enter":
+            if self.marked_items():
+                self.mode = "confirm"
+            elif row is not None and row.kind == "advice":
+                self.status = row.how
+            else:
+                self.status = "marque com espaço (a marca todos 🟢) e tecle Enter"
+        elif name == "?":
+            self.mode = "help"
+        elif name in ("q", "esc"):
+            return False
+        elif name == "click":
+            self.click(key, vis, st, height)
+        return True
+
+    def toggle(self, row: Row | None) -> None:
+        """Espaço: um item marca/desmarca; num grupo, só os 🟢 dele (🟡 e 🔴 só um por um)."""
+        if row is None:
+            return
+        leaves = leaf_items(row)
+        if not leaves:
+            return
+        if row.kind == "item":
+            toggle(row, self.marked)
+            return
+        keys = {item_key(i) for i in leaves if i.risk is SAFE}
+        if not keys:
+            self.status = SAFE_ONLY
+            return
+        if keys <= self.marked:
+            self.marked -= keys
+        else:
+            self.marked |= keys
+        if len(keys) < len(leaves):
+            self.status = f"só os 🟢 do grupo; {SAFE_ONLY}"
+
+    def cycle_filter(self) -> None:
+        options = {1: WT_FILTERS, 2: DOCKER_FILTERS}.get(self.tab)
+        if not options:
+            self.status = "f filtra só nas abas Worktrees e Docker"
+            return
+        st = self.states[self.tab]
+        st.flt = options[(options.index(st.flt) + 1) % len(options)]
+        st.cursor = st.scroll = 0
+
+    def explore(self, row: Row | None, height: int) -> None:
+        st = self.states[3]
+        if row is None or not row.group or self.s is None:
+            self.status = "nada para explorar aqui"
+            return
+        vis = visible_rows(self.tree(3)[1], st.expanded | {row.group})
+        idx = next((n for n, v in enumerate(vis) if v.row.key == row.group), None)
+        if idx is None:
+            self.status = "nada para explorar aqui"
+            return
+        st.expanded.add(row.group)
+        self.tab = 3
+        st.cursor = idx
+        move(st, len(vis), 0, height)
+
+    def copy(self, row: Row | None) -> None:
+        if row is None or (row.resume is None and row.path is None):
+            self.status = "nada para copiar aqui"
+            return
+        text = resume_command(row.resume) if row.resume else str(row.path)
+        self.status = f"copiado: {text}" if copy_text(text) else "não consegui copiar"
+
+    def click(self, key: Key, vis: list[Visible], st: ListState, height: int) -> None:
+        f = self.last
+        if f is None:
+            return
+        if key.y == 0:
+            for x0, x1, idx in f.tabs:
+                if x0 <= key.x < x1:
+                    self.tab = idx
+            return
+        name, idx = f.rows.get(key.y, ("", -1))
+        if name != f"tab{self.tab}" or not 0 <= idx < len(vis):
+            return
+        st.cursor = idx
+        move(st, len(vis), 0, height)
+        if key.x < MARK_X:
+            self.toggle(vis[idx].row)
+
+    # ---- ações
+
+    def execute(self, draw: Callable[[], None] = lambda: None) -> None:
+        items = self.marked_items()
+        self.log, self.done_items, self.freed, self.mode = [], [], None, "done"
+        skipped: list[str] = []
+
+        def notify(i: Item, ok: bool, why: str) -> None:
+            k = item_key(i)
+            if ok:
+                self.gone.add(k)
+                self.marked.discard(k)
+                self.skipped.pop(k, None)
+                self.done_items.append(i)
+                if i.worktree is not None:
+                    self.gone_paths.add(i.worktree.path)
+                self.log.append(f"✔ {i.label}")
+            else:
+                self.skipped[k] = why
+                skipped.append(f"↷ {i.label}: {why}")
+                self.log.append(skipped[-1])
+            draw()
+
+        self.freed = apply_items(items, notify)
+        self.free_after = shutil.disk_usage(DATA_VOLUME).free
+        if len(skipped) == 1:
+            self.status = skipped[0]
+        elif skipped:
+            self.status = f"↷ {len(skipped)} itens pulados: o motivo de cada um fica no 🔎"
+
+    def reopen(self, term: Terminal, conv: Conversation) -> None:
+        if not conv.start or not Path(conv.start).is_dir():
+            self.status = "a pasta da conversa não existe mais; use c para copiar o comando"
+            return
+        try:
+            with term.suspended():
+                subprocess.run(["claude", "--resume", conv.session], cwd=conv.start)
+        except OSError:
+            self.status = "não achei o comando claude; use c para copiar o comando"
+
+    def run(self, term: Terminal) -> None:
+        drawn = None
+        while True:
+            w, h = term.size()
+            lines = self.frame(w, h).lines
+            if lines != drawn:
+                term.draw(lines)
+                drawn = lines
+            for key in term.read(0.25):
+                if self.mode == "confirm" and key.name == "s":
+                    self.execute(lambda: term.draw(self.frame(*term.size()).lines))
+                    drawn = None
+                    continue
+                if self.mode == "list" and key.name == "r":
+                    row = self.focused()
+                    if row is not None and row.resume is not None:
+                        self.status = ""
+                        self.reopen(term, row.resume)
+                        drawn = None
+                        continue
+                if not self.handle(key, self.list_height):
+                    return
+
+
+def run_tui(app: App, mouse: bool) -> None:
+    with Terminal(mouse) as term:
+        app.run(term)
+
 
 
 # ---------------------------------------------------------------- configuração e agente
