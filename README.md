@@ -121,6 +121,7 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - Se um comando de limpeza falha, o item aparece como mantido, com a mensagem de erro, e não como apagado.
 - 🛡️ Imagens construídas localmente aparecem uma por uma, nunca em grupo.
 - 🛡️ Pontos de volta de imagens (`antes-*`, `backup-*`…) só viram 🟢 depois de `rollback_days` dias (padrão 2, configurável), contados a partir do sinal mais recente; antes disso ficam 🟡 para avaliar.
+- 🛡️ Se a imagem atual foi construída com as etiquetas OCI de commit e origem (`docker build --label org.opencontainers.image.revision=$(git rev-parse HEAD) --label org.opencontainers.image.source=https://github.com/acme/shop-api .`) e esse commit já está na branch principal de um clone local com o mesmo remoto, os pontos de volta antigos dela ficam 🟢 na hora. A checagem é local (nunca faz `git fetch`); sem etiquetas ou sem clone, vale o prazo de `rollback_days`.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
 - 🛡️ Arquivo pessoal só vai para a Lixeira, nunca é apagado direto.
 - 🛡️ Nenhuma pasta montada por um container (rodando ou parado) é sugerida, nem nada dentro dela. Vale também para a pasta por trás de um volume nomeado com bind (`--opt o=bind --opt device=/pasta`, comum em compose de banco). Se o Docker está instalado mas não responde e não há uma lista salva, o hogs não sugere arquivos parados nem caches grandes de apps.

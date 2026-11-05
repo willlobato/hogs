@@ -638,6 +638,82 @@ class MountsTest(unittest.TestCase):
             self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], True))
 
 
+class OciRollbackTest(unittest.TestCase):
+    SRC = "https://github.com/acme/shop-api"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.repo = self.root / "shop-api"
+        self.repo.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(self.repo), *a], check=True, capture_output=True,
+                                      text=True).stdout.strip()
+        for args in (("init", "-b", "main"), ("config", "user.name", "T"), ("config", "user.email", "t@example.invalid"),
+                     ("config", "commit.gpgsign", "false"), ("remote", "add", "origin", "git@github.com:Acme/shop-api.git"),
+                     ("commit", "--allow-empty", "-m", "a")):
+            g(*args)
+        self.on_main = g("rev-parse", "HEAD")
+        g("update-ref", "refs/remotes/origin/main", "HEAD")
+        g("commit", "--allow-empty", "-m", "b")
+        self.off_main = g("rev-parse", "HEAD")
+
+    def docker(self, labels):
+        now = time.time()
+        d = hogs.Docker(running=True)
+        d.images = [{"name": "shop-api:antes-x", "repo": "shop-api", "tag": "antes-x", "ref": "shop-api:antes-x",
+                     "size": 7e8, "used": False, "origin": "local", "created": "", "id": "1", "created_at": now},
+                    {"name": "shop-api:latest", "repo": "shop-api", "tag": "latest", "ref": "shop-api:latest",
+                     "size": 7e8, "used": True, "origin": "local", "created": "", "id": "2", "created_at": now,
+                     "labels": labels}]
+        return d
+
+    def released(self, d, repos="default"):
+        with mock.patch.object(hogs, "load_config", return_value={}):
+            return hogs.released_images(d, [self.repo] if repos == "default" else repos)
+
+    def test_normalize_remote(self):
+        for url in ("git@github.com:Acme/shop-api.git", "https://github.com/acme/shop-api",
+                    "https://github.com/acme/shop-api.git/", "ssh://git@github.com:22/acme/shop-api.git"):
+            self.assertEqual(hogs.normalize_remote(url), "github.com/acme/shop-api")
+
+    def test_commit_on_main_makes_recent_rollback_safe(self):
+        d = self.docker({hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: self.SRC})
+        self.assertEqual(self.released(d), {"shop-api:latest"})
+        d.released = {"shop-api:latest"}
+        with mock.patch.object(hogs, "first_seen", return_value={"shop-api:antes-x": time.time()}), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            item = {i.label: i for i in hogs.docker_clean_items(d)}["Ponto de volta shop-api:antes-x"]
+        self.assertIs(item.risk, hogs.SAFE)
+        self.assertIn("já está na main", item.hint)
+
+    def test_off_main_unknown_bad_or_other_source_falls_back(self):
+        for rev in (self.off_main, "f" * 40, "--output=/tmp/x", ""):
+            self.assertEqual(self.released(self.docker({hogs.OCI_REVISION: rev, hogs.OCI_SOURCE: self.SRC})), set(), rev)
+        other = {hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: "https://github.com/acme/outro"}
+        self.assertEqual(self.released(self.docker(other)), set())
+
+    def test_without_labels_or_repos_no_git_call(self):
+        with mock.patch.object(hogs, "git_at") as git:
+            self.assertEqual(self.released(self.docker({})), set())
+            ok = {hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: self.SRC}
+            self.assertEqual(self.released(self.docker(ok), repos=[]), set())
+        git.assert_not_called()
+
+    def test_gather_docker_reads_labels(self):
+        img = {"Repository": "shop-api", "Tag": "latest", "ID": "sha256:" + "a" * 64, "UniqueSize": "1GB",
+               "Containers": "0", "CreatedSince": "1 hour ago", "CreatedAt": ""}
+        labels = {hogs.OCI_REVISION: "abc1234", hogs.OCI_SOURCE: self.SRC}
+        base, _ = DockerCleanItemsTest.fake_docker(images=[img])
+        for reply, expected in ((f"sha256:{'a' * 64}\t{json.dumps(labels)}\n", labels), (None, {})):
+            def sh(cmd, timeout=60, reply=reply):
+                if cmd[:3] == ["docker", "image", "inspect"]:
+                    return reply and subprocess.CompletedProcess(cmd, 0, reply, "")
+                return base(cmd, timeout)
+            with mock.patch.object(hogs, "sh", sh):
+                self.assertEqual(hogs.gather_docker().images[0]["labels"], expected)
+
+
 class BuilderTest(unittest.TestCase):
     builders = [{"name": "multiarch", "driver": "docker-container", "nodes": ["multiarch0"], "running": True},
                 {"name": "default", "driver": "docker", "nodes": ["default"], "running": True},
