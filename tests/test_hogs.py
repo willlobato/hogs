@@ -2363,6 +2363,73 @@ class WorktreeTableTest(unittest.TestCase):
 # ---- Task 2
 
 
+class ListModelTest(unittest.TestCase):
+    def item(self, label, size=1, risk=None, action=True):
+        return hogs.Item("docker", label, size, risk or hogs.SAFE, (lambda: None) if action else None)
+
+    def tree(self):
+        kids = [hogs.Row(hogs.item_key(i), [i.label], i) for i in
+                (self.item("a", 5), self.item("b", 4), self.item("c", 3, hogs.EVAL), self.item("d", 2, hogs.LOSS))]
+        info = hogs.Row("info", ["só informação"], kind="info")
+        return [hogs.Row("g", ["grupo"], kind="group", children=kids, limit=2), info]
+
+    def test_visible_with_limit_and_more(self):
+        rows = self.tree()
+        self.assertEqual([v.row.key for v in hogs.visible_rows(rows, set())], ["g", "info"])
+        vis = hogs.visible_rows(rows, {"g"})
+        self.assertEqual([v.row.key for v in vis], ["g", "docker|a", "docker|b", "g/+", "info"])
+        self.assertEqual((vis[3].row.kind, vis[3].depth, vis[3].parent.key), ("more", 1, "g"))
+        self.assertIn("mais 2", str(vis[3].row.cells[0]))
+        self.assertEqual(len(hogs.visible_rows(rows, {"g", "g/+"})), 6)
+
+    def test_mark_all_safe_never_marks_eval_loss_or_info(self):
+        rows, marked = self.tree(), set()
+        self.assertEqual(hogs.mark_all_safe(rows, marked), 2)
+        self.assertEqual(marked, {"docker|a", "docker|b"})
+        self.assertEqual(hogs.mark_box(rows[0], marked), "[-]")
+        self.assertEqual(hogs.mark_box(rows[1], marked), "")
+
+    def test_toggle_group_and_leaf(self):
+        rows, marked = self.tree(), set()
+        hogs.toggle(rows[0], marked)
+        self.assertEqual(len(marked), 4)
+        self.assertEqual(hogs.mark_box(rows[0], marked), "[x]")
+        hogs.toggle(rows[0], marked)
+        self.assertEqual(marked, set())
+        hogs.toggle(rows[1], marked)
+        self.assertEqual(marked, set())
+
+    def test_move_clamps_and_scrolls(self):
+        st = hogs.ListState()
+        hogs.move(st, 10, 7, 3)
+        self.assertEqual((st.cursor, st.scroll), (7, 5))
+        hogs.move(st, 10, 99, 3)
+        self.assertEqual((st.cursor, st.scroll), (9, 7))
+        hogs.move(st, 10, -99, 3)
+        self.assertEqual((st.cursor, st.scroll), (0, 0))
+        empty = hogs.ListState()
+        hogs.move(empty, 0, 1, 3)
+        self.assertEqual((empty.cursor, empty.scroll), (0, 0))
+
+    def test_open_and_close(self):
+        rows, st = self.tree(), hogs.ListState()
+        hogs.open_row(st, hogs.visible_rows(rows, st.expanded))
+        self.assertIn("g", st.expanded)
+        hogs.open_row(st, hogs.visible_rows(rows, st.expanded))
+        self.assertEqual(st.cursor, 1)
+        hogs.close_row(st, hogs.visible_rows(rows, st.expanded))
+        self.assertEqual(st.cursor, 0)
+        st.cursor = 3
+        hogs.open_row(st, hogs.visible_rows(rows, st.expanded))
+        self.assertIn("g/+", st.expanded)
+        st.cursor = 0
+        hogs.close_row(st, hogs.visible_rows(rows, st.expanded))
+        self.assertNotIn("g", st.expanded)
+
+    def test_collect_items(self):
+        self.assertEqual(sorted(hogs.collect_items(self.tree())), ["docker|a", "docker|b", "docker|c", "docker|d"])
+
+
 # ---- Task 3
 
 
