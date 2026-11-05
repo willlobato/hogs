@@ -2360,6 +2360,80 @@ class WorktreeTableTest(unittest.TestCase):
 # ---- Task 1
 
 
+class ParseInputTest(unittest.TestCase):
+    def names(self, data, final=False):
+        keys, rest = hogs.parse_input(data, final)
+        return [k.name for k in keys], rest
+
+    def test_keys_and_text(self):
+        self.assertEqual(self.names(b"\x1b[A\x1b[B\x1bOC\x1b[D \r\ta?\x7f\x03"),
+                         (["up", "down", "right", "left", "space", "enter", "tab", "a", "?", "backspace", "ctrl_c"], b""))
+        self.assertEqual(self.names(b"\x1b[5~\x1b[6~\x1b[H\x1b[F\x1b[Z"), (["pgup", "pgdn", "home", "end", "backtab"], b""))
+        self.assertEqual(self.names("ç".encode()), (["ç"], b""))
+
+    def test_mouse_sgr_click_and_wheel(self):
+        keys, rest = hogs.parse_input(b"\x1b[<0;10;5M\x1b[<0;10;5m\x1b[<64;1;1M\x1b[<65;1;1M\x1b[<2;3;3M\x1b[<32;4;4M")
+        self.assertEqual(keys, [hogs.Key("click", 9, 4), hogs.Key("wheel_up", 0, 0), hogs.Key("wheel_down", 0, 0)])
+        self.assertEqual(rest, b"")
+
+    def test_split_sequences_wait_for_the_rest(self):
+        keys, rest = hogs.parse_input(b"a\x1b[<0;1")
+        self.assertEqual(([k.name for k in keys], rest), (["a"], b"\x1b[<0;1"))
+        keys, rest = hogs.parse_input(rest + b"0;5M")
+        self.assertEqual((keys, rest), ([hogs.Key("click", 9, 4)], b""))
+        self.assertEqual(self.names("ç".encode()[:1]), ([], "ç".encode()[:1]))
+
+    def test_lone_escape_only_when_final(self):
+        self.assertEqual(self.names(b"\x1b"), ([], b"\x1b"))
+        self.assertEqual(self.names(b"\x1b", final=True), (["esc"], b""))
+
+    def test_unknown_sequences_are_swallowed(self):
+        self.assertEqual(self.names(b"\x1b[200~x\x1b[?1;2c"), (["x"], b""))
+
+
+class TerminalTest(unittest.TestCase):
+    def setUp(self):
+        self.master, self.slave = os.openpty()
+        self.addCleanup(os.close, self.master)
+        self.addCleanup(os.close, self.slave)
+        self.out = io.StringIO()
+
+    def test_enter_and_exit_restore_everything(self):
+        import termios
+        before = termios.tcgetattr(self.slave)
+        with hogs.Terminal(mouse=True, fd=self.slave, out=self.out):
+            during = termios.tcgetattr(self.slave)
+            self.assertFalse(during[3] & termios.ECHO)
+            self.assertFalse(during[3] & termios.ISIG)
+        self.assertEqual(termios.tcgetattr(self.slave), before)
+        text = self.out.getvalue()
+        self.assertTrue(text.startswith(hogs.SCREEN_ON + hogs.MOUSE_ON))
+        self.assertTrue(text.endswith(hogs.MOUSE_OFF + hogs.SCREEN_OFF))
+
+    def test_exception_inside_still_restores_and_propagates(self):
+        import termios
+        before = termios.tcgetattr(self.slave)
+        with self.assertRaises(KeyboardInterrupt):
+            with hogs.Terminal(mouse=False, fd=self.slave, out=self.out):
+                raise KeyboardInterrupt
+        self.assertEqual(termios.tcgetattr(self.slave), before)
+        self.assertNotIn(hogs.MOUSE_ON, self.out.getvalue())
+        self.assertTrue(self.out.getvalue().endswith(hogs.SCREEN_OFF))
+
+    def test_read_draw_and_suspend(self):
+        with hogs.Terminal(mouse=False, fd=self.slave, out=self.out) as term:
+            os.write(self.master, b"\x1b[A")
+            self.assertEqual(term.read(1.0), [hogs.Key("up")])
+            os.write(self.master, b"\x1b")
+            self.assertEqual(term.read(1.0), [hogs.Key("esc")])
+            self.assertEqual(term.read(0.01), [])
+            term.draw(["um", "dois"])
+            with term.suspended():
+                self.assertTrue(self.out.getvalue().endswith(hogs.SCREEN_OFF))
+            self.assertTrue(self.out.getvalue().endswith(hogs.SCREEN_ON))
+        self.assertIn("\x1b[1;1Hum\x1b[K\x1b[2;1Hdois\x1b[K", self.out.getvalue())
+
+
 # ---- Task 2
 
 

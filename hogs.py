@@ -3168,6 +3168,172 @@ def clean(con: Console, s: Snapshot) -> None:
 # ---------------------------------------------------------------- tela: terminal
 
 
+class Key(NamedTuple):
+    name: str
+    x: int = -1
+    y: int = -1
+
+
+SCREEN_ON = "\x1b[?1049h\x1b[?25l"
+SCREEN_OFF = "\x1b[?25h\x1b[?1049l"
+MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1006l\x1b[?1000l"
+
+_CSI_FINAL_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left",
+                   "H": "home", "F": "end", "Z": "backtab"}
+_CSI_TILDE_KEYS = {"1": "home", "7": "home", "4": "end", "8": "end", "5": "pgup", "6": "pgdn"}
+_CONTROL_KEYS = {0x0d: "enter", 0x0a: "enter", 0x20: "space", 0x09: "tab",
+                 0x7f: "backspace", 0x08: "backspace", 0x03: "ctrl_c"}
+
+
+def _csi_key(params: str, final: str) -> Key | None:
+    """Tecla de uma sequência CSI completa; None quando não é uma que conhecemos."""
+    if params.startswith("<") and final in "Mm":
+        if final == "m":
+            return None
+        try:
+            b, x, y = (int(p) for p in params[1:].split(";"))
+        except ValueError:
+            return None
+        if b == 0:
+            return Key("click", x - 1, y - 1)
+        if b == 64:
+            return Key("wheel_up", x - 1, y - 1)
+        if b == 65:
+            return Key("wheel_down", x - 1, y - 1)
+        return None
+    if final == "~":
+        name = _CSI_TILDE_KEYS.get(params)
+        return Key(name) if name else None
+    name = _CSI_FINAL_KEYS.get(final)
+    return Key(name) if name else None
+
+
+def parse_input(data: bytes, final: bool = False) -> tuple[list[Key], bytes]:
+    """Teclas e mouse (SGR) de bytes crus do terminal, mais o resto incompleto."""
+    keys: list[Key] = []
+    i, n = 0, len(data)
+    while i < n:
+        b = data[i]
+        if b == 0x1b:
+            if i + 1 >= n:
+                if final:
+                    keys.append(Key("esc"))
+                    i += 1
+                break
+            nxt = data[i + 1]
+            if nxt == 0x5b:  # CSI
+                j = i + 2
+                while j < n and not 0x40 <= data[j] <= 0x7e:
+                    j += 1
+                if j >= n:
+                    break
+                key = _csi_key(data[i + 2:j].decode("latin-1"), chr(data[j]))
+                if key:
+                    keys.append(key)
+                i = j + 1
+            elif nxt == 0x4f:  # SS3
+                if i + 2 >= n:
+                    break
+                name = _CSI_FINAL_KEYS.get(chr(data[i + 2]))
+                if name:
+                    keys.append(Key(name))
+                i += 3
+            else:
+                keys.append(Key("esc"))
+                i += 1
+            continue
+        if b in _CONTROL_KEYS:
+            keys.append(Key(_CONTROL_KEYS[b]))
+            i += 1
+        elif b < 0x20:
+            i += 1
+        elif b < 0x80:
+            keys.append(Key(chr(b)))
+            i += 1
+        else:
+            size = 2 if b >= 0xc0 and b < 0xe0 else 3 if 0xe0 <= b < 0xf0 else 4 if 0xf0 <= b < 0xf8 else 1
+            if i + size > n:
+                break
+            text = data[i:i + size].decode("utf-8", "ignore")
+            if text:
+                keys.append(Key(text))
+            i += size
+    return keys, (b"" if final else data[i:])
+
+
+class Terminal:
+    """Terminal em modo cru, tela alternativa e mouse; sempre restaurado ao sair."""
+
+    def __init__(self, mouse: bool = True, fd: int | None = None, out: TextIO | None = None):
+        self.mouse = mouse
+        self.fd = sys.stdin.fileno() if fd is None else fd
+        self.out = sys.stdout if out is None else out
+        self._saved = None
+        self._pending = b""
+
+    def _start(self) -> None:
+        self._saved = termios.tcgetattr(self.fd)
+        raw = termios.tcgetattr(self.fd)
+        raw[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
+        raw[0] &= ~(termios.IXON | termios.ICRNL)
+        termios.tcsetattr(self.fd, termios.TCSANOW, raw)
+        self.out.write(SCREEN_ON + (MOUSE_ON if self.mouse else ""))
+        self.out.flush()
+
+    def _stop(self) -> None:
+        try:
+            self.out.write((MOUSE_OFF if self.mouse else "") + SCREEN_OFF)
+            self.out.flush()
+        finally:
+            if self._saved is not None:
+                termios.tcsetattr(self.fd, termios.TCSAFLUSH, self._saved)
+
+    def __enter__(self) -> "Terminal":
+        self._start()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._stop()
+        return False
+
+    def read(self, timeout: float) -> list[Key]:
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            keys, self._pending = parse_input(self._pending, final=True) if self._pending == b"\x1b" else ([], self._pending)
+            return keys
+        self._pending += os.read(self.fd, 4096)
+        keys, self._pending = parse_input(self._pending)
+        if self._pending == b"\x1b":
+            more, _, _ = select.select([self.fd], [], [], 0.03)
+            if more:
+                self._pending += os.read(self.fd, 4096)
+                extra, self._pending = parse_input(self._pending)
+                keys += extra
+            else:
+                extra, self._pending = parse_input(self._pending, final=True)
+                keys += extra
+        return keys
+
+    def size(self) -> tuple[int, int]:
+        s = shutil.get_terminal_size((80, 24))
+        return s.columns, s.lines
+
+    def draw(self, lines: list[str]) -> None:
+        body = "".join(f"\x1b[{y + 1};1H{line}\x1b[K" for y, line in enumerate(lines))
+        self.out.write("\x1b[?2026h" + body + "\x1b[?2026l")
+        self.out.flush()
+
+    @contextmanager
+    def suspended(self) -> Iterator[None]:
+        self._stop()
+        try:
+            yield
+        finally:
+            self._pending = b""
+            self._start()
+
+
 # ---------------------------------------------------------------- tela: lista
 
 
