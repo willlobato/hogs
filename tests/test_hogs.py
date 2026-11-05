@@ -2663,6 +2663,59 @@ class RenderTest(unittest.TestCase):
 
 # ---- Task 6
 
+class WorktreesTreeTest(unittest.TestCase):
+    ROOT = Path("/dev")
+
+    def rows(self):
+        def wt(repo, name, eligible=False, waits=(), blockers=(), merged=""):
+            w = hogs.Worktree(self.ROOT / repo / name, self.ROOT / repo, "abc", f"refs/heads/feat/{name}", 1e9,
+                              time.time() - 3 * 86400, eligible=eligible, merged=merged,
+                              waits=list(waits), blockers=list(blockers))
+            return w
+        out = [wt("shop-api", "a", eligible=True, merged="squash em origin/main"),
+               wt("shop-api", "b", waits=["mexido há 3 d"]), wt("shop-api", "c", blockers=["commit não enviado"])]
+        out += [wt("acme", f"x{k}", eligible=True, merged="origin/main") for k in range(10)]
+        out[1].conversations = [hogs.ConvLink(hogs.Conversation("s-9", "Checkout", "/dev/shop-api/b",
+                                                                time.time() - 3600, live=True), "dentro", True)]
+        return out
+
+    def test_projects_sorted_with_limit_and_columns(self):
+        cols, rows = hogs.worktrees_tree(self.rows(), self.ROOT, conversations=True)
+        self.assertEqual([c.title for c in cols][5], "Conversa")
+        self.assertEqual([r.key for r in rows], ["wt//dev/acme", "wt//dev/shop-api"])
+        self.assertEqual(rows[0].limit, 8)
+        shop = rows[1].children
+        self.assertEqual([hogs.checkable(r) for r in shop], [True, False, False])
+        self.assertEqual(shop[0].key, hogs.item_key(hogs.worktree_items(self.rows()[:1], self.ROOT)[0]))
+        self.assertIn("● Checkout", str(shop[1].cells[5]))
+        self.assertEqual(shop[1].resume.session, "s-9")
+        self.assertIn("🟡 em andamento", str(shop[1].cells[6]))
+
+    def test_filter_and_no_conversation_column(self):
+        cols, rows = hogs.worktrees_tree(self.rows(), self.ROOT, flt="manter", conversations=False)
+        self.assertNotIn("Conversa", [c.title for c in cols])
+        self.assertEqual([r.key for r in rows], ["wt//dev/shop-api"])
+        self.assertEqual(len(rows[0].children), 1)
+
+    def test_totals_and_empty(self):
+        text = hogs.worktree_totals(self.rows(), "seguro").plain
+        self.assertIn("🟢 11 podem sair", text)
+        self.assertIn("🟡 1 em andamento", text)
+        self.assertIn("filtro: 🟢 podem sair", text)
+        self.assertNotIn("filtro", hogs.worktree_totals(self.rows()).plain)
+        self.assertEqual(hogs.worktrees_tree([], self.ROOT, conversations=True)[1], [])
+
+    def test_group_cells_and_merge_column(self):
+        cols, rows = hogs.worktrees_tree(self.rows(), self.ROOT, conversations=False)
+        shop = rows[1]
+        self.assertEqual(len(shop.cells), len(cols))
+        self.assertEqual(shop.cells[0], "📁 shop-api")
+        self.assertEqual(shop.cells[-1], "🟢1 🟡1 ⚪1")
+        self.assertEqual(shop.kind, "group")
+        self.assertIn("squash", str(shop.children[0].cells[3]))
+        self.assertIn("não comprovado", str(shop.children[1].cells[3]))
+
+
 
 # ---- Task 7
 
