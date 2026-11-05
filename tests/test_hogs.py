@@ -344,6 +344,65 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(hogs.fmt_delta(-3_200_000_000), "−3,2 GB")
 
 
+class SignCloneTest(unittest.TestCase):
+    def make(self, root, clone, app, version, exe="App"):
+        c = root / "com.example.App.code_sign_clone" / clone / f"{app}.app.bundle" / "Contents"
+        c.mkdir(parents=True)
+        (c / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": version, "CFBundleExecutable": exe}))
+        (c / "blob").write_bytes(b"x" * 4096)
+
+    def tmpdir(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return Path(d.name)
+
+    def install(self, base, app, version):
+        (base / f"{app}.app/Contents").mkdir(parents=True)
+        (base / f"{app}.app/Contents/Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleShortVersionString": version}))
+
+    def test_unknown_installed_version_offers_nothing(self):
+        tmp = self.tmpdir()
+        root = tmp / "X"
+        self.make(root, "code_sign_clone.a", "Navegador", "155")
+        with mock.patch.object(hogs, "APPLICATIONS", tmp / "Applications"), \
+                mock.patch.object(hogs, "HOME", tmp / "home"):
+            self.assertEqual(hogs.sign_clone_items(hogs.gather_sign_clones(root)), [])
+
+    def test_app_found_in_user_applications(self):
+        tmp = self.tmpdir()
+        root = tmp / "X"
+        self.install(tmp / "home" / "Applications", "Navegador", "156")
+        self.make(root, "code_sign_clone.a", "Navegador", "155")
+        with mock.patch.object(hogs, "APPLICATIONS", tmp / "Applications"), \
+                mock.patch.object(hogs, "HOME", tmp / "home"), \
+                mock.patch.object(hogs, "du", return_value=10):
+            items = hogs.sign_clone_items(hogs.gather_sign_clones(root))
+        self.assertEqual(len(items), 1)
+        self.assertIn("a instalada é 156", items[0].hint)
+
+    def test_only_old_versions_one_copy_counted_and_guarded(self):
+        tmp = self.tmpdir()
+        apps, root = tmp / "Applications", tmp / "X"
+        (apps / "Navegador.app/Contents").mkdir(parents=True)
+        (apps / "Navegador.app/Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "156"}))
+        for n, v in (("a", "156"), ("b", "156"), ("c", "155"), ("d", "155"), ("e", "152")):
+            self.make(root, f"code_sign_clone.{n}", "Navegador", v)
+        with mock.patch.object(hogs, "APPLICATIONS", apps), \
+                mock.patch.object(hogs, "du", side_effect=lambda p: 1_000_000_000):
+            items = hogs.sign_clone_items(hogs.gather_sign_clones(root))
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual((item.label, item.size, item.risk), ("Cópias antigas do Navegador (3)", 2_000_000_000, hogs.SAFE))
+        with mock.patch.object(hogs, "process_running", return_value=True):
+            self.assertEqual(item.guard(), "feche o Navegador antes")
+        with mock.patch.object(hogs, "process_running", return_value=False):
+            self.assertIsNone(item.guard())
+        item.action()
+        left = sorted(p.name for p in (root / "com.example.App.code_sign_clone").iterdir())
+        self.assertEqual(left, ["code_sign_clone.a", "code_sign_clone.b"])
+
+
 class WorktreeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

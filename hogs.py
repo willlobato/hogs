@@ -1378,6 +1378,88 @@ def apps_footer() -> Text:
                 "o AppCleaner (grátis) leva tudo junto.", style="dim")
 
 
+# ---------------------------------------------------------------- cópias de assinatura
+
+APPLICATIONS = Path("/Applications")
+
+
+def sign_clone_root() -> Path | None:
+    r = sh(["getconf", "DARWIN_USER_TEMP_DIR"])
+    if not r or r.returncode != 0 or not r.stdout.strip():
+        return None
+    root = Path(r.stdout.strip()).parent / "X"
+    return root if root.is_dir() else None
+
+
+@dataclass
+class CloneGroup:
+    app: str
+    executable: str
+    installed: str
+    by_version: dict[str, list[Path]]
+
+
+def _plist(path: Path) -> dict:
+    try:
+        with open(path, "rb") as f:
+            data = plistlib.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return {}
+
+
+def gather_sign_clones(root: Path) -> list[CloneGroup]:
+    groups: dict[str, CloneGroup] = {}
+    try:
+        clones = sorted(root.glob("*.code_sign_clone/code_sign_clone.*"))
+    except OSError:
+        return []
+    for clone in clones:
+        plist = next(iter(sorted(clone.glob("*/Contents/Info.plist"))), None)
+        if plist is None:
+            continue
+        info = _plist(plist)
+        version = str(info.get("CFBundleShortVersionString") or "")
+        bundle = plist.parent.parent.name
+        app = bundle.removesuffix(".bundle").removesuffix(".app")
+        if not version or not app:
+            continue
+        group = groups.get(app)
+        if group is None:
+            installed = ""
+            for base in (APPLICATIONS, HOME / "Applications"):
+                installed = str(_plist(base / f"{app}.app" / "Contents" / "Info.plist")
+                                .get("CFBundleShortVersionString") or "")
+                if installed:
+                    break
+            group = groups[app] = CloneGroup(app, str(info.get("CFBundleExecutable") or app), installed, {})
+        group.by_version.setdefault(version, []).append(clone)
+    return list(groups.values())
+
+
+def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
+    items = []
+    for g in groups:
+        if not g.installed:      # versão instalada desconhecida: na dúvida, não oferece nada
+            continue
+        old = {v: paths for v, paths in g.by_version.items() if v != g.installed}
+        if not old:
+            continue
+        copies = [p for paths in old.values() for p in paths]
+        size = sum(du(paths[0]) for paths in old.values())
+
+        def action(copies=copies):
+            for p in copies:
+                shutil.rmtree(p)
+
+        def guard(g=g):
+            return f"feche o {g.app} antes" if process_running(g.executable) else None
+
+        hint = f"versões {', '.join(sorted(old))}; a instalada é {g.installed}"
+        items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard))
+    return items
+
+
 # ---------------------------------------------------------------- coleta
 
 @dataclass

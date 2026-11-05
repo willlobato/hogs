@@ -27,6 +27,8 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
   transcripts, recent Codex) are shown by name but do not block: the author decided merged + clean is
   enough, since nothing is lost.
 - macOS advice (restart, apply update) is text only: never executed, never an `Item`.
+- App code-sign clones (`*.code_sign_clone`) are offered only for versions different from the installed app's,
+  only while the app is closed, sized as one copy per old version; unknown installed version → nothing offered.
 
 New invariants get a test in `tests/test_hogs.py` (see `DockerCleanItemsTest`).
 
