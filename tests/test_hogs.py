@@ -2,6 +2,7 @@ import io
 import sys
 import json
 import os
+import plistlib
 import subprocess
 import tempfile
 import time
