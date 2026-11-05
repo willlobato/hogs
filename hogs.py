@@ -342,7 +342,7 @@ def gather_docker() -> Docker:
                     found += [Path(m["Source"]).resolve() for m in json.loads(line) or []
                               if m.get("Type") == "bind" and m.get("Source")]
             d.mounts, d.mounts_ok = sorted(set(found)), True
-        except (ValueError, TypeError, AttributeError, KeyError):
+        except (ValueError, TypeError, AttributeError, KeyError, OSError, RuntimeError):
             d.mounts, d.mounts_ok = [], False
     running_projects = {
         _labels(c.get("Labels", "")).get("com.docker.compose.project")
@@ -390,13 +390,17 @@ def known_mounts(d: Docker) -> tuple[list[Path], bool]:
             pass
         return d.mounts, True
     saved = read_json(MOUNTS_FILE).get("mounts")
-    if isinstance(saved, list):
+    if isinstance(saved, list) and all(isinstance(m, str) and m for m in saved):
         return [Path(m) for m in saved], True
     return [], not shutil.which("docker")
 
 
 def under_mount(path: Path, mounts: list[Path]) -> bool:
     """`path` dentro de uma pasta montada, ou contendo uma."""
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        return True   # na dúvida, protege
     return any(path == m or m in path.parents or path in m.parents for m in mounts)
 
 
