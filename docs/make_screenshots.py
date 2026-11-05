@@ -52,8 +52,8 @@ docker = h.Docker(
 )
 
 
-def item(cat, label, size, risk, hint="", action=noop):
-    return h.Item(cat, label, int(size), risk, action if risk is not h.INFO else None, hint)
+def item(cat, label, size, risk, hint="", action=noop, kind=""):
+    return h.Item(cat, label, int(size), risk, action if risk is not h.INFO else None, hint, kind=kind)
 
 
 items = [
@@ -68,7 +68,8 @@ items = [
     item("apps", "Chrome", 9.8 * GB, h.INFO, "perfis e cache do navegador"),
     item("apps", "Lixeira", 2.1 * GB, h.SAFE),
     item("apps", "Cópias antigas do Navegador (3)", 6.4 * GB, h.SAFE, "versões 120.0, 121.0; a instalada é 122.0"),
-    item("apps", "Parado: ~/Downloads/curso-gravado.mov", 4.1 * GB, h.EVAL, "sem abrir há 14 meses · vai para a Lixeira"),
+    item("apps", "Parado: ~/Downloads/curso-gravado.mov", 4.1 * GB, h.EVAL, "sem abrir há 14 meses · vai para a Lixeira",
+         kind="pessoal"),
 ]
 
 now = datetime.now(timezone.utc)

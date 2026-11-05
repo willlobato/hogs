@@ -376,11 +376,11 @@ class RollbackTest(unittest.TestCase):
         self.assertEqual(item.size, 0)
         self.assertIn("só remove a tag", item.hint)
 
-    def test_parse_created_at(self):
-        self.assertEqual(hogs.parse_created_at("2026-11-04 20:04:12 -0300 -03"),
+    def test_parse_epoch(self):
+        self.assertEqual(hogs.parse_epoch("2026-11-04 20:04:12 -0300 -03"),
                          datetime(2026, 11, 4, 23, 4, 12, tzinfo=timezone.utc).timestamp())
-        self.assertIsNone(hogs.parse_created_at("lixo"))
-        self.assertIsNone(hogs.parse_created_at(""))
+        self.assertIsNone(hogs.parse_epoch("lixo"))
+        self.assertIsNone(hogs.parse_epoch(""))
 
     def test_gather_docker_reads_created_at(self):
         img = {"Repository": "app", "Tag": "latest", "ID": "sha256:" + "a" * 64, "UniqueSize": "1GB",
@@ -388,7 +388,7 @@ class RollbackTest(unittest.TestCase):
         sh, _ = DockerCleanItemsTest.fake_docker(images=[img])
         with mock.patch.object(hogs, "sh", sh):
             d = hogs.gather_docker()
-        self.assertEqual(d.images[0]["created_at"], hogs.parse_created_at("2026-11-04 20:04:12 -0300 -03"))
+        self.assertEqual(d.images[0]["created_at"], hogs.parse_epoch("2026-11-04 20:04:12 -0300 -03"))
 
 
 class AgoTest(unittest.TestCase):
@@ -759,9 +759,10 @@ class BreakdownTest(unittest.TestCase):
     def test_report_recommends_only_safe_and_lists_what_it_protects(self):
         s = self.snap(92e9, 0, 0)
         s.items += [hogs.Item("apps", "Lixeira", 2e9, hogs.SAFE, lambda: None),
-                    hogs.Item("apps", "Parado: ~/a.mov", 5e9, hogs.EVAL, lambda: None),
-                    hogs.Item("apps", "Parado: ~/b.iso", 1e9, hogs.EVAL, lambda: None),
-                    hogs.Item("docker", "Ponto de volta app:antes-x", 3e9, hogs.EVAL, lambda: None)]
+                    hogs.Item("apps", "Parado: ~/a.mov", 5e9, hogs.EVAL, lambda: None, kind="pessoal"),
+                    hogs.Item("apps", "Parado: ~/b.iso", 1e9, hogs.EVAL, lambda: None, kind="pessoal"),
+                    hogs.Item("docker", "Ponto de volta app:antes-x", 3e9, hogs.EVAL, lambda: None,
+                              kind="ponto_de_volta")]
         s.advice = [("Reiniciar o Mac", 13e9, "swap 13,0 GB · ligado há 20 dias")]
         s.docker.live = ["shop-db"]
         s.mounts = [Path("/u/dev/db/data")]
@@ -977,8 +978,7 @@ class SignCloneTest(unittest.TestCase):
         tmp = self.tmpdir()
         root = tmp / "X"
         self.make(root, "code_sign_clone.a", "Navegador", "155")
-        with mock.patch.object(hogs, "APPLICATIONS", tmp / "Applications"), \
-                mock.patch.object(hogs, "HOME", tmp / "home"):
+        with mock.patch.object(hogs, "APP_GLOBS", [tmp / "Applications", tmp / "home" / "Applications"]):
             self.assertEqual(hogs.sign_clone_items(hogs.gather_sign_clones(root)), [])
 
     def test_app_found_in_user_applications(self):
@@ -986,8 +986,7 @@ class SignCloneTest(unittest.TestCase):
         root = tmp / "X"
         self.install(tmp / "home" / "Applications", "Navegador", "156")
         self.make(root, "code_sign_clone.a", "Navegador", "155")
-        with mock.patch.object(hogs, "APPLICATIONS", tmp / "Applications"), \
-                mock.patch.object(hogs, "HOME", tmp / "home"), \
+        with mock.patch.object(hogs, "APP_GLOBS", [tmp / "Applications", tmp / "home" / "Applications"]), \
                 mock.patch.object(hogs, "du", return_value=10):
             items = hogs.sign_clone_items(hogs.gather_sign_clones(root))
         self.assertEqual(len(items), 1)
@@ -1000,7 +999,7 @@ class SignCloneTest(unittest.TestCase):
         (apps / "Navegador.app/Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "156"}))
         for n, v in (("a", "156"), ("b", "156"), ("c", "155"), ("d", "155"), ("e", "152")):
             self.make(root, f"code_sign_clone.{n}", "Navegador", v)
-        with mock.patch.object(hogs, "APPLICATIONS", apps), \
+        with mock.patch.object(hogs, "APP_GLOBS", [apps]), \
                 mock.patch.object(hogs, "du", side_effect=lambda p: 1_000_000_000):
             items = hogs.sign_clone_items(hogs.gather_sign_clones(root))
         self.assertEqual(len(items), 1)

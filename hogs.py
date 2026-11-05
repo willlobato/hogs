@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 try:
     from rich import box
@@ -68,6 +68,7 @@ HISTORY_DAYS = 90
 
 GB = 1e9
 MIN_SHOW = 50e6          # itens menores que isso não aparecem
+BIG_ITEM = 500e6         # a partir daqui vale uma linha própria: cache de app, arquivo parado, imagem de registry
 OLD_CONTAINER_DAYS = 30
 
 
@@ -97,6 +98,7 @@ class Item:
     action: Callable[[], object] | None = None
     hint: str = ""
     guard: Callable[[], str | None] | None = None
+    kind: str = ""               # "pessoal" | "ponto_de_volta": separa os 🟡 para avaliar no Recomendado
 
 
 # ---------------------------------------------------------------- utilidades
@@ -195,6 +197,30 @@ def process_running(name: str) -> bool:
         if r and r.returncode == 0:
             return True
     return False
+
+
+def plist_dict(data: bytes) -> dict | None:
+    """Plist (XML ou binário) que é um dicionário; qualquer outra coisa ou erro de leitura vira None."""
+    try:
+        d = plistlib.loads(data)
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def plist_file(path: Path) -> dict:
+    try:
+        return plist_dict(path.read_bytes()) or {}
+    except OSError:
+        return {}
+
+
+def plist_cmd(cmd: list[str]) -> dict | None:
+    """Saída -plist de um comando; None se o comando falhou ou a saída não é um dicionário."""
+    r = sh(cmd)
+    if not r or r.returncode != 0 or not r.stdout:
+        return None
+    return plist_dict(r.stdout.encode())
 
 
 def empty_dir(path: Path) -> None:
@@ -366,7 +392,7 @@ def gather_docker() -> Docker:
             "repo": repo, "tag": tag, "id": image_id, "name": name, "ref": ref,
             "size": parse_size(img.get("UniqueSize", "")), "used": used,
             "origin": image_origin(repo), "created": img.get("CreatedSince", ""),
-            "created_at": parse_created_at(img.get("CreatedAt", "")),
+            "created_at": parse_epoch(img.get("CreatedAt", "")),
         })
     # Com o containerd, a soma dos UniqueSize passa do total real (camadas contadas em dobro).
     # Escala cada grupo pra bater com os totais do `docker system df`.
@@ -499,8 +525,9 @@ def trim_builders(max_gb: float) -> list[tuple[str, int, str]]:
     return done
 
 
-def parse_created_at(text: str) -> float | None:
-    """`CreatedAt` do docker ("2026-11-04 20:04:12 -0300 -03") em epoch; ilegível vira None."""
+def parse_epoch(text: str) -> float | None:
+    """Data com fuso em epoch: `CreatedAt` do docker ("2026-11-04 20:04:12 -0300 -03") ou do `mdls`
+    ("2025-01-02 03:04:05 +0000"); o que vem depois do fuso é ignorado e o ilegível vira None."""
     try:
         return datetime.strptime(" ".join(text.split()[:3]), "%Y-%m-%d %H:%M:%S %z").timestamp()
     except ValueError:
@@ -584,24 +611,34 @@ def rollback_pairs(d: Docker) -> list[tuple[dict, dict]]:
     return pairs
 
 
-def rollback_info(d: Docker) -> list[tuple[dict, int, Risk, str]]:
-    """(imagem, quanto libera, risco, dica) de cada ponto de volta, do maior para o menor.
+class Rollback(NamedTuple):
+    img: dict
+    size: int       # quanto libera
+    risk: Risk
+    hint: str
+
+
+RECENT_ROLLBACK = "o QA pode estar em andamento"
+
+
+def rollback_info(d: Docker) -> dict[int, Rollback]:
+    """Cada ponto de volta, pelo id() da imagem em `d.images`, do maior para o menor.
     O relatório e o --clean usam esta mesma função, então o risco mostrado é sempre o mesmo."""
     pairs = rollback_pairs(d)
     if not pairs:
-        return []
+        return {}
     now = time.time()
     seen = first_seen([i["name"] for i, _ in pairs], now)
     days = setting("rollback_days")
-    out = []
+    out: dict[int, Rollback] = {}
     for img, current in sorted(pairs, key=lambda p: -p[0]["size"]):
         age = rollback_age_days(img, current, seen[img["name"]], now)
         old = age > days
-        hint = f"ponto de volta há {int(age)} dias" if old else "ponto de volta recente: o QA pode estar em andamento"
+        hint = f"ponto de volta há {int(age)} dias" if old else f"ponto de volta recente: {RECENT_ROLLBACK}"
         same = bool(img["id"]) and img["id"] == current["id"]
         if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
             hint = "mesma imagem da atual: só remove a tag"
-        out.append((img, 0 if same else img["size"], SAFE if old else EVAL, hint))
+        out[id(img)] = Rollback(img, 0 if same else img["size"], SAFE if old else EVAL, hint)
     return out
 
 
@@ -629,10 +666,9 @@ def docker_clean_items(d: Docker) -> list[Item]:
     old = [c for c in d.stopped if is_old_stopped(c)]
     if old:
         names = [c["name"] for c in old]
-        preview = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
         items.append(Item("docker", f"Docker: containers parados há +{OLD_CONTAINER_DAYS} dias ({len(old)})",
                           sum(c["size"] for c in old), SAFE,
-                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview))
+                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview(names)))
     for c in d.stopped:
         if is_old_stopped(c):
             continue
@@ -642,17 +678,17 @@ def docker_clean_items(d: Docker) -> list[Item]:
                           lambda n=c["name"]: run_all([["docker", "rm", n]]), why))
 
     rollbacks = rollback_info(d)
-    rollback_ids = {id(img) for img, _, _, _ in rollbacks}
-    for img, size, risk, hint in rollbacks:
-        items.append(Item("docker", f"Ponto de volta {img['name']}", size, risk,
-                          lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]), hint))
+    for rb in rollbacks.values():
+        items.append(Item("docker", f"Ponto de volta {rb.img['name']}", rb.size, rb.risk,
+                          lambda ref=image_ref(rb.img): run_all([["docker", "rmi", ref]]), rb.hint,
+                          kind="ponto_de_volta"))
 
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):
-        if img["used"] or img["origin"] == "none" or id(img) in rollback_ids:
+        if img["used"] or img["origin"] == "none" or id(img) in rollbacks:
             continue
         local = img["origin"] == "local"
-        if not local and img["size"] < 500e6:
+        if not local and img["size"] < BIG_ITEM:
             small_pullable.append(img)
             continue
         items.append(Item("docker", f"Imagem {img['name']}", img["size"], LOSS if local else REDOWN,
@@ -664,7 +700,7 @@ def docker_clean_items(d: Docker) -> list[Item]:
         items.append(Item("docker", f"Imagens pequenas de registry/Hub ({len(names)})",
                           sum(i["size"] for i in small_pullable), REDOWN,
                           lambda refs=refs: run_all([["docker", "rmi", r] for r in refs]),
-                          ", ".join(n.rsplit("/", 1)[-1] for n in names[:3]) + ("…" if len(names) > 3 else "")))
+                          preview([n.rsplit("/", 1)[-1] for n in names])))
     return items
 
 
@@ -1478,13 +1514,10 @@ def scan_candidates(known: set[str]) -> list[Path]:
     return out
 
 
-BIG_CACHE = 500e6
-
-
 def big_cache_paths(sizes: dict[Path, int], mounts: list[Path]) -> list[Path]:
     """Filhos grandes de ~/Library/Caches fora de pastas montadas, do maior para o menor."""
     return [p for p, size in sorted(sizes.items(), key=lambda kv: -kv[1])
-            if p.parent == CACHES and size >= BIG_CACHE and not under_mount(p, mounts)]
+            if p.parent == CACHES and size >= BIG_ITEM and not under_mount(p, mounts)]
 
 
 def cache_items(sizes: dict[Path, int], mounts: list[Path]) -> list[Item]:
@@ -1509,10 +1542,7 @@ class AppInfo:
 
 
 def _app_info(app: Path) -> AppInfo:
-    try:
-        info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        info = {}
+    info = plist_file(app / "Contents/Info.plist")
     bundle_id = info.get("CFBundleIdentifier", "")
     name = info.get("CFBundleName") or app.stem
 
@@ -1599,9 +1629,6 @@ def apps_footer() -> Text:
 
 # ---------------------------------------------------------------- cópias de assinatura
 
-APPLICATIONS = Path("/Applications")
-
-
 def sign_clone_root() -> Path | None:
     r = sh(["getconf", "DARWIN_USER_TEMP_DIR"])
     if not r or r.returncode != 0 or not r.stdout.strip():
@@ -1618,15 +1645,6 @@ class CloneGroup:
     by_version: dict[str, list[Path]]
 
 
-def _plist(path: Path) -> dict:
-    try:
-        with open(path, "rb") as f:
-            data = plistlib.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        return {}
-
-
 def gather_sign_clones(root: Path) -> list[CloneGroup]:
     groups: dict[str, CloneGroup] = {}
     try:
@@ -1637,7 +1655,7 @@ def gather_sign_clones(root: Path) -> list[CloneGroup]:
         plist = next(iter(sorted(clone.glob("*/Contents/Info.plist"))), None)
         if plist is None:
             continue
-        info = _plist(plist)
+        info = plist_file(plist)
         version = str(info.get("CFBundleShortVersionString") or "")
         bundle = plist.parent.parent.name
         app = bundle.removesuffix(".bundle").removesuffix(".app")
@@ -1646,8 +1664,8 @@ def gather_sign_clones(root: Path) -> list[CloneGroup]:
         group = groups.get(app)
         if group is None:
             installed = ""
-            for base in (APPLICATIONS, HOME / "Applications"):
-                installed = str(_plist(base / f"{app}.app" / "Contents" / "Info.plist")
+            for base in APP_GLOBS:
+                installed = str(plist_file(base / f"{app}.app" / "Contents" / "Info.plist")
                                 .get("CFBundleShortVersionString") or "")
                 if installed:
                     break
@@ -1683,7 +1701,6 @@ def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
 
 PERSONAL_ROOTS = [HOME / "Desktop", HOME / "Documents", HOME / "Downloads", HOME / "Pictures"]
 STALE_PERSONAL_DAYS = 180
-BIG_FILE = 500e6
 SKIP_PACKAGES = (".photoslibrary", ".musiclibrary", ".app", ".tvlibrary", ".logicx", ".band", ".fcpbundle",
                  ".imovielibrary", ".vmwarevm", ".pvm", ".utm", ".bundle", ".pkg")
 
@@ -1692,13 +1709,7 @@ def spotlight_last_used(path: Path) -> float | None:
     r = sh(["mdls", "-name", "kMDItemLastUsedDate", "-raw", str(path)], timeout=10)
     if r is None or r.returncode != 0:
         return None
-    out = r.stdout.strip()
-    if not out or out == "(null)":
-        return None
-    try:
-        return datetime.strptime(out, "%Y-%m-%d %H:%M:%S %z").timestamp()
-    except ValueError:
-        return None
+    return parse_epoch(r.stdout)
 
 
 def stale_personal(roots: list[Path], mounts: list[Path], now: float) -> list[tuple[Path, int, float]]:
@@ -1722,7 +1733,7 @@ def stale_personal(roots: list[Path], mounts: list[Path], now: float) -> list[tu
                     continue
                 size = st.st_blocks * 512
                 recent = max(st.st_mtime, getattr(st, "st_birthtime", 0), st.st_ctime)
-                if size < BIG_FILE or recent >= cutoff or under_mount(p, mounts, containing=False):
+                if size < BIG_ITEM or recent >= cutoff or under_mount(p, mounts, containing=False):
                     continue
                 last = max(recent, spotlight_last_used(p) or 0)
                 if last < cutoff:
@@ -1742,7 +1753,7 @@ def personal_items(found: list[tuple[Path, int, float]], now: float) -> list[Ite
     for p, size, last in found:
         meses = int((now - last) // (30 * 86400))
         items.append(Item("apps", f"Parado: {short(p)}", size, EVAL, lambda p=p: move_to_trash(p),
-                          f"sem abrir há {meses} meses · vai para a Lixeira"))
+                          f"sem abrir há {meses} meses · vai para a Lixeira", kind="pessoal"))
     return items
 
 
@@ -1848,10 +1859,7 @@ class SystemInfo:
 
 def parse_apfs(data: bytes, container: str) -> dict[str, int]:
     """CapacityInUse por papel (Roles[0]) dos volumes do container; volumes sem papel ficam de fora."""
-    try:
-        info = plistlib.loads(data)
-    except Exception:
-        return {}
+    info = plist_dict(data) or {}
     out: dict[str, int] = {}
     for c in info.get("Containers", []):
         if c.get("ContainerReference") != container:
@@ -1880,19 +1888,8 @@ def parse_boottime(text: str, now: float) -> float:
     return max(0.0, (now - int(m.group(1))) / 86400)
 
 
-def _plist_out(cmd: list[str]) -> dict | None:
-    r = sh(cmd)
-    if not r or r.returncode != 0 or not r.stdout:
-        return None
-    try:
-        d = plistlib.loads(r.stdout.encode())
-    except Exception:
-        return None
-    return d if isinstance(d, dict) else None
-
-
 def gather_system(now: float) -> SystemInfo | None:
-    info = _plist_out(["diskutil", "info", "-plist", "/"])
+    info = plist_cmd(["diskutil", "info", "-plist", "/"])
     container = (info or {}).get("APFSContainerReference")
     if not container:
         return None
@@ -1900,7 +1897,7 @@ def gather_system(now: float) -> SystemInfo | None:
     if not r or r.returncode != 0 or not r.stdout:
         return None
     volumes = parse_apfs(r.stdout.encode(), container)
-    snaps = _plist_out(["diskutil", "apfs", "listSnapshots", "-plist", "/"])
+    snaps = plist_cmd(["diskutil", "apfs", "listSnapshots", "-plist", "/"])
     if snaps is None:
         return None
     pending = any(s.get("SnapshotName") == UPDATE_SNAPSHOT for s in snaps.get("Snapshots", []))
@@ -2072,10 +2069,9 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
         return rows
 
     rollbacks = rollback_info(d)
-    rollback_ids = {id(img) for img, _, _, _ in rollbacks}
 
     def group(pred):
-        sel = [i for i in d.images if pred(i) and id(i) not in rollback_ids]
+        sel = [i for i in d.images if pred(i) and id(i) not in rollbacks]
         return sel, sum(i["size"] for i in sel)
 
     used, used_size = group(lambda i: i["used"])
@@ -2090,7 +2086,7 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
         (f"Imagens em uso ({len(used)})", used_size, INFO, "usadas por containers"),
         (f"Imagens sem uso, de registry ({len(pull)})", pull_size, REDOWN, "voltam com docker pull"),
         (f"Imagens sem uso, construídas aqui ({len(local)})", local_size, LOSS, local_names),
-        *rollback_rows(rollbacks),
+        *rollback_rows(list(rollbacks.values())),
         (f"Imagens sem tag ({len(none)})", none_size, SAFE, "versões antigas órfãs"),
         ("Cache de build", d.build_cache, SAFE, "próximo build fica mais lento"),
         *[(f"Cache do builder {bc['builder']}", bc["size"], SAFE, "volume do BuildKit; o daemon.json não limita")
@@ -2105,9 +2101,9 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
     return rows
 
 
-def rollback_rows(rollbacks: list[tuple[dict, int, Risk, str]]) -> list[tuple[str, int, Risk, str]]:
+def rollback_rows(rollbacks: list[Rollback]) -> list[tuple[str, int, Risk, str]]:
     """Cada ponto de volta numa linha própria, com o mesmo risco e a mesma dica do --clean."""
-    return [(f"Ponto de volta {img['name']}", size, risk, hint) for img, size, risk, hint in rollbacks]
+    return [(f"Ponto de volta {rb.img['name']}", rb.size, rb.risk, rb.hint) for rb in rollbacks]
 
 
 def stopped_rows(stopped: list[dict]) -> list[tuple[str, int, Risk, str]]:
@@ -2135,10 +2131,10 @@ def unused_images_table(d: Docker) -> Table | None:
     t.add_column("Tamanho", justify="right", no_wrap=True)
     t.add_column("Origem", no_wrap=True)
     t.add_column("Criada", style="dim", no_wrap=True)
-    rollback_risk = {id(img): risk for img, _, risk, _ in rollback_info(d)}
+    rollbacks = rollback_info(d)
     for i in imgs:
-        if id(i) in rollback_risk:
-            risk, origin = rollback_risk[id(i)], "ponto de volta"
+        if id(i) in rollbacks:
+            risk, origin = rollbacks[id(i)].risk, "ponto de volta"
         else:
             risk, origin = (LOSS if i["origin"] == "local" else REDOWN), ORIGIN_LABEL[i["origin"]]
         t.add_row(i["name"], Text(fmt(i["size"]), style="bold"),
@@ -2314,12 +2310,12 @@ def recommended_panel(s: Snapshot, cleanable: list[Item]) -> Panel:
     for label, size, how in s.advice:
         t.add_row(f"💻 {label}", f"~{fmt(size)}" if size else "", Text("↻", style="cyan"), how)
     evals = [i for i in cleanable if i.risk is EVAL]
-    files = [i for i in evals if i.cat != "docker"]
-    rollbacks = [i for i in evals if i.cat == "docker"]
+    files = [i for i in evals if i.kind == "pessoal"]
+    rollbacks = [i for i in evals if i.kind == "ponto_de_volta"]
     names = ", ".join(i.label.removeprefix("Ponto de volta ") for i in rollbacks)
     for title, sel, why in (
             ("🗂  Arquivos parados para avaliar", files, "vão para a Lixeira"),
-            ("🐳 Pontos de volta recentes", rollbacks, f"o QA pode estar em andamento: {names}")):
+            ("🐳 Pontos de volta recentes", rollbacks, f"{RECENT_ROLLBACK}: {names}")):
         if sel:
             t.add_row(f"{title} ({len(sel)})", fmt(sum(i.size for i in sel)), Text(EVAL.icon),
                       f"{why} · um por um no hogs --clean")
@@ -2359,9 +2355,11 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
     con.print(protected_panel(s))
     con.print(growth_table(s, records))
     con.print()
-    for t in (category_table("🐳 Docker", docker_rows(s.docker)), prevention_panel(s), unused_images_table(s.docker),
-              category_table("🧰 Caches de dev", [(i.label, i.size, i.risk, i.hint) for i in s.items if i.cat == "dev"]),
-              category_table("📦 Apps e dados", [(i.label, i.size, i.risk, i.hint) for i in s.items if i.cat == "apps"]),
+    def rows(cat: str) -> list[tuple[str, int, Risk, str]]:
+        return [(i.label, i.size, i.risk, i.hint) for i in s.items if i.cat == cat]
+    for t in (category_table(CAT_TITLES["docker"], docker_rows(s.docker)), prevention_panel(s),
+              unused_images_table(s.docker),
+              category_table(CAT_TITLES["dev"], rows("dev")), category_table(CAT_TITLES["apps"], rows("apps")),
               category_table("🔎 Outros grandes (fora da lista acima)",
                              [(label, size, INFO, "") for label, size in s.others if size >= GB][:12])):
         if t is not None:
