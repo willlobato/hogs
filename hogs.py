@@ -83,6 +83,7 @@ SAFE = Risk("🟢", "seguro", "green", 0)
 REDOWN = Risk("🟡", "baixa de novo", "yellow", 1)
 LOSS = Risk("🔴", "perde algo", "red", 2)
 INFO = Risk("⚪", "só informação", "bright_black", 3)
+EVAL = Risk("🟡", "para avaliar", "yellow", 1)
 
 
 @dataclass
@@ -1858,6 +1859,25 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+DEFAULTS: dict[str, object] = {
+    "rollback_tags": ["antes", "backup", "bkp", "before", "rollback"],
+    "rollback_days": 2,
+    "stale_worktree_days": 30,
+}
+
+
+def setting(key: str) -> object:
+    """Valor do config.json se tiver o mesmo tipo do padrão (lista de str; int > 0), senão o padrão."""
+    default = DEFAULTS[key]
+    value = load_config().get(key)
+    if isinstance(default, list):
+        if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+            return value
+    elif isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return default
 
 
 def log(msg: str) -> None:

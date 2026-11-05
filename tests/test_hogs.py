@@ -15,6 +15,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import hogs  # noqa: E402
 
 
+class SettingTest(unittest.TestCase):
+    def test_defaults_and_valid_overrides(self):
+        with mock.patch.object(hogs, "load_config", return_value={}):
+            self.assertEqual(hogs.setting("rollback_days"), 2)
+            self.assertEqual(hogs.setting("stale_worktree_days"), 30)
+            self.assertIn("antes", hogs.setting("rollback_tags"))
+        with mock.patch.object(hogs, "load_config", return_value={"rollback_days": 5, "rollback_tags": ["old"]}):
+            self.assertEqual(hogs.setting("rollback_days"), 5)
+            self.assertEqual(hogs.setting("rollback_tags"), ["old"])
+
+    def test_invalid_values_fall_back_to_default(self):
+        for bad in ({"rollback_days": "5"}, {"rollback_days": 0}, {"rollback_days": -1}, {"rollback_tags": "antes"}):
+            with mock.patch.object(hogs, "load_config", return_value=bad):
+                self.assertEqual(hogs.setting(next(iter(bad))), hogs.DEFAULTS[next(iter(bad))])
+
+
 class ParseSizeTest(unittest.TestCase):
     def test_docker_formats(self):
         self.assertEqual(hogs.parse_size("1.4GB"), 1_400_000_000)
