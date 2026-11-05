@@ -113,6 +113,8 @@ class Item:
     hint: str = ""
     guard: Callable[[], str | None] | None = None
     kind: str = ""               # "pessoal" | "ponto_de_volta": separa os 🟡 para avaliar no Recomendado
+    path: Path | None = None     # onde o item mora no disco (para abrir no Finder e mostrar no 🔎)
+    worktree: Worktree | None = None   # o worktree, quando o item é um só
 
 
 # ---------------------------------------------------------------- utilidades
@@ -2127,7 +2129,7 @@ def big_cache_paths(sizes: dict[Path, int], mounts: list[Path]) -> list[Path]:
 def cache_items(sizes: dict[Path, int], mounts: list[Path]) -> list[Item]:
     """Caches grandes em ~/Library/Caches que a lista não cobre; o app recria quando precisar."""
     return [Item("dev", f"Cache: {p.name}", int(sizes[p]), REDOWN, lambda p=p: shutil.rmtree(p),
-                 "cache do app; ele recria quando precisar")
+                 "cache do app; ele recria quando precisar", path=p)
             for p in big_cache_paths(sizes, mounts)]
 
 
@@ -2297,7 +2299,8 @@ def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
             return f"feche o {g.app} antes" if process_running(g.executable) else None
 
         hint = f"versões {', '.join(sorted(old))}; a instalada é {g.installed}"
-        items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard))
+        items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard,
+                          path=copies[0]))
     return items
 
 
@@ -2357,7 +2360,7 @@ def personal_items(found: list[tuple[Path, int, float]], now: float) -> list[Ite
     for p, size, last in found:
         meses = int((now - last) // (30 * 86400))
         items.append(Item("apps", f"Parado: {short(p)}", size, EVAL, lambda p=p: move_to_trash(p),
-                          f"sem abrir há {meses} meses · vai para a Lixeira", kind="pessoal"))
+                          f"sem abrir há {meses} meses · vai para a Lixeira", kind="pessoal", path=p))
     return items
 
 
@@ -2443,7 +2446,7 @@ def gather(con: Console) -> Snapshot:
                     worktrees_error = str(exc) or type(exc).__name__
 
     items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
-                  make_action(pd), pd.hint, make_guard(pd)) for pd in PATH_DEFS]
+                  make_action(pd), pd.hint, make_guard(pd), path=pd.paths[0]) for pd in PATH_DEFS]
     shown: set[Path] = set()
     if mounts_known:
         cand_sizes = {p: sizes.get(p, 0) for p in candidates}
@@ -3143,21 +3146,17 @@ def clean(con: Console, s: Snapshot) -> None:
         con.print("[dim]Nada apagado.[/]")
         return
 
-    before = shutil.disk_usage(DATA_VOLUME).free
-    for i in chosen:
-        if i.guard and (why := i.guard()):
-            con.print(f"  [yellow]↷[/] {i.label}: pulei, {why}")
-            continue
-        try:
-            with con.status(f"Limpando {i.label}…"):
-                i.action()
-        except (OSError, RuntimeError) as exc:
-            con.print(Text(f"  ↷ {i.label}: {exc}", style="yellow"))
-            continue
-        con.print(f"  [green]✔[/] {i.label}")
+    def report(i: Item, ok: bool, why: str) -> None:
+        if ok:
+            con.print(f"  [green]✔[/] {i.label}")
+        else:
+            con.print(Text(f"  ↷ {i.label}: {why}", style="yellow"))
+
+    with con.status("Limpando…"):
+        freed = apply_items(chosen, report)
 
     after = shutil.disk_usage(DATA_VOLUME).free
-    msg = Text.assemble(("Liberado: ", "bold"), (fmt(max(0, after - before)), "bold green"),
+    msg = Text.assemble(("Liberado: ", "bold"), (fmt(freed), "bold green"),
                         f"  ·  livre agora: {fmt(after)}")
     if any(i.cat == "docker" for i in chosen):
         msg.append("\nO Docker devolve o espaço do Docker.raw aos poucos; se não mudar, reinicie o Docker Desktop.",
@@ -3172,6 +3171,86 @@ def clean(con: Console, s: Snapshot) -> None:
 
 
 # ---------------------------------------------------------------- tela: itens e ações
+
+RISK_WHY = {
+    "seguro": "volta sozinho ou já está guardado em outro lugar",
+    "baixa de novo": "volta baixando de novo",
+    "perde algo": "não volta: só apague se tiver certeza",
+    "para avaliar": "não volta sozinho: avalie você (arquivos vão para a Lixeira)",
+    "só informação": "só informação: o hogs não apaga",
+}
+
+
+def worktree_items(rows: list[Worktree], root: Path, days: int = 0) -> list[Item]:
+    """Um Item por worktree 🟢 (a tela apaga um por um; o relatório continua com `worktree_item`)."""
+    items = []
+    for w in safe_worktrees(rows):
+        hint = f"já na main ({w.merged})" if w.merged else f"enviado ({w.pushed}), parado {elapsed(w.last_activity)}"
+        if any(link.reopen for link in w.conversations):
+            hint += " · ⚠ reabra antes de apagar"
+        items.append(Item("worktree", f"{w.repo.name} / {where(w, root)}", w.size, SAFE,
+                          lambda w=w: remove_worktree(w, days, root), hint, path=w.path, worktree=w))
+    return items
+
+
+def tui_items(s: Snapshot) -> list[Item]:
+    items = [i for i in clean_items(s) if i.cat != "worktree"]
+    if s.worktrees_root:
+        items += worktree_items(s.worktrees, s.worktrees_root)
+    return sorted(items, key=lambda i: (i.risk.rank, -i.size))
+
+
+def apply_items(items: list[Item], notify: Callable[[Item, bool, str], None]) -> int:
+    """Roda cada item reconferindo a guarda na hora; devolve os bytes livres a mais no volume de dados."""
+    before = shutil.disk_usage(DATA_VOLUME).free
+    for i in items:
+        if i.guard and (why := i.guard()):
+            notify(i, False, f"pulei, {why}")
+            continue
+        try:
+            i.action()
+        except (OSError, RuntimeError) as exc:
+            notify(i, False, str(exc))
+            continue
+        notify(i, True, "")
+    return max(0, shutil.disk_usage(DATA_VOLUME).free - before)
+
+
+def worktree_detail(w: Worktree, root: Path | None) -> list[Text]:
+    lines = [Text(f"{where(w, root)} · {branch_name(w)}", style="bold"),
+             Text(f"{fmt(w.size)} · mexido {elapsed(w.last_activity)}")]
+    for ok, text in w.checks:
+        lines.append(Text(f"✓ {text}", style="green") if ok else Text(f"✗ {text}", style="yellow"))
+    if w.users:
+        lines.append(Text(f"▶ em uso por: {', '.join(w.users)}"))
+    lines += [Text(f"🟡 {t}") for t in w.waits]
+    lines += [Text(f"⚪ {t}") for t in w.blockers]
+    icon, color = VERDICTS[w.verdict]
+    verdict = f"{icon} {VERDICT_LABELS[w.verdict]}"
+    if w.eligible:
+        verdict += " · a pasta sai, a branch fica"
+    lines.append(Text(verdict, style=color))
+    for link in sorted(w.conversations, key=lambda l: -l.conv.last):
+        c = link.conv
+        lines.append(Text(f"💬 {'● ' if c.live else ''}“{c.title or c.session[:8]}” · última msg {elapsed(c.last)}"))
+        lines.append(Text(resume_command(c), style="cyan"))
+        if link.reopen:
+            lines.append(Text("⚠ reabra antes de apagar: depois da remoção ela não abre mais", style="yellow"))
+    return lines
+
+
+def item_detail(i: Item, guard_text: str | None = None) -> list[Text]:
+    lines = [Text(i.label, style="bold"),
+             Text(f"{fmt(i.size)} · {i.risk.icon} {i.risk.label}: {RISK_WHY[i.risk.label]}")]
+    if i.hint:
+        lines.append(Text(i.hint))
+    if guard_text:
+        lines.append(Text(f"✗ {guard_text}", style="yellow"))
+    if i.path:
+        lines.append(Text(f"📁 {short(i.path)}", style=f"link file://{i.path}"))
+    if i.worktree:
+        lines += worktree_detail(i.worktree, None)
+    return lines
 
 
 # ---------------------------------------------------------------- tela: desenho
