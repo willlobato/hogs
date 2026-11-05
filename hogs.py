@@ -3671,12 +3671,11 @@ def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
             if si:
                 if si.swap_used:
                     kids.append(_info_row("disk/system/swap", ["Swap em uso", fmt(si.swap_used), "⚪", ""]))
-                    total += si.swap_used
                 for role, size in sorted(si.volumes.items(), key=lambda kv: -kv[1]):
                     kids.append(_info_row(f"disk/system/apfs/{role}", [f"Volume APFS: {role}", fmt(size), "⚪", ""]))
-                    total += size
-                kids.append(_info_row("disk/system/uptime", ["Tempo ligado", "", "⚪",
-                                                              f"{int(si.uptime_days)} dias"]))
+                if si.uptime_days is not None:
+                    kids.append(_info_row("disk/system/uptime", ["Tempo ligado", "", "⚪",
+                                                                  f"{int(si.uptime_days)} dias"]))
             for n, (label, size, how) in enumerate(s.advice):
                 kids.append(Row(f"disk/advice/{n}", [f"💻 {label}", f"~{fmt(size)}" if size else "",
                                                      Text("↻", style="cyan"), how],
@@ -3688,8 +3687,14 @@ def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
                     kids.append(_info_row(f"disk/others/{label}", [label, fmt(size), "⚪", ""]))
                     total += size
         if kids:
-            rows.append(_group_row(f"disk/{cat}", title, fmt(total), "", plural(len(kids), "item", "itens"), kids,
-                                   [Text(title, style="bold"), Text(f"{fmt(total)} · {plural(len(kids), 'item', 'itens')}")]))
+            count = plural(len(kids), "item", "itens")
+            if cat == "system":      # swap e volumes se sobrepõem: não há soma honesta
+                size_cell, note = Text("—", style="dim"), count
+                head = Text(count)
+            else:
+                size_cell, note = fmt(total), Text(TRIM_OFF_NOTE, style="yellow") if trim_trapped(cat, trim_off) else count
+                head = Text(f"{fmt(total)} · {count}")
+            rows.append(_group_row(f"disk/{cat}", title, size_cell, "", note, kids, [Text(title, style="bold"), head]))
     return DISK_COLUMNS, rows
 
 

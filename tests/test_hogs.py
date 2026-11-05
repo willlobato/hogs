@@ -2641,6 +2641,20 @@ class DiskTreeTest(unittest.TestCase):
         self.assertEqual([r.key for r in rows], ["disk/system"])
         kinds = [c.kind for c in rows[0].children]
         self.assertEqual(kinds, ["info", "info", "info", "advice"])
+        self.assertEqual(str(rows[0].cells[1]), "—")
+        si.uptime_days = None
+        _, rows2 = hogs.disk_tree(s, [], False, {})
+        self.assertNotIn("disk/system/uptime", [c.key for c in rows2[0].children])
+
+    def test_redown_in_dev_and_trim_note(self):
+        items = RecommendedTreeTest.items(None)
+        s = hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(running=True), [], [])
+        _, rows = hogs.disk_tree(s, items, True, {})
+        by = {r.key: r for r in rows}
+        maven = by["disk/dev"].children[0]
+        self.assertEqual((maven.item.risk, maven.group), (hogs.REDOWN, "disk/dev"))
+        self.assertEqual(str(by["disk/docker"].cells[3]), hogs.TRIM_OFF_NOTE)
+        self.assertNotEqual(str(by["disk/dev"].cells[3]), hogs.TRIM_OFF_NOTE)
         self.assertEqual(hogs.disk_tree(hogs.Snapshot(1, 1, hogs.Docker(), [], []), [], False, {})[1], [])
         def height(c):
             con = hogs.Console(width=100, file=io.StringIO())
