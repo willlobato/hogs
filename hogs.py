@@ -2,12 +2,13 @@
 """hogs: mostra quem está comendo o disco do Mac (Docker incluso) e ajuda a limpar com segurança.
 
 Uso:
-  hogs                 relatório
-  hogs --clean         escolhe o que apagar
-  hogs --alert 30      avisa quando o espaço livre cair abaixo de 30 GB
-  hogs --alert off     desliga o aviso
-  hogs --alert         mostra se o aviso está ativo
-  hogs --alert test    manda uma notificação de teste
+  hogs                    num terminal, abre a tela para ver e escolher o que apagar; fora dele, o relatório
+  hogs --report           o relatório, mesmo num terminal
+  hogs --worktrees PASTA  a tela na aba Worktrees, só com os worktrees Git de PASTA
+  hogs --alert 30         avisa quando o espaço livre cair abaixo de 30 GB
+  hogs --alert off        desliga o aviso
+  hogs --alert            mostra se o aviso está ativo
+  hogs --alert test       manda uma notificação de teste
 """
 from __future__ import annotations
 
@@ -42,14 +43,13 @@ try:
     from rich.console import Console, Group, RenderableType
     from rich.padding import Padding
     from rich.panel import Panel
-    from rich.prompt import Confirm, Prompt
     from rich.table import Table
     from rich.text import Text
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -750,7 +750,7 @@ RECENT_ROLLBACK = "o QA pode estar em andamento"
 
 def rollback_info(d: Docker) -> dict[int, Rollback]:
     """Cada ponto de volta, pelo id() da imagem em `d.images`, do maior para o menor.
-    O relatório e o --clean usam esta mesma função, então o risco mostrado é sempre o mesmo."""
+    O relatório e a tela usam esta mesma função, então o risco mostrado é sempre o mesmo."""
     pairs = rollback_pairs(d)
     if not pairs:
         return {}
@@ -1710,7 +1710,7 @@ VERDICT_LABELS = {"seguro": "seguro", "depois": "em andamento", "manter": "com t
 
 
 def safe_worktrees(rows: list[Worktree]) -> list[Worktree]:
-    """Os 🟢 na ordem em que recebem número (#1, #2…), a mesma no quadro e no --clean."""
+    """Os 🟢, por projeto e do maior para o menor."""
     return sorted((w for w in rows if w.eligible), key=lambda w: (w.repo.name.lower(), -w.size))
 
 
@@ -1727,7 +1727,7 @@ def hogs_command(root: Path, days: int) -> str:
 
 
 def merge_cell(w: Worktree) -> Text:
-    """Coluna da branch principal no quadro e no --clean: merge comprovado, só enviado ou nada comprovado."""
+    """Coluna da branch principal no quadro: merge comprovado, só enviado ou nada comprovado."""
     if w.merged:
         return Text(f"✓ {w.merged}", style="green")
     if w.pushed:
@@ -1753,7 +1753,6 @@ def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = Non
                      stale_days: int = DEFAULTS["stale_worktree_days"]) -> None:
     """Quadro por projeto e, por último (o que fica na tela), o resumo."""
     order = {"seguro": 0, "depois": 1, "manter": 2}
-    number = {id(w): n for n, w in enumerate(safe_worktrees(rows), 1)}
     projects: dict[Path, list[Worktree]] = {}
     for w in rows:
         projects.setdefault(w.repo, []).append(w)
@@ -1770,7 +1769,7 @@ def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = Non
         t.add_column("Veredito", ratio=3, overflow="fold")   # "ellipsis" corta a palavra depois de um emoji (rich)
         for w in items:
             icon, style = VERDICTS[w.verdict]
-            verdict = (f"{icon} seguro · #{number[id(w)]}" if w.eligible
+            verdict = (f"{icon} seguro" if w.eligible
                        else f"{icon} {VERDICT_LABELS[w.verdict]}: {w.reason}")
             if w.eligible and not w.merged:
                 verdict += "\na pasta sai, a branch fica"
@@ -1894,9 +1893,9 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
     todo = [Text(""), Text("O que fazer", style="bold")]
     step = 1
     if safe:
-        todo.append(Text(f"  {step}. Apagar os 🟢: {cmd} --clean", style="bold"))
-        todo.append(indent("Digite a para todos ou os números do quadro (ex: 1,3,5-7). Ele confirma antes e "
-                           "confere tudo de novo antes de cada remoção."))
+        todo.append(Text(f"  {step}. Apagar os 🟢: {cmd}", style="bold"))
+        todo.append(indent("Num terminal, abre a tela na aba Worktrees: espaço marca (a marca todos os 🟢), Enter "
+                           "mostra a lista e s apaga. Cada um é conferido de novo antes de sair."))
         step += 1
     if later:
         todo.append(Text(f"  {step}. 🟡 ficam: estão em uso ou em andamento (motivo na coluna Veredito). "
@@ -1910,87 +1909,6 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
                     title_align="left", border_style="green" if safe else "yellow", padding=(1, 2)))
     con.print(Text("Merge e envio conferidos nas referências remotas locais; rode git fetch nos repositórios para "
                    "atualizá-las.", style="dim"))
-
-
-def clean_worktrees(con: Console, rows: list[Worktree], days: int, root: Path | None = None) -> None:
-    """Só os 🟢: todos de uma vez (a) ou pelos números do quadro, com confirmação e reverificação."""
-    safe = safe_worktrees(rows)
-    if not safe:
-        con.print(Panel("Nenhum worktree 🟢 agora. O resumo acima diz o que falta para cada grupo.",
-                        border_style="yellow", padding=(0, 2)))
-        return
-    t = Table(title="🗑  Worktrees seguros para apagar", title_justify="left", title_style="bold",
-              box=box.SIMPLE_HEAD, expand=True)
-    t.add_column("#", justify="right", style="cyan", no_wrap=True)
-    t.add_column("Projeto", no_wrap=True)
-    t.add_column("Worktree / branch", ratio=3)
-    t.add_column("Tamanho", justify="right", no_wrap=True)
-    t.add_column("Mexido", no_wrap=True)
-    t.add_column("Na main", ratio=2)
-    t.add_column("Sessão que trabalhou nele", ratio=2)
-    for n, w in enumerate(safe, 1):
-        t.add_row(str(n), w.repo.name, Text(where(w, root)).append(f"\n{branch_name(w)}", style="dim"),
-                  fmt(w.size), elapsed(w.last_activity), merge_cell(w),
-                  Text(", ".join(w.sessions) or "—", style="dim"))
-    con.print(t)
-    raw = Prompt.ask(f"Quais apagar? [cyan]a[/] = todos os {len(safe)} ({fmt(sum(w.size for w in safe))}) · "
-                     "números, ex: [cyan]1,3,5-7[/] · Enter cancela", default="", show_default=False)
-    numbers = selection_numbers(raw, len(safe))
-    chosen = [w for n, w in enumerate(safe, 1) if n in numbers]
-    if not chosen:
-        con.print("[dim]Nada apagado.[/]")
-        return
-
-    con.print(Text(f"\nVou remover {n_worktrees(len(chosen))}, {fmt(sum(w.size for w in chosen))}:", style="bold"))
-    for w in chosen:
-        note = f"  · sessão {', '.join(w.sessions)}" if w.sessions else ""
-        con.print(Text(f"  • {w.repo.name} / {where(w, root)}  ({branch_name(w)}){note}"))
-        for link in w.conversations:
-            if link.reopen:
-                con.print(Text(f"    ⚠ reabra antes de apagar “{link.conv.title or link.conv.session[:8]}”: "
-                               f"{resume_command(link.conv)}", style="yellow"))
-    con.print(Text("As branches ficam. Antes de cada remoção confiro tudo de novo; se algo mudou, ele fica.",
-                   style="dim"))
-    if not Confirm.ask("Remover?", default=False):
-        con.print("[dim]Nada apagado.[/]")
-        return
-
-    done, kept = [], []
-    for w in chosen:
-        try:
-            with con.status(f"Removendo {where(w, root)}…"):
-                remove_worktree(w, days, root)
-        except (OSError, RuntimeError) as exc:
-            kept.append((w, str(exc)))
-            con.print(Text(f"  ↷ {where(w, root)}: mantido, {exc}", style="yellow"))
-            continue
-        done.append(w)
-        con.print(Text(f"  ✔ {where(w, root)} removido", style="green"))
-    msg = Text.assemble((f"✔ {n_worktrees(len(done))} removido{'s' if len(done) != 1 else ''}", "bold green"),
-                        f" · {fmt(sum(w.size for w in done))} · livre agora: "
-                        f"{fmt(shutil.disk_usage(DATA_VOLUME).free)}")
-    if kept:
-        msg.append(f"\n↷ {n_worktrees(len(kept))} mantido{'s' if len(kept) != 1 else ''} porque algo mudou "
-                   "desde a análise (motivo acima)", style="yellow")
-    if done:
-        w = done[0]
-        msg.append(f"\nPara recriar um: git -C {short(w.repo)} worktree add {short(w.path)} {branch_name(w)}",
-                   style="dim")
-    con.print(Panel(msg, border_style="green" if done else "yellow", padding=(0, 2)))
-
-
-def selection_numbers(raw: str, total: int, everything: set[int] | None = None) -> set[int]:
-    """'a' = `everything` (padrão: todos); '1,3,5-7' = esses. Números fora da lista são ignorados."""
-    chosen: set[int] = set()
-    for tok in re.split(r"[,\s]+", raw.strip().lower()):
-        if tok == "a":
-            chosen |= set(range(1, total + 1)) if everything is None else everything
-        elif m := re.fullmatch(r"(\d+)-(\d+)", tok):
-            # limitado à lista: "1-99999999999" não cria bilhões de números
-            chosen |= set(range(max(1, int(m.group(1))), min(total, int(m.group(2))) + 1))
-        elif tok.isdigit():
-            chosen.add(int(tok))
-    return {n for n in chosen if 1 <= n <= total}
 
 
 def verdict_counts(rows: list[Worktree]) -> dict[str, tuple[int, int]]:
@@ -2032,7 +1950,7 @@ def remove_worktrees(rows: list[Worktree], scope: Path) -> None:
 
 
 def worktree_item(rows: list[Worktree], root: Path) -> Item | None:
-    """Os 🟢 viram um Item só no relatório principal e no --clean."""
+    """Os 🟢 viram um Item só no relatório principal (a tela usa `worktree_items`, um por worktree)."""
     safe = safe_worktrees(rows)
     if not safe:
         return None
@@ -2774,12 +2692,12 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
 
 
 def rollback_rows(rollbacks: list[Rollback]) -> list[tuple[str, int, Risk, str]]:
-    """Cada ponto de volta numa linha própria, com o mesmo risco e a mesma dica do --clean."""
+    """Cada ponto de volta numa linha própria, com o mesmo risco e a mesma dica da tela."""
     return [(f"Ponto de volta {rb.img['name']}", rb.size, rb.risk, rb.hint) for rb in rollbacks]
 
 
 def stopped_rows(stopped: list[dict]) -> list[tuple[str, int, Risk, str]]:
-    """Containers parados com o mesmo risco do --clean: os antigos 🟢 e o resto pelo pior risco."""
+    """Containers parados com o mesmo risco da tela: os antigos 🟢 e o resto pelo pior risco."""
     old = [c for c in stopped if is_old_stopped(c)]
     rest = [c for c in stopped if not is_old_stopped(c)]
     rows = []
@@ -2789,7 +2707,7 @@ def stopped_rows(stopped: list[dict]) -> list[tuple[str, int, Risk, str]]:
     if rest:
         risk = max((stopped_risk(c) for c in rest), key=lambda r: r.rank)
         rows.append((f"Outros containers parados ({len(rest)})", sum(c["size"] for c in rest), risk,
-                     "recentes ou de projeto rodando; veja um por um no --clean"))
+                     "recentes ou de projeto rodando; veja um por um na aba Disco do hogs"))
     return rows
 
 
@@ -3039,7 +2957,7 @@ def recommended_panel(s: Snapshot, cleanable: list[Item], trim_off: bool | None 
             ("🐳 Pontos de volta recentes", rollbacks, f"{RECENT_ROLLBACK}: {names}")):
         if sel:
             t.add_row(f"{title} ({len(sel)})", fmt(sum(i.size for i in sel)), Text(EVAL.icon),
-                      f"{why} · um por um no hogs --clean")
+                      f"{why} · marque um por um na tela do hogs")
     body: list = [t] if t.row_count else [Text("Nada recomendado agora. 🎉", style="green")]
     if not s.mounts_known:
         body.append(Text("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.",
@@ -3108,8 +3026,8 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
                          (f"🟡 {fmt(redown)} que baixam de novo", "bold yellow"))
     if trim_off:
         line.append(f"  ({TRIM_OFF_NOTE})", style="yellow")
-    line.append_text(Text.assemble("\n", ("Rode ", "dim"), ("hogs --clean", "bold cyan"),
-                                   (" pra escolher o que apagar.", "dim")))
+    line.append_text(Text.assemble("\n", ("Rode ", "dim"), ("hogs", "bold cyan"),
+                                   (" num terminal para escolher o que apagar.", "dim")))
     con.print(Panel(line, border_style="green", padding=(0, 2)))
 
 
@@ -3119,66 +3037,6 @@ def clean_items(s: Snapshot) -> list[Item]:
     items = docker_clean_items(s.docker) + [i for i in s.items if i.action]
     items = [i for i in items if i.size >= 1e6 or i.cat == "worktree"]
     return sorted(items, key=lambda i: (i.risk.rank, -i.size))
-
-
-def parse_selection(raw: str, items: list[Item]) -> list[Item]:
-    """Como selection_numbers, mas 'a' são só os 🟢."""
-    safe = {n for n, i in enumerate(items, 1) if i.risk is SAFE}
-    return [items[n - 1] for n in sorted(selection_numbers(raw, len(items), safe))]
-
-
-def clean(con: Console, s: Snapshot) -> None:
-    items = clean_items(s)
-    if not items:
-        con.print("[green]Nada pra limpar. 🎉[/]")
-        return
-
-    t = Table(title="🧹 O que dá pra apagar", title_justify="left", title_style="bold",
-              box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
-    t.add_column("#", justify="right", style="cyan", no_wrap=True)
-    t.add_column("Item", ratio=4, no_wrap=True, overflow="ellipsis")
-    t.add_column("Tamanho", justify="right", no_wrap=True)
-    t.add_column("Risco", no_wrap=True)
-    t.add_column("Detalhe", style="dim", ratio=3, overflow="ellipsis", no_wrap=True)
-    for n, i in enumerate(items, 1):
-        t.add_row(str(n), i.label, Text(fmt(i.size), style="bold"), risk_text(i.risk), i.hint)
-    con.print(t)
-    con.print("[dim]🟢 seguro · 🟡 volta com download/rebuild · 🔴 perde algo (só se tiver certeza). "
-              "Containers rodando e volumes nunca aparecem aqui.[/]\n")
-
-    raw = Prompt.ask("Quais apagar? [cyan]a[/] = todos 🟢 · ex: [cyan]1,3,5-7[/] · Enter cancela", default="",
-                     show_default=False)
-    chosen = parse_selection(raw, items)
-    if not chosen:
-        con.print("[dim]Nada apagado.[/]")
-        return
-
-    con.print()
-    for i in chosen:
-        con.print(f"  [green]✔[/] {i.label}  [bold]{fmt(i.size)}[/]  {i.risk.icon}")
-    con.print(f"\n  Total: [bold]{fmt(sum(i.size for i in chosen))}[/]")
-    if any(i.risk is LOSS for i in chosen):
-        con.print("  [red]Atenção: tem item 🔴 na lista, ele não volta.[/]")
-    if not Confirm.ask("\nApagar esses itens?", default=False):
-        con.print("[dim]Nada apagado.[/]")
-        return
-
-    def report(i: Item, ok: bool, why: str) -> None:
-        if ok:
-            con.print(f"  [green]✔[/] {i.label}")
-        else:
-            con.print(Text(f"  ↷ {i.label}: {why}", style="yellow"))
-
-    with con.status("Limpando…"):
-        freed = apply_items(chosen, report)
-
-    after = shutil.disk_usage(DATA_VOLUME).free
-    msg = Text.assemble(("Liberado: ", "bold"), (fmt(freed), "bold green"),
-                        f"  ·  livre agora: {fmt(after)}")
-    if any(i.cat == "docker" for i in chosen):
-        msg.append("\nO Docker devolve o espaço do Docker.raw aos poucos; se não mudar, reinicie o Docker Desktop.",
-                   style="dim")
-    con.print(Panel(msg, border_style="green", padding=(0, 2)))
 
 
 # ---------------------------------------------------------------- tela: terminal
@@ -4735,19 +4593,28 @@ def main() -> None:
         sys.exit(130)
 
 
+def interactive() -> bool:
+    """A tela só abre num terminal de verdade: entrada e saída TTY e um TERM que desenha."""
+    return sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb")
+
+
+NEEDS_TTY = "A escolha do que apagar precisa de um terminal interativo."
+
+
 def run() -> None:
     p = argparse.ArgumentParser(
         prog="hogs", description="Mostra quem está comendo seu disco e ajuda a limpar.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="exemplos:\n"
-               "  hogs                          relatório do disco\n"
-               "  hogs --clean                  escolhe o que apagar do relatório\n"
-               "  hogs --worktrees ~/Projetos   worktrees Git: quais dá pra apagar e por quê\n"
-               "  hogs --worktrees ~/Projetos --clean\n"
-               "                                apaga os worktrees 🟢 (todos ou por número)")
+               "  hogs                          abre a tela: o disco, o recomendado e o que dá pra apagar\n"
+               "  hogs --report                 imprime o relatório (fora de um terminal, é o padrão)\n"
+               "  hogs --worktrees ~/Projetos   a tela na aba Worktrees: quais dá pra apagar e por quê\n"
+               "  hogs --worktrees ~/Projetos --report\n"
+               "                                imprime o quadro dos worktrees")
     p.add_argument("--version", action="version", version=f"hogs {__version__}")
-    p.add_argument("--clean", action="store_true",
-                   help="escolhe o que apagar; com --worktrees, só os worktrees seguros (🟢)")
+    p.add_argument("--clean", action="store_true", help="abre a tela para escolher o que apagar (o mesmo que hogs)")
+    p.add_argument("--report", action="store_true", help="imprime o relatório estático, mesmo num terminal")
+    p.add_argument("--no-mouse", action="store_true", help="a tela sem mouse")
     p.add_argument("--worktrees", type=Path, metavar="PASTA",
                    help="acha os worktrees Git em PASTA e diz quais já estão na main e podem ser apagados")
     p.add_argument("--worktree-days", type=int, default=0, metavar="DIAS",
@@ -4775,16 +4642,22 @@ def run() -> None:
         sys.exit("hogs precisa da biblioteca rich:  pip install rich")
 
     con = Console()
+    screen = not args.report and interactive()
     if args.worktrees:
         remember_worktrees_root(args.worktrees)
         with con.status("[bold]🌳 Conferindo worktrees, alterações e sinais de uso…[/]"):
             rows, warnings = gather_worktrees(args.worktrees, args.worktree_days)
         root = args.worktrees.expanduser().resolve()
+        if screen:
+            app = App(None, [], rows, root, args.worktree_days, tab=1, color_system=con.color_system)
+            app.status = " · ".join(warnings)
+            return run_tui(app, not args.no_mouse)
         for warning in warnings:
             con.print(Text(warning, style="yellow"))
         worktrees_report(con, rows, root, args.worktree_days, setting("stale_worktree_days"))
         if args.clean:
-            clean_worktrees(con, rows, args.worktree_days, root)
+            con.print(NEEDS_TTY)
+            sys.exit(2)
         return
     if args.apps:
         with con.status("[bold]🐷 Vendo quais apps você não abre há tempo…[/]", spinner="dots"):
@@ -4795,10 +4668,13 @@ def run() -> None:
     snapshot = gather(con)
     records = history_load()
     record_snapshot(snapshot)
+    if screen:
+        return run_tui(App(snapshot, records, snapshot.worktrees, snapshot.worktrees_root,
+                           color_system=con.color_system), not args.no_mouse)
+    report(con, snapshot, records)
     if args.clean:
-        clean(con, snapshot)
-    else:
-        report(con, snapshot, records)
+        con.print(NEEDS_TTY)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

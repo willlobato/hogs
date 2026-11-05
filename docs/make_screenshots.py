@@ -4,12 +4,14 @@
 """
 import io
 import sys
+import tempfile
 import time
 from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rich.console import Console
+from rich.text import Text
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -178,3 +180,40 @@ with mock.patch.object(h, "load_config", return_value={}), \
     save("report.svg", lambda con: h.report(con, snapshot, records))
 save("apps.svg", lambda con: (con.print(h.apps_table(apps, 7)), con.print(h.apps_footer())))
 save("worktrees.svg", lambda con: h.worktrees_report(con, WORKTREES, DEV))
+
+
+# A tela interativa: cada linha de App.frame() já vem em ANSI; o Console só a grava para virar SVG.
+TUI_W, TUI_H = 120, 40
+
+
+def save_tui(name, app):
+    con = Console(record=True, width=TUI_W, force_terminal=True, color_system="truecolor", file=io.StringIO())
+    for line in app.frame(TUI_W, TUI_H).lines:
+        con.print(Text.from_ansi(line), no_wrap=True, overflow="crop")
+    con.save_svg(str(ROOT / "docs" / name), title="hogs")
+    print("ok", name)
+
+
+def focus(app, group, key):
+    """Abre o grupo `group` da aba atual e põe o cursor na linha `key`."""
+    app.states[app.tab].expanded.add(group)
+    vis = h.visible_rows(app.trees()[app.tab][1], app.states[app.tab].expanded)
+    app.states[app.tab].cursor = [v.row.key for v in vis].index(key)
+
+
+# Pasta de conversas fictícia (vazia), para a coluna Conversa aparecer sem ler o ~/.claude da sua máquina.
+with tempfile.TemporaryDirectory() as fake_claude, \
+        mock.patch.object(h, "load_config", return_value={}), \
+        mock.patch.object(h, "claude_dir", return_value=Path(fake_claude)), \
+        mock.patch.object(h, "claude_retention", return_value=RETENTION), \
+        mock.patch.object(h, "read_json", side_effect=lambda path: FAKE_JSON.get(path, {})), \
+        mock.patch.object(h, "first_seen", side_effect=lambda refs, now: {r: now - 300 * 86400 for r in refs}), \
+        mock.patch.object(h, "process_running", return_value=False), \
+        mock.patch.object(h, "docker_trim_off", return_value=False):
+    app = h.App(snapshot, records, WORKTREES, DEV, color_system="truecolor")
+    app.handle(h.Key("a"))
+    focus(app, "rec/worktree", "worktree|shop-api / shop-api-relatorio")
+    save_tui("tui.svg", app)
+    app = h.App(None, [], WORKTREES, DEV, tab=1, color_system="truecolor")
+    focus(app, f"wt/{DEV / 'shop-api'}", "worktree|shop-api / shop-api-relatorio")
+    save_tui("tui-worktrees.svg", app)

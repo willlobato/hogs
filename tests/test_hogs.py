@@ -253,32 +253,6 @@ class PersonalTest(unittest.TestCase):
         self.assertIn("Lixeira", items[0].hint)
 
 
-class SelectionTest(unittest.TestCase):
-    def setUp(self):
-        risks = [hogs.SAFE, hogs.SAFE, hogs.REDOWN, hogs.LOSS, hogs.REDOWN]
-        self.items = [hogs.Item("x", f"i{n}", 1, r) for n, r in enumerate(risks, 1)]
-
-    def labels(self, raw):
-        return [i.label for i in hogs.parse_selection(raw, self.items)]
-
-    def test_all_safe(self):
-        self.assertEqual(self.labels("a"), ["i1", "i2"])
-
-    def test_ranges_and_lists(self):
-        self.assertEqual(self.labels("1, 3-4"), ["i1", "i3", "i4"])
-        self.assertEqual(self.labels("5 2"), ["i2", "i5"])
-
-    def test_ignores_out_of_range_and_junk(self):
-        self.assertEqual(self.labels("99 x 0"), [])
-        self.assertEqual(self.labels(""), [])
-
-    def test_huge_range_is_clamped_to_the_list(self):
-        start = time.perf_counter()
-        self.assertEqual(self.labels("4-99999999999999"), ["i4", "i5"])
-        self.assertEqual(hogs.selection_numbers("0-99999999999999", 3), {1, 2, 3})
-        self.assertLess(time.perf_counter() - start, 0.5)
-
-
 class ParseGbTest(unittest.TestCase):
     def test_accepts_decimal_comma_and_rejects_non_finite(self):
         self.assertEqual(hogs.parse_gb("2,5", "uso"), 2.5)
@@ -513,16 +487,17 @@ class DockerCleanItemsTest(unittest.TestCase):
     def test_failed_removal_is_reported_not_marked_done(self):
         d = hogs.Docker(running=True)
         d.images = [{"name": "old:t1", "size": 900_000_000, "used": False, "origin": "local", "created": "", "id": "b"}]
-        items = hogs.docker_clean_items(d)
-        con = hogs.Console(file=io.StringIO(), width=200)
+        items = [i for i in hogs.docker_clean_items(d) if i.label == "Imagem old:t1"]
+        self.assertEqual(len(items), 1)
+        got = []
         failing = lambda cmd, timeout=60: subprocess.CompletedProcess(cmd, 1, "", "Error: conflict: image is in use")
-        with mock.patch.object(hogs, "sh", failing), mock.patch.object(hogs, "clean_items", return_value=items), \
-                mock.patch.object(hogs.Prompt, "ask", return_value="1"), \
-                mock.patch.object(hogs.Confirm, "ask", return_value=True):
-            hogs.clean(con, hogs.Snapshot(1, 1, d, [], []))
-        out = con.file.getvalue().split("Total:")[1]
-        self.assertNotIn("✔ Imagem old:t1", out)
-        self.assertIn("↷ Imagem old:t1: Error: conflict: image is in use", out)
+        with mock.patch.object(hogs, "sh", failing):
+            hogs.apply_items(items, lambda i, ok, why: got.append((i.label, ok, why)))
+        self.assertEqual(len(got), 1)
+        label, ok, why = got[0]
+        self.assertEqual(label, "Imagem old:t1")
+        self.assertFalse(ok, "falha nunca vira ✔")
+        self.assertIn("Error: conflict: image is in use", why)
 
     def test_run_all_runs_every_command_and_then_fails(self):
         calls = []
@@ -2063,43 +2038,34 @@ class WorktreeTest(unittest.TestCase):
         out = io.StringIO()
         return hogs.Console(file=out, width=160, force_terminal=False), out
 
-    def test_selection_numbers(self):
-        self.assertEqual(hogs.selection_numbers("a", 3), {1, 2, 3})
-        self.assertEqual(hogs.selection_numbers("1, 3-9", 4), {1, 3, 4})
-        self.assertEqual(hogs.selection_numbers("", 3), set())
-        self.assertEqual(hogs.selection_numbers("0 7 x", 3), set())
-
-    def test_report_numbers_safe_and_summarizes(self):
+    def test_report_marks_safe_and_summarizes(self):
         row = self.inspect()
         con, out = self.console()
         hogs.worktrees_report(con, [row], self.root, 30)
         text = out.getvalue()
-        self.assertIn("seguro · #1", text)
+        self.assertIn("🟢 seguro", text)
+        self.assertNotIn("seguro · #", text)
         self.assertIn("SEGURO PARA APAGAR", text)
-        self.assertIn("--clean", text)
+        self.assertIn(f"Apagar os 🟢: {hogs.hogs_command(self.root, 30)}", text)
+        self.assertNotIn("--clean", text)
 
-    def test_clean_offers_only_safe_confirms_and_keeps_branch(self):
+    def test_worktree_items_offer_only_safe_and_removal_keeps_branch(self):
         self.quiet()
         safe = self.inspect()
         unsafe = hogs.Worktree(self.root / "x", self.repo, blockers=["merge não comprovado em origin/main"])
-        con, out = self.console()
-        with mock.patch.object(hogs.Prompt, "ask", return_value="a"), \
-                mock.patch.object(hogs.Confirm, "ask", return_value=False):
-            hogs.clean_worktrees(con, [safe, unsafe], 30, self.root)
-        self.assertTrue(self.path.exists(), "sem confirmação nada sai")
-        with mock.patch.object(hogs.Prompt, "ask", return_value="a"), \
-                mock.patch.object(hogs.Confirm, "ask", return_value=True):
-            hogs.clean_worktrees(con, [safe, unsafe], 30, self.root)
+        items = hogs.worktree_items([safe, unsafe], self.root, 30)
+        self.assertEqual([i.worktree for i in items], [safe])
+        self.assertIs(items[0].risk, hogs.SAFE)
+        self.assertTrue(self.path.exists(), "montar os itens não apaga nada")
+        got = []
+        hogs.apply_items(items, lambda i, ok, why: got.append((ok, why)))
+        self.assertEqual(got, [(True, "")])
         self.assertFalse(self.path.exists())
-        self.assertIn("1 worktree removido", out.getvalue())
-        self.assertEqual(self.git(self.repo, "rev-parse", "feature"), safe.head)
+        self.assertNotIn(str(self.path), self.git(self.repo, "worktree", "list"))
+        self.assertEqual(self.git(self.repo, "rev-parse", "feature"), safe.head, "a branch fica")
 
-    def test_clean_without_safe_offers_nothing(self):
-        con, out = self.console()
-        with mock.patch.object(hogs.Prompt, "ask") as ask:
-            hogs.clean_worktrees(con, [hogs.Worktree(self.path, self.repo, blockers=["x"])], 30, self.root)
-        ask.assert_not_called()
-        self.assertIn("Nenhum worktree", out.getvalue())
+    def test_worktree_items_without_safe_is_empty(self):
+        self.assertEqual(hogs.worktree_items([hogs.Worktree(self.path, self.repo, blockers=["x"])], self.root, 30), [])
 
     def commit_and_push(self, push=True):
         (self.path / "file.txt").write_text("trabalho sem merge\n")
@@ -2221,18 +2187,10 @@ class WorktreeReportTest(unittest.TestCase):
     def test_table_shows_conversation_pushed_and_new_verdicts(self):
         text = self.text(hogs.worktrees_report, self.rows(), self.DEV, 0, 30)
         for expected in ("Conversa", "● Relatório mensal", "reabra antes de apagar", "✓ enviado (origin/feat/rel)",
-                         "seguro · #1", "a pasta sai, a branch fica", "EM ANDAMENTO",
+                         "🟢 seguro", "a pasta sai, a branch fica", "EM ANDAMENTO",
                          "está sem merge e foi mexido nos últimos 30 dias",
                          "cd /dev/shop-api-relatorio && claude --resume s-123", "Merge e envio conferidos"):
             self.assertIn(expected, text)
-
-    def test_clean_warns_to_reopen_before_confirm(self):
-        with mock.patch.object(hogs.Prompt, "ask", return_value="a"), \
-                mock.patch.object(hogs.Confirm, "ask", return_value=False):
-            text = self.text(hogs.clean_worktrees, self.rows(), 0, self.DEV)
-        self.assertIn("⚠ reabra antes de apagar “Relatório mensal”: "
-                      "cd /dev/shop-api-relatorio && claude --resume s-123", text)
-        self.assertIn("Nada apagado", text)
 
 
 class WorktreeSummaryTest(unittest.TestCase):
@@ -2344,7 +2302,8 @@ class WorktreeTableTest(unittest.TestCase):
                              conversations=[self.link(1, "Título bem comprido para quebrar a coluna", now, live=True)])
         text = self.table([safe, wait, keep])
         self.assertIn("Conversa", text)
-        self.assertIn("🟢 seguro · #1", text)
+        self.assertIn("🟢 seguro", text)
+        self.assertNotIn("#1", text)
         self.assertIn("a pasta sai,", text)
         self.assertIn("enviado", text)
         self.assertIn("(origin/ok)", text)
@@ -3257,6 +3216,118 @@ class AppRulingsTest(unittest.TestCase):
 
 
 # ---- Task 9
+
+class CliTest(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(hogs, "docker_trim_off", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_cli(self, *argv, tty=True, extra=()):
+        with mock.patch.object(sys, "argv", ["hogs", *argv]), mock.patch.object(hogs, "interactive", return_value=tty), \
+                mock.patch.object(hogs, "gather", return_value=hogs.Snapshot(1, 1, hogs.Docker(), [], [])) as gather, \
+                mock.patch.object(hogs, "record_snapshot"), mock.patch.object(hogs, "history_load", return_value=[]), \
+                mock.patch.object(hogs, "run_tui") as tui, mock.patch.object(hogs, "report") as rep, \
+                mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.gather, self.out = gather, out
+            try:
+                hogs.run()
+                code = 0
+            except SystemExit as exc:
+                code = exc.code
+        return tui, rep, code
+
+    def test_terminal_opens_the_screen_and_report_flag_forces_static(self):
+        tui, rep, _ = self.run_cli()
+        tui.assert_called_once()
+        self.assertTrue(tui.call_args[0][1], "mouse ligado por padrão")
+        self.assertEqual(tui.call_args[0][0].tab, 0)
+        rep.assert_not_called()
+        tui, rep, _ = self.run_cli("--report")
+        tui.assert_not_called()
+        rep.assert_called_once()
+        tui, _, _ = self.run_cli("--no-mouse")
+        self.assertFalse(tui.call_args[0][1])
+        tui, rep, code = self.run_cli("--clean")
+        tui.assert_called_once()
+        rep.assert_not_called()
+        self.assertEqual(code, 0)
+
+    def test_without_tty_prints_static_and_clean_explains(self):
+        tui, rep, code = self.run_cli(tty=False)
+        tui.assert_not_called()
+        rep.assert_called_once()
+        self.assertEqual(code, 0)
+        tui, rep, code = self.run_cli("--clean", tty=False)
+        tui.assert_not_called()
+        rep.assert_called_once()
+        self.assertEqual(code, 2)
+        self.assertIn("A escolha do que apagar precisa de um terminal interativo.", self.out.getvalue())
+        _, _, code = self.run_cli("--clean", "--report")
+        self.assertEqual(code, 2)
+
+    def test_worktrees_opens_on_worktrees_tab_without_measuring_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(hogs, "gather_worktrees", return_value=([], ["aviso de teste"])):
+                tui, rep, code = self.run_cli("--worktrees", tmp)
+                app = tui.call_args[0][0]
+                self.assertEqual(app.tab, 1)
+                self.assertIsNone(app.s)
+                self.assertEqual(app.root, Path(tmp).resolve())
+                self.assertIn("aviso de teste", app.status)
+                self.gather.assert_not_called()
+                rep.assert_not_called()
+                with mock.patch.object(hogs, "worktrees_report") as wr:
+                    tui, _, code = self.run_cli("--worktrees", tmp, "--report")
+                tui.assert_not_called()
+                wr.assert_called_once()
+                self.assertEqual(code, 0)
+                with mock.patch.object(hogs, "worktrees_report") as wr:
+                    tui, _, code = self.run_cli("--worktrees", tmp, "--clean", tty=False)
+                tui.assert_not_called()
+                wr.assert_called_once()
+                self.assertEqual(code, 2)
+                self.assertIn("precisa de um terminal interativo", self.out.getvalue())
+
+    def test_interactive_needs_both_ttys_and_a_real_term(self):
+        def check(stdin, stdout, term):
+            env = {} if term is None else {"TERM": term}
+            with mock.patch.object(sys.stdin, "isatty", return_value=stdin), \
+                    mock.patch.object(sys.stdout, "isatty", return_value=stdout), \
+                    mock.patch.dict(os.environ, env, clear=False):
+                if term is None:
+                    os.environ.pop("TERM", None)
+                return hogs.interactive()
+        self.assertTrue(check(True, True, "xterm-256color"))
+        self.assertFalse(check(False, True, "xterm-256color"))
+        self.assertFalse(check(True, False, "xterm-256color"))
+        self.assertFalse(check(True, True, "dumb"))
+        self.assertFalse(check(True, True, ""))
+        self.assertFalse(check(True, True, None))
+
+    def test_no_ui_text_mentions_the_numbered_flow(self):
+        src = Path(hogs.__file__).read_text(encoding="utf-8")
+        for gone in ("Quais apagar?", "um por um no hogs --clean", "um por um no --clean", "Digite a para todos",
+                     "1,3,5-7", "seguro · #"):
+            self.assertFalse(gone in src, gone)
+        for name in ("clean", "clean_worktrees", "parse_selection", "selection_numbers"):
+            self.assertFalse(hasattr(hogs, name), name)
+        self.assertFalse(hasattr(hogs, "Prompt"))
+        self.assertFalse(hasattr(hogs, "Confirm"))
+
+    def test_static_report_footer_points_to_the_screen(self):
+        con = hogs.Console(file=io.StringIO(), width=160)
+        s = hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(), [], [])
+        with mock.patch.object(hogs, "claude_retention", return_value=None):
+            hogs.report(con, s, [])
+        text = con.file.getvalue()
+        self.assertIn("Rode hogs num terminal para escolher o que apagar.", text)
+        self.assertNotIn("--clean", text)
+
+    def test_version_is_0_6_0_in_both_places(self):
+        self.assertEqual(hogs.__version__, "0.6.0")
+        toml = (Path(hogs.__file__).parent / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('version = "0.6.0"', toml)
 
 
 if __name__ == "__main__":

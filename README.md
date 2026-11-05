@@ -9,7 +9,7 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-<img src="docs/report.svg" alt="Relatório do hogs no terminal" width="900">
+<img src="docs/tui.svg" alt="Tela interativa do hogs com dados fictícios" width="900">
 
 </div>
 
@@ -25,7 +25,7 @@ O `hogs` responde em uns 20 segundos:
 
 - **pra onde foi o espaço**, numa barra parecida com a do macOS mas separada em partes com nome: Docker, caches de dev, apps, projetos, macOS e swap, outras pastas e o que sobra sem identificar;
 - **o que dá pra apagar sem medo**, com uma etiqueta de risco em cada item e um resumo do que é recomendado agora;
-- **e apaga pra você**, só o que você escolher, nunca o que está em uso;
+- **e apaga pra você**, numa tela com teclado e mouse: você marca, confere a lista e confirma; nunca o que está em uso;
 - **o que está crescendo**, comparando com os dias anteriores;
 - **e impede que o Docker volte a inchar**, limitando o cache de build sozinho.
 
@@ -61,11 +61,13 @@ Confira com `hogs --version`.
 
 | Comando | O que faz |
 |---|---|
-| `hogs` | Relatório completo: disco por partes, o que é recomendado agora, o que o hogs não mexe, Docker, caches de dev, apps e o que mais estiver grande |
-| `hogs --clean` | Lista o que dá pra apagar e apaga só o que você escolher |
-| `hogs --worktrees PASTA` | Quadro por projeto: quem usa cada worktree, quando mudou, merge, envio, conversa do Claude Code e se é seguro apagar; a pasta fica lembrada para o relatório principal |
-| `hogs --worktrees PASTA --clean` | Escolhe worktrees candidatos e confirma a remoção, preservando branches |
+| `hogs` | Num terminal, abre a [tela interativa](#tela-interativa): disco por partes, o que é recomendado agora, worktrees, Docker e tudo o que dá pra apagar, para marcar e apagar. Fora de um terminal (saída redirecionada, agente), imprime o relatório |
+| `hogs --report` | Imprime o relatório estático, mesmo num terminal: disco por partes, o que é recomendado agora, o que o hogs não mexe, Docker, caches de dev, apps e o que mais estiver grande |
+| `hogs --worktrees PASTA` | Abre a tela na aba Worktrees, só com os worktrees Git de PASTA (sem medir o disco); a pasta fica lembrada para o relatório principal |
+| `hogs --worktrees PASTA --report` | Imprime o quadro por projeto: quem usa cada worktree, quando mudou, merge, envio, conversa do Claude Code e se é seguro apagar |
 | `hogs --worktrees PASTA --worktree-days 3` | Só considera seguro o que está há 3 dias sem mudança (padrão: sem mínimo) |
+| `hogs --no-mouse` | A tela sem mouse (só teclado) |
+| `hogs --clean` | O mesmo que `hogs`: abre a tela para escolher o que apagar. Fora de um terminal, imprime o relatório e avisa que a escolha precisa de um terminal (sai com código 2) |
 | `hogs --apps [N]` | Os N apps que você menos usa (padrão: 20) |
 | `hogs --docker-gc 20` | Mantém o cache de build de cada builder abaixo de 20 GB, conferindo de hora em hora |
 | `hogs --docker-gc off` | Desliga o limite do cache de build |
@@ -74,14 +76,60 @@ Confira com `hogs --version`.
 | `hogs --alert off` | Desliga o aviso |
 | `hogs --alert test` | Manda uma notificação de exemplo |
 
+### Tela interativa
+
+Num terminal, `hogs` abre uma tela com quatro abas. Nada vem marcado: você marca o que quer apagar, tecla
+Enter, confere a lista e confirma com `s`.
+
+- **✨ Recomendado:** a barra do disco, o histórico e só os itens 🟢, agrupados por bloco (os worktrees 🟢
+  entram um por um no grupo 🌳); as ações do macOS (↻) e, à parte, os 🟡 para avaliar. Embaixo, o 🔎 diz
+  por que cada item é seguro, e o 🛡 o que o hogs não mexe.
+- **🌳 Worktrees:** um grupo por projeto, com tamanho, quando mudou, merge, quem usa, conversa e veredito
+  de cada worktree. `f` filtra por veredito.
+- **🐳 Docker:** cache e sobras de build, pontos de volta, containers parados, todas as imagens (`f` filtra:
+  em uso, sem uso, construídas aqui) e, só como informação, os containers rodando e os volumes.
+- **💾 Disco:** todos os itens por bloco (Docker, caches de dev, apps e dados, worktrees, macOS e swap,
+  outros grandes), com qualquer risco: é aqui que ficam os 🟡 e os 🔴.
+
+<img src="docs/tui-worktrees.svg" alt="Aba Worktrees da tela interativa, com dados fictícios" width="900">
+
+| Tecla | O que faz |
+|---|---|
+| ↑ ↓ | move o cursor (PgUp/PgDn, Home/End também) |
+| → ← | abre e fecha um grupo |
+| espaço | marca ou desmarca; num grupo, só os 🟢 dele (🟡 e 🔴 só um por um) |
+| `a` | marca todos os 🟢 da aba |
+| Enter | mostra a lista do que vai sair, o total e os avisos; `s` apaga, `n` ou Esc volta |
+| `c` | copia o comando de reabrir a conversa do Claude Code, ou o caminho |
+| `o` | mostra a pasta no Finder |
+| `r` | reabre a conversa do Claude Code ligada ao worktree (`claude --resume`) |
+| `e` | explora: leva à aba Disco, no bloco do item em foco |
+| `f` | troca o filtro (abas Worktrees e Docker) |
+| `1`–`4`, Tab | troca de aba |
+| `?` | ajuda |
+| `q` | sai (Esc e Ctrl-C também) |
+
+**Mouse:** clique numa linha leva o foco até ela; clique na caixinha `[ ]` marca; clique numa aba troca de
+aba; a rodinha rola. Para selecionar texto com o mouse ligado, segure Option enquanto arrasta (iTerm2).
+`hogs --no-mouse` desliga o mouse.
+
+Na hora de apagar, cada item é conferido de novo (app aberto, worktree mexido, comando que falha): o que
+saiu aparece com ✔ e some da tela; o que ficou aparece com ↷ e o motivo, e continua na lista. Os números do
+topo são os da última medição: rode `hogs` de novo para medir. A tela nunca abre sem um terminal de verdade
+e, ao sair (inclusive por erro ou Ctrl-C), o terminal volta ao normal.
+
 ### O que o relatório mostra
+
+O relatório estático (`hogs --report`, ou `hogs` fora de um terminal) traz os mesmos blocos, sem interação.
+
+<img src="docs/report.svg" alt="Relatório do hogs no terminal" width="900">
 
 - **🐷 Barra do disco:** o usado em partes (Docker, worktrees, caches de dev, apps e dados, projetos, macOS e swap, outras pastas, não identificado) e o livre, sem contar nada duas vezes: a soma das partes é o usado. **Worktrees** sai de dentro de **Projetos** (a pasta `worktrees_root`), não se soma a ela. **macOS e swap** são os volumes do sistema (System, Preboot, VM com o swap…), lidos do `diskutil`. Ao lado do livre, quanto ficaria livre **com o recomendado**.
 - **🌳 Worktrees:** logo abaixo da barra, quantos worktrees há na pasta dos projetos, quanto ocupam, quantos podem sair, quantos estão em andamento e quantos têm trabalho só ali, com o comando do quadro detalhado. Precisa de `worktrees_root`: rode `hogs --worktrees PASTA` uma vez e a pasta fica lembrada; até lá, a linha diz isso.
 - **✨ Recomendado agora:** só os itens 🟢, agrupados por bloco (os worktrees 🟢 entram como um grupo 🌳, com quantos estão na main, quantos são enviados e parados e quantas conversas reabrir antes); as ações do macOS que liberam espaço (↻ reiniciar quando o swap está alto e o Mac ligado há muitos dias, ↻ aplicar uma atualização já baixada), que o hogs só recomenda; e linhas à parte com os arquivos parados e os pontos de volta recentes (cada um pelo nome), para você avaliar. Se um item 🟢 depende de fechar um app, o motivo aparece ali.
 - **🛡 Não mexo:** o que fica protegido: containers rodando e as imagens deles, volumes do Docker, pastas montadas por containers e, com `worktrees_root`, quantos worktrees estão em andamento ou com trabalho só aqui.
 - **📈 O que mais cresceu:** comparado com o relatório de ontem, mais a variação das últimas 24h e uma minicurva dos últimos 7 dias do espaço livre e do Docker.
-- **🐳 Docker:** tamanho real do `Docker.raw` e o limite configurado. Também imagens em uso, imagens sem uso (separando as que voltam com `docker pull` das que foram construídas na sua máquina), imagens sem tag, pontos de volta (cada um na sua linha, com o mesmo risco do `--clean`), cache de build (inclusive o de builders `buildx` que rodam em container), containers parados, volumes, e o espaço que a VM do Docker ocupa sem contabilizar.
+- **🐳 Docker:** tamanho real do `Docker.raw` e o limite configurado. Também imagens em uso, imagens sem uso (separando as que voltam com `docker pull` das que foram construídas na sua máquina), imagens sem tag, pontos de volta (cada um na sua linha, com o mesmo risco da tela), cache de build (inclusive o de builders `buildx` que rodam em container), containers parados, volumes, e o espaço que a VM do Docker ocupa sem contabilizar.
 - **🛡 Prevenção:** se o cache de build tem limite, se a limpeza automática do Docker vale pro builder que você usa de verdade, se o TRIM está ligado e o teto do disco do Docker. Também por quanto tempo o Claude Code guarda as conversas (`cleanupPeriodDays` em `~/.claude/settings.json`, ou na pasta de `CLAUDE_CONFIG_DIR` se definida; 30 dias se não estiver definido): o hogs recomenda aumentar, mas nunca altera o arquivo.
 - **🧰 Caches de dev:** npm, Yarn, pnpm, pip, Homebrew, Maven, Gradle, Go, Cargo, JetBrains, VS Code, Xcode, Playwright, Ollama, nvm, pyenv, SDKMAN e simuladores iOS.
 - **📦 Apps e dados:** WhatsApp, Chrome, Teams, a VM do Claude (Cowork), backups do iPhone, Downloads, Lixeira e `/Applications`. Também as cópias antigas que alguns apps (como o Chrome) deixam em pastas `*.code_sign_clone` depois de atualizar, e arquivos grandes (500 MB+) na Mesa, Documentos, Downloads e Imagens sem abrir há mais de 6 meses (🟡 para avaliar: vão para a Lixeira).
@@ -100,17 +148,7 @@ Cada item tem uma etiqueta de risco:
 | 🔴 **perde algo** | Não volta sozinho, só apague se tiver certeza | imagens Docker construídas localmente |
 | ⚪ **só informação** | O hogs mostra, mas não apaga | volumes, WhatsApp, Downloads, apps |
 
-```text
-$ hogs --clean
- #  Item                                   Tamanho  Risco
- 1  Docker: cache de build                 21,7 GB  🟢 seguro
- 2  npm                                     4,2 GB  🟢 seguro
- 3  Imagem registry.gitlab.com/acme/…       6,8 GB  🟡 baixa de novo
- …
-Quais apagar? a = todos 🟢 · ex: 1,3,5-7 · Enter cancela: a
-```
-
-Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de apagar, o hogs mostra o resumo e pede confirmação. No fim, diz quanto liberou.
+Na [tela](#tela-interativa), nada vem marcado. `a` marca só os 🟢; os 🟡 e os 🔴 você marca um por um. Enter mostra o que vai sair, o total e um aviso se houver item 🔴; só `s` apaga. No fim, o hogs diz quanto liberou.
 
 **Garantias:**
 
@@ -119,7 +157,7 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - 🛡️ Um container parado de um projeto `docker compose` que ainda tem algo rodando nunca entra no grupo “seguro”.
 - 🛡️ Um container cuja idade o Docker não informa nunca conta como “parado há +30 dias”; um que nunca foi iniciado conta a partir da criação.
 - 🛡️ Imagem sem tag baixada por digest (`postgres@sha256:…`) é removida pelo digest, nunca por `docker rmi postgres` (que seria a `postgres:latest`).
-- Se um comando de limpeza falha, o item aparece como mantido, com a mensagem de erro, e não como apagado.
+- Se um comando de limpeza falha, ou algo mudou entre marcar e confirmar (app aberto, worktree mexido), o item aparece como mantido (↷), com o motivo, e não como apagado.
 - 🛡️ Imagens construídas localmente aparecem uma por uma, nunca em grupo.
 - 🛡️ Pontos de volta de imagens (`antes-*`, `backup-*`…) só viram 🟢 depois de `rollback_days` dias (padrão 2, configurável), contados a partir do sinal mais recente; antes disso ficam 🟡 para avaliar.
 - 🛡️ Se a imagem atual foi construída com as etiquetas OCI de commit e origem (`docker build --label org.opencontainers.image.revision=$(git rev-parse HEAD) --label org.opencontainers.image.source=https://github.com/acme/shop-api .`) e o commit da imagem atual já está na branch padrão de um clone em `worktrees_root`, a do remoto que bate com a etiqueta de origem (`<remoto>/HEAD`, senão `<remoto>/main` ou `<remoto>/master`), os pontos de volta dela ficam 🟢 na hora, mesmo os recentes. A revisão precisa ser o SHA de um commit: uma tag ou branch local com nome hexadecimal não vale. A checagem é local (nunca faz `git fetch`); sem etiquetas, sem `worktrees_root` ou sem clone, vale o prazo de `rollback_days`.
@@ -130,13 +168,14 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - 🛡️ Cópias antigas de apps só saem com o app fechado, e só as de versões diferentes da instalada. O app conta como aberto se o nome do executável, o nome cortado pelo macOS ou o caminho dele aparecer nos processos.
 - 🛡️ Reiniciar o Mac e aplicar atualizações do macOS são só recomendações: o hogs nunca executa essas ações e elas nunca entram na limpeza nem no “com o recomendado”.
 - O “com o recomendado” soma só os itens 🟢; os 🟡 para avaliar ficam de fora. Com o TRIM do Docker desligado, o que se apaga no Docker não volta ao macOS: ele fica fora da conta e o cabeçalho avisa.
-- Nada é apagado sem você confirmar.
+- Nada vem marcado ao abrir a tela, `a` marca só os 🟢 e nada é apagado sem você ver a lista e confirmar com `s`.
+- 🛡️ Containers rodando e volumes aparecem na aba Docker só como informação, sem caixinha. As ações do macOS (↻) também nunca têm caixinha.
 
 ## Worktrees Git
 
 ```bash
-hogs --worktrees ~/Development
-hogs --worktrees ~/Development --clean
+hogs --worktrees ~/Development            # a tela, na aba Worktrees
+hogs --worktrees ~/Development --report   # o quadro abaixo
 ```
 
 <img src="docs/worktrees.svg" alt="Análise de worktrees com dados fictícios" width="900">
@@ -159,11 +198,10 @@ processos como `node ×3`, containers), a **conversa** do Claude Code ligada a e
 Por último vem o **resumo**: quantos são 🟢 e por quê, quais sessões abertas trabalharam neles, o que
 falta para os 🟡, por que cada grupo ⚪ fica, e o que fazer, com o comando pronto.
 
-Cada 🟢 recebe um número (`#1`, `#2`…). Com `--clean`, só os 🟢 são oferecidos, com os mesmos números
-e a sessão que trabalhou em cada um: digite `a` para apagar todos de uma vez ou os números para
-escolher (`1,3,5-7`). Ele mostra o que vai sair e o total, pede confirmação (padrão: não) e confere
-tudo de novo antes de cada remoção. O que mudou desde a análise fica, com o motivo. No fim, mostra
-como recriar um worktree removido.
+Para apagar, abra a tela (`hogs --worktrees PASTA` ou `hogs`, num terminal): na aba Worktrees, só os 🟢
+têm caixinha. Marque com espaço (`a` marca todos os 🟢), tecle Enter para ver o que vai sair, o total e as
+conversas para reabrir antes, e confirme com `s`. Cada worktree é conferido de novo na hora da remoção; o
+que mudou desde a análise fica, com o motivo.
 
 Um worktree 🟢 precisa passar por **todas** as condições:
 
