@@ -1331,8 +1331,8 @@ class WorktreeTest(unittest.TestCase):
     def git(self, path, *args):
         return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True, text=True).stdout.strip()
 
-    def age(self):
-        old = time.time() - 90 * 86400
+    def age(self, days=90):
+        old = time.time() - days * 86400
         gd = Path(self.git(self.path, "rev-parse", "--absolute-git-dir"))
         for base in (self.path, gd):
             for root, dirs, files in os.walk(base):
@@ -1656,6 +1656,82 @@ class WorktreeTest(unittest.TestCase):
             hogs.clean_worktrees(con, [hogs.Worktree(self.path, self.repo, blockers=["x"])], 30, self.root)
         ask.assert_not_called()
         self.assertIn("Nenhum worktree", out.getvalue())
+
+    def commit_and_push(self, push=True):
+        (self.path / "file.txt").write_text("trabalho sem merge\n")
+        self.git(self.path, "commit", "-am", "work")
+        if push:
+            self.git(self.path, "update-ref", "refs/remotes/origin/feature", "HEAD")
+        self.age()
+
+    def link(self, days_ago, inside=False):
+        from types import SimpleNamespace
+        c = SimpleNamespace(session="s9", title="Rascunho do checkout", start=str(self.path) if inside else "/x",
+                            last=time.time() - days_ago * 86400, live=False)
+        return [SimpleNamespace(conv=c, how="dentro" if inside else "citou", reopen=inside)]
+
+    def test_stale_unmerged_pushed_is_safe_and_removal_keeps_branch(self):
+        self.commit_and_push()
+        row = self.inspect(days=0)
+        self.assertTrue(row.eligible, row.reason)
+        self.assertEqual((row.merged, row.pushed), ("", "origin/feature"))
+        self.assertIn("a branch fica", row.reason)
+        self.assertTrue(all(ok for ok, _ in row.checks))
+        self.assertIn("enviado a origin/feature (conferido nas referências locais de origin)", [t for _, t in row.checks])
+        self.quiet()
+        hogs.remove_worktree(row, 0)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.git(self.repo, "rev-parse", "feature"), row.head)
+
+    def test_unpushed_dirty_or_protected_is_kept_at_any_age(self):
+        self.commit_and_push(push=False)
+        row = self.inspect(days=0)
+        self.assertEqual(row.verdict, "manter")
+        self.assertIn("não enviados", row.reason)
+        self.git(self.path, "update-ref", "refs/remotes/origin/feature", "HEAD")
+        for name in ("file.txt", ".env"):
+            (self.path / name).write_text("só aqui\n")
+            self.age()
+            self.assertEqual(self.inspect(days=0).verdict, "manter", name)
+            self.git(self.path, "checkout", "--", "file.txt")
+            (self.path / ".env").unlink(missing_ok=True)
+
+    def test_unmerged_recent_conversation_or_running_is_in_progress(self):
+        self.commit_and_push()
+        os.utime(self.path / "file.txt", None)
+        self.assertTrue(self.inspect(days=0).reason.startswith("sem merge, mexido"))
+        self.age()
+        row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=self.link(2))
+        self.assertEqual(row.verdict, "depois")
+        self.assertTrue(row.reason.startswith("conversa do Claude Code"))
+        self.assertTrue(hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=self.link(40)).eligible)
+        cited = hogs.Agents(mentions={self.path: {"Claude Code apps-1"}})
+        self.assertEqual(self.inspect(agents=cited, days=0).verdict, "depois")
+        self.assertEqual(self.inspect(([(self.path / "file.txt", "vim (pid 1)")], "", []), days=0).verdict, "depois")
+
+    def test_stale_window_is_a_parameter_and_conversation_error_blocks_only_unmerged(self):
+        self.commit_and_push()
+        self.age(20)
+        args = (self.w, 0, ([], "", []), hogs.Agents())
+        self.assertEqual(hogs.inspect_worktree(*args, stale_days=30).verdict, "depois")
+        self.assertTrue(hogs.inspect_worktree(*args, stale_days=10).eligible)
+        self.assertEqual(hogs.inspect_worktree(*args, conv_error="falhou", stale_days=10).verdict, "manter")
+
+    def test_merged_ignores_conversations_and_stale_window(self):
+        row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=self.link(0, inside=True),
+                                    conv_error="falhou")
+        self.assertTrue(row.eligible, row.reason)
+        self.assertEqual(len(row.conversations), 1)
+
+    def test_pushed_ref_prefers_own_branch_and_ignores_head(self):
+        self.commit_and_push()
+        head = self.git(self.path, "rev-parse", "HEAD")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/aaa", head)
+        self.assertEqual(hogs.pushed_ref(self.path, head, "refs/heads/feature"), "origin/feature")
+        self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/feature")
+        self.assertEqual(hogs.pushed_ref(self.path, head, "refs/heads/feature"), "origin/aaa")
+        self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/aaa")
+        self.assertEqual(hogs.pushed_ref(self.path, head, "refs/heads/feature"), "")
 
 if __name__ == "__main__":
     unittest.main()
