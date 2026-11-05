@@ -29,6 +29,8 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
   transcripts, recent Codex) are shown by name but do not block: the author decided merged + clean is
   enough, since nothing is lost.
 - macOS advice (restart, apply update) is text only: never executed, never an `Item`.
+- "com o recomendado" and "✨ Recomendado agora" count only 🟢 (`SAFE`) `clean_items`; ↻ advice and 🟡 `EVAL`
+  are listed apart and never add to it. `breakdown()` parts never exceed the used space (no double counting).
 - App code-sign clones (`*.code_sign_clone`) are offered only for versions different from the installed app's,
   only while the app is closed, sized as one copy per old version; unknown installed version → nothing offered.
 
