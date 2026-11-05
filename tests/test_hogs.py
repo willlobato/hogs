@@ -25,6 +25,10 @@ def setUpModule():
             p = mock.patch.object(hogs, name, value)
             p.start()
             unittest.addModuleCleanup(p.stop)
+    env = mock.patch.dict(os.environ)          # CLAUDE_CONFIG_DIR real nunca vaza para os testes
+    env.start()
+    unittest.addModuleCleanup(env.stop)
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
 
 class SettingTest(unittest.TestCase):
@@ -661,6 +665,7 @@ class OciRollbackTest(unittest.TestCase):
         self.repo.mkdir()
         g = lambda *a: subprocess.run(["git", "-C", str(self.repo), *a], check=True, capture_output=True,
                                       text=True).stdout.strip()
+        self.g = g
         for args in (("init", "-b", "main"), ("config", "user.name", "T"), ("config", "user.email", "t@example.invalid"),
                      ("config", "commit.gpgsign", "false"), ("remote", "add", "origin", "git@github.com:Acme/shop-api.git"),
                      ("commit", "--allow-empty", "-m", "a")):
@@ -691,8 +696,8 @@ class OciRollbackTest(unittest.TestCase):
 
     def test_commit_on_main_makes_recent_rollback_safe(self):
         d = self.docker({hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: self.SRC})
-        self.assertEqual(self.released(d), {"shop-api:latest"})
-        d.released = {"shop-api:latest"}
+        self.assertEqual(self.released(d), {"shop-api:latest": "main"})
+        d.released = {"shop-api:latest": "main"}
         with mock.patch.object(hogs, "first_seen", return_value={"shop-api:antes-x": time.time()}), \
                 mock.patch.object(hogs, "load_config", return_value={}):
             item = {i.label: i for i in hogs.docker_clean_items(d)}["Ponto de volta shop-api:antes-x"]
@@ -701,16 +706,47 @@ class OciRollbackTest(unittest.TestCase):
 
     def test_off_main_unknown_bad_or_other_source_falls_back(self):
         for rev in (self.off_main, "f" * 40, "--output=/tmp/x", ""):
-            self.assertEqual(self.released(self.docker({hogs.OCI_REVISION: rev, hogs.OCI_SOURCE: self.SRC})), set(), rev)
+            self.assertEqual(self.released(self.docker({hogs.OCI_REVISION: rev, hogs.OCI_SOURCE: self.SRC})), {}, rev)
         other = {hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: "https://github.com/acme/outro"}
-        self.assertEqual(self.released(self.docker(other)), set())
+        self.assertEqual(self.released(self.docker(other)), {})
 
     def test_without_labels_or_repos_no_git_call(self):
         with mock.patch.object(hogs, "git_at") as git:
-            self.assertEqual(self.released(self.docker({})), set())
+            self.assertEqual(self.released(self.docker({})), {})
             ok = {hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: self.SRC}
-            self.assertEqual(self.released(self.docker(ok), repos=[]), set())
+            self.assertEqual(self.released(self.docker(ok), repos=[]), {})
         git.assert_not_called()
+
+    def test_matching_remote_other_than_origin_uses_its_own_default_branch(self):
+        # G3: o clone casa pelo `upstream`; `origin` é outro repositório e a main dele não tem o commit
+        self.g("remote", "set-url", "origin", "git@github.com:acme/outro.git")
+        self.g("remote", "add", "upstream", self.SRC)
+        self.g("update-ref", "refs/remotes/upstream/main", self.off_main)
+        d = self.docker({hogs.OCI_REVISION: self.off_main, hogs.OCI_SOURCE: self.SRC})
+        self.assertEqual(self.released(d), {"shop-api:latest": "main"})
+        self.g("update-ref", "refs/remotes/upstream/develop", self.off_main)
+        self.g("update-ref", "-d", "refs/remotes/upstream/main")
+        self.g("symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/develop")
+        self.assertEqual(self.released(d), {"shop-api:latest": "develop"})
+        # G9: a dica diz a branch padrão de verdade, não "main" fixo
+        d.released = self.released(d)
+        with mock.patch.object(hogs, "first_seen", return_value={"shop-api:antes-x": time.time()}), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            item = {i.label: i for i in hogs.docker_clean_items(d)}["Ponto de volta shop-api:antes-x"]
+        self.assertEqual(item.hint, "o commit da shop-api:latest já está na develop")
+        self.g("update-ref", "-d", "refs/remotes/upstream/develop")
+        self.assertEqual(self.released(d), {}, "HEAD do remoto apontando para o nada: não libera")
+
+    def test_hex_named_ref_is_not_taken_for_a_commit(self):
+        # G4: uma tag ou branch local com nome hexadecimal não pode se passar pelo commit da etiqueta
+        for kind, name in (("tag", "deadbee"), ("branch", "cafe1234")):
+            with self.subTest(kind=kind):
+                self.assertNotEqual(self.g("rev-parse", "HEAD")[:len(name)], name)
+                self.g(kind, name, self.on_main)
+                d = self.docker({hogs.OCI_REVISION: name, hogs.OCI_SOURCE: self.SRC})
+                self.assertEqual(self.released(d), {})
+        d = self.docker({hogs.OCI_REVISION: self.on_main[:7], hogs.OCI_SOURCE: self.SRC})
+        self.assertEqual(self.released(d), {"shop-api:latest": "main"}, "SHA curto de verdade continua valendo")
 
     def test_gather_docker_reads_labels(self):
         img = {"Repository": "shop-api", "Tag": "latest", "ID": "sha256:" + "a" * 64, "UniqueSize": "1GB",
@@ -878,6 +914,8 @@ class BreakdownTest(unittest.TestCase):
         item = hogs.worktree_item([merged, pushed, other], Path("/dev"))
         self.assertEqual(item.hint, "a branch fica · 1 na main · 2 enviados e parados · reabra 1 conversa antes")
         self.assertEqual(hogs.worktree_item([merged], Path("/dev")).hint, "a branch fica · 1 na main")
+        self.assertEqual(hogs.worktree_item([merged, pushed], Path("/dev")).hint,
+                         "a branch fica · 1 na main · 1 enviado e parado · reabra 1 conversa antes")
 
     def test_group_counts_as_recommended(self):
         s = self.snap(92e9, 0, 0)
@@ -1161,21 +1199,33 @@ class BreakdownTest(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         repos = [tmp / "shop-api", tmp / "loja-web"]
         found = mock.Mock(return_value=(repos, []))
-        released = mock.Mock(return_value={"shop-api:latest"})
-        with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released):
+        released = mock.Mock(return_value={"shop-api:latest": "main"})
+        candidate = mock.patch.object(hogs, "oci_candidates", return_value={"shop-api:latest": ("abc1234", "x/y")})
+        with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released), \
+                candidate:
             snap, _ = self._gather(tmp, True, [], {tmp: 20e9})
         found.assert_called_once_with(tmp)
         released.assert_called_once_with(snap.docker, repos)
-        self.assertEqual(snap.docker.released, {"shop-api:latest"})
+        self.assertEqual(snap.docker.released, {"shop-api:latest": "main"})
         for boom in (mock.Mock(side_effect=RuntimeError("git sumiu")), found):
-            with mock.patch.object(hogs, "find_repos", boom), \
+            with mock.patch.object(hogs, "find_repos", boom), candidate, \
                     mock.patch.object(hogs, "released_images", mock.Mock(side_effect=OSError("sem git"))):
                 snap, _ = self._gather(tmp, True, [], {tmp: 20e9})
-            self.assertEqual(snap.docker.released, set())   # o relatório nunca cai: só fica sem a regra
+            self.assertEqual(snap.docker.released, {})   # o relatório nunca cai: só fica sem a regra
+
+    def test_gather_looks_for_repos_only_when_an_image_has_both_oci_labels(self):
+        # G16: sem imagem candidata, nem procura os clones (find_repos varre a pasta dos projetos)
+        tmp = Path(tempfile.mkdtemp())
+        found, released = mock.Mock(return_value=([tmp / "shop-api"], [])), mock.Mock(return_value={})
+        with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released):
+            snap, _ = self._gather(tmp, True, [], {tmp: 20e9})
+        found.assert_not_called()
+        released.assert_not_called()
+        self.assertEqual(snap.docker.released, {})
 
     def test_gather_without_projects_folder_runs_no_git_for_released_images(self):
         tmp = Path(tempfile.mkdtemp())
-        found, released, git = mock.Mock(return_value=([], [])), mock.Mock(return_value={"x"}), mock.Mock()
+        found, released, git = mock.Mock(return_value=([], [])), mock.Mock(return_value={"x": "main"}), mock.Mock()
         sh = mock.Mock(side_effect=hogs.sh)
         with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released), \
                 mock.patch.object(hogs, "git_at", git), mock.patch.object(hogs, "sh", sh):
@@ -1184,7 +1234,7 @@ class BreakdownTest(unittest.TestCase):
         released.assert_not_called()
         git.assert_not_called()
         self.assertFalse([c for c in sh.call_args_list if c.args and c.args[0][:1] == ["git"]])
-        self.assertEqual(snap.docker.released, set())
+        self.assertEqual(snap.docker.released, {})
 
 
 class PreventionTest(unittest.TestCase):
@@ -1436,6 +1486,12 @@ class ConversationTest(unittest.TestCase):
         self.assertIn("shop-api/ção/nota.txt", c.mentions)
         self.assertFalse([m for m in c.mentions if m.startswith("saida")])
 
+    def test_scope_cited_with_other_case_counts(self):
+        # G1: o escopo citado com outra caixa ainda é o escopo (APFS não diferencia maiúsculas)
+        self.write("-dev/s1.jsonl", self.rec("user", content=f"veja {str(self.scope).upper()}/shop-api/x.txt"))
+        [c] = self.scan()[0]
+        self.assertIn("shop-api/x.txt", c.mentions)
+
     def test_reads_only_appended_complete_lines(self):
         p = self.write("-dev/s1.jsonl", self.title("Antigo"))
         self.scan()
@@ -1521,6 +1577,38 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(hogs.resume_command(hogs.Conversation("s2")), "claude --resume s2")
 
 
+class ClaudeDirTest(unittest.TestCase):
+    """G6: o Claude Code respeita CLAUDE_CONFIG_DIR; o hogs lê a mesma pasta (só leitura)."""
+
+    def test_default_is_home_dot_claude(self):
+        self.assertNotIn("CLAUDE_CONFIG_DIR", os.environ)
+        self.assertEqual(hogs.claude_dir(), hogs.HOME / ".claude")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}):
+            self.assertEqual(hogs.claude_dir(), hogs.HOME / ".claude")
+
+    def test_config_dir_is_read_by_every_reader(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name).resolve()
+        cfg = base / "outro-claude"
+        (cfg / "sessions").mkdir(parents=True)
+        (cfg / "projects" / "-dev").mkdir(parents=True)
+        (cfg / "settings.json").write_text('{"cleanupPeriodDays": 400}')
+        (cfg / "sessions" / "1.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": "s-cfg", "name": "apps-1"}))
+        t = cfg / "projects" / "-dev" / "s-cfg.jsonl"
+        t.write_text(json.dumps({"type": "ai-title", "aiTitle": "Pela variável"}) + "\n")
+        before = sorted(str(p) for p in cfg.rglob("*"))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(cfg)}):
+            self.assertEqual(hogs.claude_dir(), cfg)
+            self.assertEqual([d["sessionId"] for d in hogs.live_claude_sessions()[0]], ["s-cfg"])
+            self.assertEqual(hogs.live_claude_transcripts(), ([("apps-1", t)], ""))
+            convs, err = hogs.claude_conversations(base / "dev")
+            self.assertEqual(([c.title for c in convs], [c.live for c in convs], err), (["Pela variável"], [True], ""))
+            self.assertIn(("Claude Code", "-dev"), hogs.agent_activity(7, []).folders)
+            self.assertEqual(hogs.claude_retention()[:2], (True, "Conversas do Claude Code guardadas por 400 dias"))
+        self.assertEqual(sorted(str(p) for p in cfg.rglob("*")), before, "só leitura")
+
+
 class ConversationLinkTest(unittest.TestCase):
     def test_links_by_folder_branch_and_mention(self):
         dev = Path("/dev")
@@ -1547,6 +1635,68 @@ class ConversationLinkTest(unittest.TestCase):
             with self.subTest(mention=mention):
                 links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={mention})], dev, {})
                 self.assertEqual([l.how for l in links[w.path]], ["citou"] if hit else [])
+
+    def test_cwd_through_symlink_or_other_case_links_inside(self):
+        # G1: cwds resolvidos (best-effort) e comparados sem diferenciar maiúsculas (APFS não diferencia)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        real = Path(tmp.name).resolve() / "dev"
+        (real / "shop" / "wt-a" / "src").mkdir(parents=True)
+        alias = Path(tmp.name).resolve() / "atalho"
+        alias.symlink_to(real)
+        w = hogs.Worktree(real / "shop" / "wt-a", real / "shop", branch="refs/heads/feat/x")
+        other_case = str(real / "Shop" / "WT-A")
+        for cwd in (str(alias / "shop" / "wt-a" / "src"), other_case + "/src", other_case):
+            with self.subTest(cwd=cwd):
+                c = hogs.Conversation("s", start=cwd, cwds={cwd})
+                links = hogs.conversation_links([w], [c], real, {})
+                self.assertEqual([(l.how, l.reopen) for l in links[w.path]], [("dentro", True)])
+        for cwd in (str(alias / "shop"), str(real / "SHOP")):
+            with self.subTest(branch_from=cwd):
+                c = hogs.Conversation("b", branches={(cwd, "feat/x")})
+                links = hogs.conversation_links([w], [c], real, {w.repo: [w.repo, w.path]})
+                self.assertEqual([l.how for l in links[w.path]], ["branch"])
+        out = Path(tmp.name).resolve() / "fora"
+        out.mkdir()
+        (real / "shop" / "wt-a" / "leva-pra-fora").symlink_to(out)   # escrito dentro, resolve fora: ainda é dentro
+        c = hogs.Conversation("l", start=str(real / "shop/wt-a/leva-pra-fora"), cwds={str(real / "shop/wt-a/leva-pra-fora")})
+        self.assertEqual([(l.how, l.reopen) for l in hogs.conversation_links([w], [c], real, {})[w.path]],
+                         [("dentro", True)])
+        gone = hogs.Conversation("g", start="/nao/existe/mais", cwds={"/nao/existe/mais", ""})
+        self.assertEqual(hogs.conversation_links([w], [gone], real, {})[w.path], [])
+        self.assertEqual([l.how for l in hogs.conversation_links([w], [hogs.Conversation("n", cwds={str(real / "shop/wt-a-2")})],
+                                                                   real, {})[w.path]], [])
+
+    def test_mention_with_other_case_links(self):
+        dev = Path("/dev")
+        w = hogs.Worktree(dev / "shop/wt-a", dev / "shop", branch="refs/heads/x")
+        for mention, hit in (("Shop/WT-A/src", True), ("SHOP/WT-A", True), ("Shop/WT-A-2", False)):
+            with self.subTest(mention=mention):
+                links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={mention})], dev, {})
+                self.assertEqual([l.how for l in links[w.path]], ["citou"] if hit else [])
+        self.assertEqual(hogs.mention_tails(b"ls /DEV/Shop/WT-A/src", dev), {"Shop/WT-A/src"})
+
+    def test_deep_worktree_matches_by_its_first_levels(self):
+        # G2: menções são cortadas em MENTION_PARTS partes; worktree mais fundo casa pelos primeiros níveis
+        dev = Path("/dev")
+        self.assertEqual(hogs.MENTION_PARTS, 8)
+        for depth in (7, 8, 9, 12):
+            rel = "/".join(f"n{i}" for i in range(depth))
+            w = hogs.Worktree(dev / rel, dev / "n0", branch="refs/heads/x")
+            [mention] = hogs.mention_tails(f"ls {dev}/{rel}/src/a.py".encode(), dev)
+            with self.subTest(depth=depth):
+                links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={mention})], dev, {})
+                self.assertEqual([l.how for l in links[w.path]], ["citou"])
+                sibling = "/".join(f"n{i}" for i in range(depth - 1)) + "/outro"
+                [far] = hogs.mention_tails(f"ls {dev}/{sibling}".encode(), dev)
+                links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={far})], dev, {})
+                # irmão que difere até o 8º nível não casa; depois dele, casa (lado seguro: liga a mais)
+                self.assertEqual([l.how for l in links[w.path]], ["citou"] if depth > 8 else [])
+        a = hogs.Worktree(dev / "/".join(f"n{i}" for i in range(9)), dev / "n0", branch="refs/heads/a")
+        b = hogs.Worktree(dev / ("/".join(f"n{i}" for i in range(8)) + "/b"), dev / "n0", branch="refs/heads/b")
+        links = hogs.conversation_links([a, b], [hogs.Conversation("s", mentions={str(a.path.relative_to(dev))[:23]})],
+                                        dev, {})
+        self.assertEqual(([l.how for l in links[a.path]], [l.how for l in links[b.path]]), (["citou"], ["citou"]))
 
     def test_worktree_outside_scope_links_only_by_folder(self):
         w = hogs.Worktree(Path("/outro/wt"), Path("/outro/repo"), branch="refs/heads/x")
@@ -1617,7 +1767,19 @@ class WorktreeTest(unittest.TestCase):
         self.assertEqual([(l.how, l.reopen) for l in row.conversations], [("dentro", True)])
         new = hogs.Conversation("s2", "Nova", "/x", time.time(), cwds={str(self.path)})
         with mock.patch.object(hogs, "claude_conversations", return_value=([new], "")):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaisesRegex(RuntimeError, "conversa do Claude Code"):
+                hogs.remove_worktree(row, 0, self.root)
+        self.assertTrue(self.path.exists())
+
+    def test_recheck_with_conversations_error_keeps_unmerged(self):
+        # G5: na reconferência, conversas ilegíveis seguram o worktree sem merge
+        self.quiet()
+        self.commit_and_push()
+        row = self.inspect(days=0)
+        self.assertTrue(row.eligible, row.reason)
+        failed = ([], "não foi possível ler as conversas do Claude Code: disco sumiu")
+        with mock.patch.object(hogs, "claude_conversations", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "não foi possível ler as conversas do Claude Code"):
                 hogs.remove_worktree(row, 0, self.root)
         self.assertTrue(self.path.exists())
 
@@ -2115,6 +2277,29 @@ class WorktreeSummaryTest(unittest.TestCase):
         self.assertIn("… mais 2", text)
         self.assertIn("shop-api / w0: cd /dev/shop-api-w0 && claude --resume s-0", text)
 
+    def test_unmerged_paragraph_and_footer_name_the_remote_actually_checked(self):
+        # G7: o texto diz o remoto conferido, não "origin" fixo
+        text = self.summary([self.wt("a", pushed="fork/a", eligible=True)])
+        self.assertIn("com tudo commitado e enviado (conferido nas referências locais de fork)", text)
+        self.assertNotIn("origin", text)
+        text = self.summary([self.wt("a", pushed="fork/a", eligible=True), self.wt("b", pushed="origin/b", eligible=True)])
+        self.assertIn("com tudo commitado e enviado (conferido nas referências remotas locais)", text)
+        self.assertIn("Merge e envio conferidos nas referências remotas locais; rode git fetch", text)
+
+    def test_open_session_wait_has_its_own_category(self):
+        # G8: "conversa aberta do Claude Code" não cai em "tem conversa nos últimos N dias"
+        one = self.wt("a", waits=["conversa aberta do Claude Code: apps-1"])
+        self.assertEqual(hogs.worktree_category(one), "aberta")
+        self.assertIn("• 1 tem uma sessão do Claude Code aberta que trabalha nele", self.summary([one]))
+        two = [self.wt("b", waits=["conversa aberta do Claude Code: apps-1"]),
+               self.wt("c", waits=["conversa aberta do Claude Code: apps-2"])]
+        self.assertIn("• 2 têm uma sessão do Claude Code aberta que trabalha neles", self.summary(two))
+
+    def test_merge_category_does_not_assume_main(self):
+        # G9: a branch principal pode ser develop ou master
+        keep = self.wt("k", blockers=["merge não comprovado em origin/develop e há commits não enviados"])
+        self.assertIn("• 1 tem commits que não estão na branch principal nem foram enviados", self.summary([keep]))
+
     def test_categories_singular_plural_and_conversa(self):
         one = self.wt("a", waits=["conversa do Claude Code há 2 d: x"])
         two = [self.wt("b", waits=["conversa do Claude Code há 2 d: x"]),
@@ -2164,8 +2349,11 @@ class WorktreeTableTest(unittest.TestCase):
         self.assertIn("enviado", text)
         self.assertIn("(origin/ok)", text)
         self.assertIn("✗ sem merge", text)
-        self.assertIn("🟡 depois", text)
-        self.assertIn("⚪ manter", text)
+        self.assertIn("🟡 em andamento:", text)
+        self.assertIn("⚪ com trabalho só", text)          # a coluna quebra a linha aqui na largura 120
+        self.assertIn("aqui: merge não", text)
+        self.assertNotIn("depois:", text)
+        self.assertNotIn("manter:", text)
         self.assertEqual(text.count("✗ não"), 2)
         self.assertIn("● Título", text)
 

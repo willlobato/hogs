@@ -79,10 +79,10 @@ Confira com `hogs --version`.
 - **🐷 Barra do disco:** o usado em partes (Docker, worktrees, caches de dev, apps e dados, projetos, macOS e swap, outras pastas, não identificado) e o livre, sem contar nada duas vezes: a soma das partes é o usado. **Worktrees** sai de dentro de **Projetos** (a pasta `worktrees_root`), não se soma a ela. **macOS e swap** são os volumes do sistema (System, Preboot, VM com o swap…), lidos do `diskutil`. Ao lado do livre, quanto ficaria livre **com o recomendado**.
 - **🌳 Worktrees:** logo abaixo da barra, quantos worktrees há na pasta dos projetos, quanto ocupam, quantos podem sair, quantos estão em andamento e quantos têm trabalho só ali, com o comando do quadro detalhado. Precisa de `worktrees_root`: rode `hogs --worktrees PASTA` uma vez e a pasta fica lembrada; até lá, a linha diz isso.
 - **✨ Recomendado agora:** só os itens 🟢, agrupados por bloco (os worktrees 🟢 entram como um grupo 🌳, com quantos estão na main, quantos são enviados e parados e quantas conversas reabrir antes); as ações do macOS que liberam espaço (↻ reiniciar quando o swap está alto e o Mac ligado há muitos dias, ↻ aplicar uma atualização já baixada), que o hogs só recomenda; e linhas à parte com os arquivos parados e os pontos de volta recentes (cada um pelo nome), para você avaliar. Se um item 🟢 depende de fechar um app, o motivo aparece ali.
-- **🛡 Não mexo:** o que fica protegido: containers rodando e as imagens deles, volumes do Docker e pastas montadas por containers.
+- **🛡 Não mexo:** o que fica protegido: containers rodando e as imagens deles, volumes do Docker, pastas montadas por containers e, com `worktrees_root`, quantos worktrees estão em andamento ou com trabalho só aqui.
 - **📈 O que mais cresceu:** comparado com o relatório de ontem, mais a variação das últimas 24h e uma minicurva dos últimos 7 dias do espaço livre e do Docker.
 - **🐳 Docker:** tamanho real do `Docker.raw` e o limite configurado. Também imagens em uso, imagens sem uso (separando as que voltam com `docker pull` das que foram construídas na sua máquina), imagens sem tag, pontos de volta (cada um na sua linha, com o mesmo risco do `--clean`), cache de build (inclusive o de builders `buildx` que rodam em container), containers parados, volumes, e o espaço que a VM do Docker ocupa sem contabilizar.
-- **🛡 Prevenção:** se o cache de build tem limite, se a limpeza automática do Docker vale pro builder que você usa de verdade, se o TRIM está ligado e o teto do disco do Docker. Também por quanto tempo o Claude Code guarda as conversas (`cleanupPeriodDays` em `~/.claude/settings.json`, 30 dias se não estiver definido): o hogs recomenda aumentar, mas nunca altera o arquivo.
+- **🛡 Prevenção:** se o cache de build tem limite, se a limpeza automática do Docker vale pro builder que você usa de verdade, se o TRIM está ligado e o teto do disco do Docker. Também por quanto tempo o Claude Code guarda as conversas (`cleanupPeriodDays` em `~/.claude/settings.json`, ou na pasta de `CLAUDE_CONFIG_DIR` se definida; 30 dias se não estiver definido): o hogs recomenda aumentar, mas nunca altera o arquivo.
 - **🧰 Caches de dev:** npm, Yarn, pnpm, pip, Homebrew, Maven, Gradle, Go, Cargo, JetBrains, VS Code, Xcode, Playwright, Ollama, nvm, pyenv, SDKMAN e simuladores iOS.
 - **📦 Apps e dados:** WhatsApp, Chrome, Teams, a VM do Claude (Cowork), backups do iPhone, Downloads, Lixeira e `/Applications`. Também as cópias antigas que alguns apps (como o Chrome) deixam em pastas `*.code_sign_clone` depois de atualizar, e arquivos grandes (500 MB+) na Mesa, Documentos, Downloads e Imagens sem abrir há mais de 6 meses (🟡 para avaliar: vão para a Lixeira).
 - **🧰 Caches grandes:** pastas de `~/Library/Caches` acima de 500 MB que não estão na lista entram como 🟡 (o app recria).
@@ -122,7 +122,7 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - Se um comando de limpeza falha, o item aparece como mantido, com a mensagem de erro, e não como apagado.
 - 🛡️ Imagens construídas localmente aparecem uma por uma, nunca em grupo.
 - 🛡️ Pontos de volta de imagens (`antes-*`, `backup-*`…) só viram 🟢 depois de `rollback_days` dias (padrão 2, configurável), contados a partir do sinal mais recente; antes disso ficam 🟡 para avaliar.
-- 🛡️ Se a imagem atual foi construída com as etiquetas OCI de commit e origem (`docker build --label org.opencontainers.image.revision=$(git rev-parse HEAD) --label org.opencontainers.image.source=https://github.com/acme/shop-api .`) e o commit da imagem atual já está na branch padrão de um clone em `worktrees_root` com o mesmo remoto da etiqueta de origem, os pontos de volta dela ficam 🟢 na hora, mesmo os recentes. A checagem é local (nunca faz `git fetch`); sem etiquetas, sem `worktrees_root` ou sem clone, vale o prazo de `rollback_days`.
+- 🛡️ Se a imagem atual foi construída com as etiquetas OCI de commit e origem (`docker build --label org.opencontainers.image.revision=$(git rev-parse HEAD) --label org.opencontainers.image.source=https://github.com/acme/shop-api .`) e o commit da imagem atual já está na branch padrão de um clone em `worktrees_root`, a do remoto que bate com a etiqueta de origem (`<remoto>/HEAD`, senão `<remoto>/main` ou `<remoto>/master`), os pontos de volta dela ficam 🟢 na hora, mesmo os recentes. A revisão precisa ser o SHA de um commit: uma tag ou branch local com nome hexadecimal não vale. A checagem é local (nunca faz `git fetch`); sem etiquetas, sem `worktrees_root` ou sem clone, vale o prazo de `rollback_days`.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
 - 🛡️ Arquivo pessoal só vai para a Lixeira, nunca é apagado direto.
 - 🛡️ Worktree só sai por `git worktree remove`, sem `--force`, e a branch fica. Tudo é conferido de novo logo antes de cada remoção, inclusive o envio e as conversas do Claude Code; o que mudou desde a análise fica.
@@ -153,7 +153,7 @@ processos como `node ×3`, containers), a **conversa** do Claude Code ligada a e
   A pasta sai, a branch fica.
 - 🟡 **em andamento**: algo roda dentro da pasta agora (dev server, container, sessão aberta dentro
   dela), ou está sem merge e foi mexido ou conversado nos últimos `stale_worktree_days` dias.
-- ⚪ **com trabalho só aqui**: commits que não estão na main nem foram enviados, alterações, `.env`…,
+- ⚪ **com trabalho só aqui**: commits que não estão na branch principal nem foram enviados, alterações, `.env`…,
   ou ficou dúvida. Não apague.
 
 Por último vem o **resumo**: quantos são 🟢 e por quê, quais sessões abertas trabalharam neles, o que
@@ -193,11 +193,13 @@ sessão só perde a pasta. Sem merge é diferente: uma sessão aberta que o cite
 **Coluna Conversa.** Mostra a conversa do Claude Code mais recente ligada ao worktree: o título, há
 quanto tempo, `●` se está aberta agora e `+N` se há outras. Uma conversa se liga a um worktree quando
 trabalhou numa pasta dentro dele, trabalhou na branch dele em outra pasta do mesmo repositório ou citou um
-caminho dele. Se a conversa **começou** dentro da pasta, aparece `⚠ reabra antes de apagar`: o
+caminho dele. Como o APFS, a ligação não diferencia maiúsculas e segue symlinks; um worktree a mais de 8
+níveis da pasta escolhida casa pelos 8 primeiros (na dúvida, liga). Se **alguma** das conversas ligadas
+**começou** dentro da pasta (não só a mostrada), aparece `⚠ reabra antes de apagar`: o
 `claude --resume` acha a conversa pela pasta onde ela começou, então o resumo traz o comando pronto
-(`cd … && claude --resume …`) para você retomá-la antes que a pasta saia.
+(`cd … && claude --resume …`) de cada uma para você retomá-las antes que a pasta saia.
 
-As conversas vêm de `~/.claude/projects`, só lidas, e ficam num cache em
+As conversas vêm de `~/.claude/projects` (ou da pasta de `CLAUDE_CONFIG_DIR`, se definida), só lidas, e ficam num cache em
 `~/Library/Application Support/hogs/conversations.json`: cada transcrição é lida só a partir de onde
 parou, então da segunda análise em diante as conversas levam uma fração de segundo. O Claude Code apaga conversas depois de 30 dias se
 `cleanupPeriodDays` não estiver definido; o painel 🛡 Prevenção avisa.
