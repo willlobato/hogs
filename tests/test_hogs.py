@@ -302,6 +302,33 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(hogs.fmt_delta(-3_200_000_000), "−3,2 GB")
 
 
+class SignCloneTest(unittest.TestCase):
+    def make(self, root, clone, app, version, exe="App"):
+        c = root / "com.example.App.code_sign_clone" / clone / f"{app}.app.bundle" / "Contents"
+        c.mkdir(parents=True)
+        (c / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": version, "CFBundleExecutable": exe}))
+        (c / "blob").write_bytes(b"x" * 4096)
+
+    def test_only_old_versions_one_copy_counted_and_guarded(self):
+        tmp = Path(tempfile.mkdtemp())
+        apps, root = tmp / "Applications", tmp / "X"
+        (apps / "Navegador.app/Contents").mkdir(parents=True)
+        (apps / "Navegador.app/Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "156"}))
+        for n, v in (("a", "156"), ("b", "156"), ("c", "155"), ("d", "155"), ("e", "152")):
+            self.make(root, f"code_sign_clone.{n}", "Navegador", v)
+        with mock.patch.object(hogs, "APPLICATIONS", apps), \
+                mock.patch.object(hogs, "du", side_effect=lambda p: 1_000_000_000):
+            items = hogs.sign_clone_items(hogs.gather_sign_clones(root))
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual((item.label, item.size, item.risk), ("Cópias antigas do Navegador (3)", 2_000_000_000, hogs.SAFE))
+        with mock.patch.object(hogs, "process_running", return_value=True):
+            self.assertEqual(item.guard(), "feche o Navegador antes")
+        item.action()
+        left = sorted(p.name for p in (root / "com.example.App.code_sign_clone").iterdir())
+        self.assertEqual(left, ["code_sign_clone.a", "code_sign_clone.b"])
+
+
 class WorktreeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
