@@ -850,6 +850,9 @@ class BreakdownTest(unittest.TestCase):
         self.assertEqual(hogs.worktrees_line(rows, Path("/dev")).plain.split("  detalhes")[0],
                          "🌳 Worktrees: 4 · 15,0 GB · 2 podem sair (3,0 GB) · 1 em andamento · 1 com trabalho só aqui")
         self.assertIn("  detalhes: hogs --worktrees /dev", hogs.worktrees_line(rows, Path("/dev")).plain)
+        self.assertIn("· 1 pode sair (1,0 GB) ·", hogs.worktrees_line(rows[:1], Path("/dev")).plain)
+        self.assertEqual(hogs.worktrees_line([], Path("/dev"), "git sumiu").plain,
+                         "🌳 Worktrees: não consegui conferir (git sumiu)")
         self.assertIn("hogs --worktrees PASTA", hogs.worktrees_line([], None).plain)
         self.assertEqual(hogs.worktrees_line([], Path("/dev")).plain, "🌳 Worktrees: nenhum em /dev")
         item = hogs.worktree_item(rows, Path("/dev"))
@@ -861,7 +864,7 @@ class BreakdownTest(unittest.TestCase):
             if w.size == int(1e9):
                 raise RuntimeError("HEAD ou branch mudou desde a análise")
         with mock.patch.object(hogs, "remove_worktree", remove):
-            with self.assertRaisesRegex(RuntimeError, "1 de 2 mantidos"):
+            with self.assertRaisesRegex(RuntimeError, "1 de 2 mantidos: wt-1000000000.0-seguro: HEAD ou branch"):
                 item.action()
         self.assertEqual(sorted(calls), [(int(1e9), 0, Path("/dev")), (int(2e9), 0, Path("/dev"))])
         self.assertIsNone(hogs.worktree_item([self.wt(4e9, "depois")], Path("/dev")))
@@ -889,12 +892,21 @@ class BreakdownTest(unittest.TestCase):
         s.worktrees, s.worktrees_root, s.projects = rows, Path("/dev"), int(30e9)
         s.items.append(hogs.worktree_item(rows, Path("/dev")))
         out = self.render_report(s)
-        self.assertIn("🌳 Worktrees: 4 · 22,0 GB · 1 podem sair (1,0 GB)", out.split("✨ Recomendado agora")[0])
+        self.assertIn("🌳 Worktrees: 4 · 22,0 GB · 1 pode sair (1,0 GB)", out.split("✨ Recomendado agora")[0])
         recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
         self.assertIn("🌳 Worktrees", recommended)
         self.assertIn("Worktrees que podem sair (1)", recommended)
         protected = " ".join(out.split("🛡 Não mexo")[1].split())
         self.assertIn("1 worktree em andamento e 2 com trabalho só aqui: não mexo", protected)
+        for rows, expect in (([self.wt(8e9, "manter"), self.wt(9e9, "manter")], "2 worktrees com trabalho só aqui"),
+                             ([self.wt(4e9, "depois")], "1 worktree em andamento")):
+            s = self.snap(92e9, 0, 0)
+            s.worktrees = rows
+            con = hogs.Console(file=io.StringIO(), width=160)
+            con.print(hogs.protected_panel(s))
+            protected = " ".join(con.file.getvalue().split())
+            self.assertIn(f"{expect}: não mexo", protected)
+            self.assertNotIn("0 ", protected.split("Não mexo")[1])
         s = self.snap(92e9, 0, 0)
         out = self.render_report(s)
         self.assertIn("escolha a pasta dos seus projetos com hogs --worktrees PASTA", " ".join(out.split()))
@@ -1132,9 +1144,17 @@ class BreakdownTest(unittest.TestCase):
         found.assert_not_called()
         self.assertEqual((snap.worktrees, snap.worktrees_root), ([], None))
         self.assertFalse([i for i in snap.items if i.cat == "worktree"])
+        self.assertEqual(snap.worktrees_error, "")
         snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(side_effect=RuntimeError("git sumiu")))
-        self.assertEqual(snap.worktrees, [])
+        self.assertEqual((snap.worktrees, snap.worktrees_error), ([], "git sumiu"))
         self.assertFalse([i for i in snap.items if i.cat == "worktree"])
+        line = hogs.worktrees_line(snap.worktrees, snap.worktrees_root, snap.worktrees_error).plain
+        self.assertEqual(line, "🌳 Worktrees: não consegui conferir (git sumiu)")
+        self.assertNotIn("nenhum", line)
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(return_value=([], ["não consegui inspecionar x"])))
+        self.assertEqual(snap.worktrees_error, "não consegui inspecionar x")
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(return_value=(rows, ["aviso qualquer"])))
+        self.assertEqual(snap.worktrees_error, "")
 
 
 class PreventionTest(unittest.TestCase):
@@ -1199,6 +1219,29 @@ class HistoryTest(unittest.TestCase):
         rows = hogs.growth({"docker": 30 * 10**9, "npm": 4 * 10**9, "new": 2 * 10**9, "tiny": 10**9},
                            {"docker": 13 * 10**9, "npm": 5 * 10**9, "tiny": 10**9 - 10})
         self.assertEqual(rows, [("docker", 17 * 10**9), ("new", 2 * 10**9)])
+
+    def test_growth_compares_projects_with_worktrees_against_old_records(self):
+        # Registros antigos têm os worktrees dentro de "Projetos" e nenhum "Worktrees": não é crescimento.
+        current = {"Projetos": 50 * 10**9, "Worktrees": 10 * 10**9}
+        self.assertEqual(hogs.growth(current, {"Projetos": 60 * 10**9}), [])
+        self.assertEqual(hogs.growth(current, {"docker": 10**9}), [])
+        self.assertEqual(hogs.growth(current, {"Projetos": 55 * 10**9}), [("Projetos", 5 * 10**9)])
+        self.assertEqual(hogs.growth(current, {"Projetos": 50 * 10**9, "Worktrees": 8 * 10**9}),
+                         [("Worktrees", 2 * 10**9)])
+
+    def test_growth_table_has_no_false_worktrees_row_after_upgrade(self):
+        s = hogs.Snapshot(494e9, 28e9, hogs.Docker(), [], [], projects=int(60e9))
+        w = hogs.Worktree(Path("/dev/wt-a"), Path("/dev/shop-api"), size=int(10e9))
+        s.worktrees = [w]
+        records = [{"t": self.now - 26 * 3600, "full": True, "free": 1, "sizes": {"Projetos": int(57e9)}}]
+        con = hogs.Console(file=io.StringIO(), width=160)
+        with mock.patch.object(hogs.time, "time", return_value=self.now):
+            con.print(hogs.growth_table(s, records))
+        out = con.file.getvalue()
+        self.assertNotIn("Worktrees", out)
+        self.assertIn("Projetos", out)
+        self.assertIn("+3,0 GB", out)
+        self.assertIn("60,0 GB", out)
 
     def test_value_at_picks_last_record_before_time(self):
         records = [{"t": 10, "free": 1}, {"t": 20}, {"t": 30, "free": 3}, {"t": 40, "free": 4}]

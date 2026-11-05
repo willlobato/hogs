@@ -1814,16 +1814,19 @@ def verdict_counts(rows: list[Worktree]) -> dict[str, tuple[int, int]]:
     return counts
 
 
-def worktrees_line(rows: list[Worktree], root: Path | None) -> Text:
+def worktrees_line(rows: list[Worktree], root: Path | None, error: str = "") -> Text:
     """O totalizador 🌳 do relatório principal."""
     if root is None:
         return Text("🌳 Worktrees: escolha a pasta dos seus projetos com hogs --worktrees PASTA (ela fica lembrada)",
                     style="dim")
+    if error and not rows:
+        return Text(f"🌳 Worktrees: não consegui conferir ({error})", style="yellow")
     if not rows:
         return Text(f"🌳 Worktrees: nenhum em {short(root)}")
     c = verdict_counts(rows)
     (a, sa), (b, _), (k, _) = c["seguro"], c["depois"], c["manter"]
-    return Text.assemble(f"🌳 Worktrees: {len(rows)} · {fmt(sum(w.size for w in rows))} · {a} podem sair ({fmt(sa)})"
+    return Text.assemble(f"🌳 Worktrees: {len(rows)} · {fmt(sum(w.size for w in rows))} · "
+                         f"{plural(a, 'pode sair', 'podem sair')} ({fmt(sa)})"
                          f" · {b} em andamento · {k} com trabalho só aqui",
                          (f"  detalhes: hogs --worktrees {short(root)}", "dim"))
 
@@ -1835,7 +1838,7 @@ def remove_worktrees(rows: list[Worktree], scope: Path) -> None:
         try:
             remove_worktree(w, 0, scope)
         except Exception as exc:   # o motivo vai para a mensagem; os outros ainda são tentados
-            errors.append(str(exc))
+            errors.append(f"{where(w, scope)}: {exc}")
     if errors:
         raise RuntimeError(f"{len(errors)} de {len(rows)} mantidos: {errors[0]}")
 
@@ -2206,6 +2209,7 @@ class Snapshot:
     mounts: list[Path] = field(default_factory=list)
     worktrees: list[Worktree] = field(default_factory=list)     # todas as linhas, não só os 🟢
     worktrees_root: Path | None = None
+    worktrees_error: str = ""       # a conferência falhou: o 🌳 diz isso em vez de "nenhum"
 
 
 def projects_root() -> Path | None:
@@ -2253,12 +2257,15 @@ def gather(con: Console) -> Snapshot:
             system = fut_system.result()
             clones = fut_clones.result()
             worktrees: list[Worktree] = []
+            worktrees_error = ""
             if fut_worktrees is not None:
                 status.update("[bold]🌳 Conferindo worktrees…[/]")
                 try:
-                    worktrees = fut_worktrees.result()[0]
-                except Exception:   # o relatório nunca cai por causa dos worktrees: só ficam de fora
-                    pass
+                    worktrees, warnings = fut_worktrees.result()
+                    if not worktrees and warnings:
+                        worktrees_error = warnings[0]
+                except Exception as exc:   # o relatório nunca cai por causa dos worktrees: diz que não conferiu
+                    worktrees_error = str(exc) or type(exc).__name__
 
     items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
                   make_action(pd), pd.hint, make_guard(pd)) for pd in PATH_DEFS]
@@ -2282,7 +2289,8 @@ def gather(con: Console) -> Snapshot:
                     key=lambda x: -x[1])
     usage = shutil.disk_usage(DATA_VOLUME)
     return Snapshot(usage.total, usage.free, docker, items, others, apps, system,
-                    system_advice(system) if system else [], mounts_known, projects, mounts, worktrees, root)
+                    system_advice(system) if system else [], mounts_known, projects, mounts, worktrees, root,
+                    worktrees_error)
 
 
 # ---------------------------------------------------------------- sistema
@@ -2454,8 +2462,22 @@ def baseline(records: list[dict], now: float) -> dict | None:
     return hour_old[0] if hour_old else None
 
 
+def comparable_sizes(current: dict[str, int], base: dict[str, int]) -> dict[str, int]:
+    """Registros sem "Worktrees" têm os worktrees dentro de "Projetos": compara igual com igual. Sem nenhum dos
+    dois no registro, a pasta dos projetos passou a ser medida agora, o que não é crescimento."""
+    if "Worktrees" in base:
+        return current
+    cur = dict(current)
+    worktrees = cur.pop("Worktrees", 0)
+    if "Projetos" not in base:
+        cur.pop("Projetos", None)
+    elif "Projetos" in cur or worktrees:
+        cur["Projetos"] = cur.get("Projetos", 0) + worktrees
+    return cur
+
+
 def growth(current: dict[str, int], base: dict[str, int], min_delta: float = 100e6) -> list[tuple[str, int]]:
-    deltas = [(k, v - base.get(k, 0)) for k, v in current.items()]
+    deltas = [(k, v - base.get(k, 0)) for k, v in comparable_sizes(current, base).items()]
     return sorted((d for d in deltas if d[1] >= min_delta), key=lambda d: -d[1])
 
 
@@ -2687,7 +2709,8 @@ def growth_table(s: Snapshot, records: list[dict]) -> Table | Text:
         return Text("📈 O histórico começou agora: a partir de amanhã o hogs mostra o que mais cresceu. "
                     "Com o agente ligado (hogs --alert ou --docker-gc), ele também registra de hora em hora.",
                     style="dim")
-    rows = growth(snapshot_sizes(s), base.get("sizes", {}))[:8]
+    current = comparable_sizes(snapshot_sizes(s), base.get("sizes", {}))
+    rows = growth(current, base.get("sizes", {}))[:8]
     since = ago(datetime.fromtimestamp(base["t"], timezone.utc))
     if not rows:
         return Text(f"📈 Nada cresceu mais de 100 MB desde o último relatório ({since}).", style="dim")
@@ -2698,7 +2721,6 @@ def growth_table(s: Snapshot, records: list[dict]) -> Table | Text:
     t.add_column("Cresceu", justify="right", no_wrap=True)
     t.add_column("", no_wrap=True, width=14)
     t.add_column("Agora", justify="right", style="dim", no_wrap=True)
-    current = snapshot_sizes(s)
     for label, delta in rows:
         color = "red" if delta >= GB else "yellow"
         t.add_row(label, Text(fmt_delta(delta), style=f"bold {color}"), mini_bar(delta, top, color), fmt(current[label]))
@@ -2834,9 +2856,12 @@ def protected_panel(s: Snapshot) -> Panel:
         lines.append("Docker não respondeu: não sei o que está em uso.")
     counts = verdict_counts(s.worktrees)
     (b, _), (c, _) = counts["depois"], counts["manter"]
-    if b or c:
-        lines.append(f"{plural(b, 'worktree em andamento', 'worktrees em andamento')} e {c} com trabalho só aqui: "
-                     "não mexo")
+    busy = plural(b, "worktree em andamento", "worktrees em andamento")
+    if b and c:
+        lines.append(f"{busy} e {c} com trabalho só aqui: não mexo")
+    elif b or c:
+        lines.append(f"{busy if b else plural(c, 'worktree com trabalho só aqui', 'worktrees com trabalho só aqui')}"
+                     ": não mexo")
     text = Text("\n".join(lines) if lines else "Nada em uso pelo Docker agora.")
     return Panel(text, title="[bold]🛡 Não mexo[/]", title_align="left", border_style="grey50", padding=(0, 2))
 
@@ -2845,7 +2870,7 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
     records = records or []
     cleanable = clean_items(s)
     con.print(header(s, records, cleanable))
-    con.print(worktrees_line(s.worktrees, s.worktrees_root))
+    con.print(worktrees_line(s.worktrees, s.worktrees_root, s.worktrees_error))
     con.print(recommended_panel(s, cleanable))
     con.print(protected_panel(s))
     con.print(growth_table(s, records))
