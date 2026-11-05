@@ -238,6 +238,8 @@ class Docker:
     builders: list[dict] = field(default_factory=list)
     builder_caches: list[dict] = field(default_factory=list)   # volumes de estado do BuildKit
     current_builder: str = ""
+    mounts: list[Path] = field(default_factory=list)   # origens de bind mount de qualquer container
+    mounts_ok: bool = False                            # True só se o inspect respondeu
 
 
 def list_builders() -> list[dict]:
@@ -327,6 +329,21 @@ def gather_docker() -> Docker:
                 i["size"] = int(i["size"] * target / reported)
 
     containers = v.get("Containers") or []
+    if not containers:
+        d.mounts_ok = True
+    else:
+        r = sh(["docker", "inspect", "--format", "{{json .Mounts}}"] + [c["ID"] for c in containers])
+        try:
+            if not r or r.returncode != 0:
+                raise ValueError("inspect falhou")
+            found = []
+            for line in r.stdout.splitlines():
+                if line.strip():
+                    found += [Path(m["Source"]).resolve() for m in json.loads(line) or []
+                              if m.get("Type") == "bind" and m.get("Source")]
+            d.mounts, d.mounts_ok = sorted(set(found)), True
+        except (ValueError, TypeError, AttributeError, KeyError):
+            d.mounts, d.mounts_ok = [], False
     running_projects = {
         _labels(c.get("Labels", "")).get("com.docker.compose.project")
         for c in containers if c.get("State") in ACTIVE_STATES
@@ -358,6 +375,29 @@ def gather_docker() -> Docker:
             continue
         d.volumes.append({"name": name, "size": size, "used": vol.get("Links", "0") not in ("0", "N/A")})
     return d
+
+
+MOUNTS_FILE = DATA_DIR / "mounts.json"
+
+
+def known_mounts(d: Docker) -> tuple[list[Path], bool]:
+    """Pastas montadas por containers e se a lista é confiável. Sem resposta do Docker, usa a última salva."""
+    if d.mounts_ok:
+        try:
+            MOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            MOUNTS_FILE.write_text(json.dumps({"mounts": [str(m) for m in d.mounts]}))
+        except OSError:
+            pass
+        return d.mounts, True
+    saved = read_json(MOUNTS_FILE).get("mounts")
+    if isinstance(saved, list):
+        return [Path(m) for m in saved], True
+    return [], not shutil.which("docker")
+
+
+def under_mount(path: Path, mounts: list[Path]) -> bool:
+    """`path` dentro de uma pasta montada, ou contendo uma."""
+    return any(path == m or m in path.parents or path in m.parents for m in mounts)
 
 
 def prune_builder(name: str, max_gb: float | None = None) -> subprocess.CompletedProcess | None:

@@ -214,6 +214,43 @@ class DockerCleanItemsTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
+class MountsTest(unittest.TestCase):
+    def test_under_mount_both_directions(self):
+        m = [Path("/u/dev/db/data")]
+        self.assertTrue(hogs.under_mount(Path("/u/dev/db/data/x.mdf"), m))
+        self.assertTrue(hogs.under_mount(Path("/u/dev/db"), m))
+        self.assertFalse(hogs.under_mount(Path("/u/dev/dbx"), m))
+
+    def test_gather_reads_bind_mounts_of_stopped_containers_too(self):
+        cs = [{"ID": "a" * 64, "Names": "db", "State": "exited", "Labels": "", "Size": "1MB"}]
+        mounts = json.dumps([{"Type": "bind", "Source": "/tmp/dados-db"}, {"Type": "volume", "Source": "/var/lib/x"}])
+        def inspect(cmd):
+            out = f"{'a' * 64}|2020-01-01T00:00:00Z|2019-01-01T00:00:00Z\n" if "{{.Id}}|" in cmd[3] else mounts + "\n"
+            return out
+        sh, _ = DockerCleanItemsTest.fake_docker(containers=cs, inspect=None)
+        def sh2(cmd, timeout=60):
+            if cmd[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(cmd, 0, inspect(cmd), "")
+            return sh(cmd, timeout)
+        with mock.patch.object(hogs, "sh", sh2):
+            d = hogs.gather_docker()
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [Path("/tmp/dados-db").resolve()])
+
+    def test_known_mounts_falls_back_to_saved_then_unknown(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "MOUNTS_FILE", tmp / "m.json"), mock.patch.object(hogs, "DATA_DIR", tmp), \
+                mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"):
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], False))
+            hogs.known_mounts(hogs.Docker(running=True, mounts=[Path("/x/db")], mounts_ok=True))
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([Path("/x/db")], True))
+
+    def test_no_docker_installed_means_no_mounts_known_ok(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "MOUNTS_FILE", tmp / "m.json"), mock.patch.object(hogs.shutil, "which", return_value=None):
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], True))
+
+
 class BuilderTest(unittest.TestCase):
     builders = [{"name": "multiarch", "driver": "docker-container", "nodes": ["multiarch0"], "running": True},
                 {"name": "default", "driver": "docker", "nodes": ["default"], "running": True},
