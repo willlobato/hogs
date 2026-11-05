@@ -230,6 +230,89 @@ class DockerCleanItemsTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
+class MountsTest(unittest.TestCase):
+    def test_under_mount_both_directions(self):
+        m = [Path("/u/dev/db/data")]
+        self.assertTrue(hogs.under_mount(Path("/u/dev/db/data/x.mdf"), m))
+        self.assertTrue(hogs.under_mount(Path("/u/dev/db"), m))
+        self.assertFalse(hogs.under_mount(Path("/u/dev/dbx"), m))
+
+    @staticmethod
+    def gather_with(mounts_reply, state="exited", containers=True):
+        """gather_docker com `docker inspect` de mounts respondendo `mounts_reply` (None = sh falhou)."""
+        cs = [{"ID": "a" * 64, "Names": "db", "State": state, "Labels": "", "Size": "1MB"}] if containers else []
+        sh, _ = DockerCleanItemsTest.fake_docker(containers=cs, inspect=None)
+
+        def sh2(cmd, timeout=60):
+            if cmd[:2] == ["docker", "inspect"]:
+                if "Mounts" in cmd[3]:
+                    return mounts_reply(cmd) if callable(mounts_reply) else mounts_reply
+                return subprocess.CompletedProcess(cmd, 0, f"{'a' * 64}|2020-01-01T00:00:00Z|2019-01-01T00:00:00Z\n", "")
+            return sh(cmd, timeout)
+        with mock.patch.object(hogs, "sh", sh2):
+            return hogs.gather_docker()
+
+    @staticmethod
+    def ok(out):
+        return subprocess.CompletedProcess([], 0, out, "")
+
+    BINDS = json.dumps([{"Type": "bind", "Source": "/tmp/dados-db"}, {"Type": "volume", "Source": "/var/lib/x"}]) + "\n"
+
+    def test_gather_reads_bind_mounts_of_stopped_containers_too(self):
+        d = self.gather_with(self.ok(self.BINDS))
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [Path("/tmp/dados-db").resolve()])
+
+    def test_gather_reads_bind_mounts_of_running_containers(self):
+        d = self.gather_with(self.ok(self.BINDS), state="running")
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [Path("/tmp/dados-db").resolve()])
+
+    def test_gather_mounts_unknown_when_inspect_fails(self):
+        for reply in (None, subprocess.CompletedProcess([], 1, "", "erro"), self.ok("não é json\n")):
+            d = self.gather_with(reply)
+            self.assertFalse(d.mounts_ok)
+            self.assertEqual(d.mounts, [])
+
+    def test_gather_mounts_unknown_when_resolve_raises(self):
+        with mock.patch.object(Path, "resolve", side_effect=OSError("x")):
+            d = self.gather_with(self.ok(self.BINDS))
+        self.assertFalse(d.mounts_ok)
+
+    def test_gather_without_containers_is_ok_and_empty(self):
+        d = self.gather_with(None, containers=False)
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [])
+
+    def test_under_mount_resolves_the_path(self):
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        (tmp / "real").mkdir()
+        (tmp / "link").symlink_to(tmp / "real")
+        self.assertTrue(hogs.under_mount(tmp / "link" / "x.mdf", [tmp / "real"]))
+        self.assertTrue(hogs.under_mount(tmp / "link", [tmp / "real"]))
+
+    def test_corrupt_saved_mounts_count_as_nothing_saved(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "MOUNTS_FILE", tmp / "m.json"), \
+                mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"):
+            for body in ('{"mounts": [1, 2]}', '{"mounts": "x"}', '[1]', 'lixo', '{"mounts": [""]}'):
+                (tmp / "m.json").write_text(body)
+                self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], False), body)
+
+    def test_known_mounts_falls_back_to_saved_then_unknown(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "MOUNTS_FILE", tmp / "m.json"), \
+                mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"):
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], False))
+            hogs.known_mounts(hogs.Docker(running=True, mounts=[Path("/x/db")], mounts_ok=True))
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([Path("/x/db")], True))
+
+    def test_no_docker_installed_means_no_mounts_known_ok(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "MOUNTS_FILE", tmp / "m.json"), mock.patch.object(hogs.shutil, "which", return_value=None):
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], True))
+
+
 class BuilderTest(unittest.TestCase):
     builders = [{"name": "multiarch", "driver": "docker-container", "nodes": ["multiarch0"], "running": True},
                 {"name": "default", "driver": "docker", "nodes": ["default"], "running": True},
