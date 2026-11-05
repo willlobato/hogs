@@ -1719,10 +1719,13 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
     lines: list = [Text.assemble(("🟢 SEGURO PARA APAGAR  ", "bold green"),
                                  (f"{n_worktrees(len(safe))} · {size(safe)}", "bold"))]
     prazo = f", e parados há mais de {days} dias" if days else ""
-    lines.append(indent(Text(f"Já estão na main (merge, squash ou rebase), sem alterações, sem arquivos que o Git não "
-                             f"recupera e sem nada rodando dentro da pasta{prazo}. A branch continua existindo.",
-                             style="green")))
     unmerged = [w for w in safe if not w.merged]
+    merged = [w for w in safe if w.merged]
+    if merged or not safe:
+        who = f"{n_worktrees(len(merged))}: " if unmerged else ""
+        lines.append(indent(Text(f"{who}Já estão na main (merge, squash ou rebase), sem alterações, sem arquivos que o "
+                                 f"Git não recupera e sem nada rodando dentro da pasta{prazo}. A branch continua "
+                                 "existindo.", style="green")))
     if unmerged:
         lines.append(indent(Text(f"{n_worktrees(len(unmerged))} sem merge, parados há mais de {stale_days} dias, com "
                                  "tudo commitado e enviado (conferido nas referências locais de origin): a pasta "
