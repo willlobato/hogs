@@ -79,6 +79,16 @@ class ToolCacheTest(unittest.TestCase):
         self.assertFalse([i for i in snap.items if i.label.startswith("Cache: ")])
         self.assertIn(big, [n for n, _ in snap.others])
 
+    def test_mounts_unknown_blocks_only_scan_based_blocks_not_path_defs(self):
+        # CLAUDE.md: com mounts desconhecidos, só os blocos que acham arquivos por varredura (arquivos pessoais e
+        # caches grandes de apps) deixam de sugerir; os itens de PATH_DEFS continuam como sempre.
+        snap, _ = self._gather([], False)
+        labels = {i.label for i in snap.items}
+        self.assertTrue({pd.label for pd in hogs.PATH_DEFS} <= labels)
+        self.assertFalse([i for i in snap.items if i.label.startswith(("Cache: ", "Parado: "))])
+        claude_md = (Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text()
+        self.assertFalse("no file suggestions at all" in claude_md, "CLAUDE.md promete mais do que o código faz")
+
     def test_gather_mounts_known_moves_cache_out_of_others(self):
         snap, big = self._gather([], True)
         self.assertEqual([i.label for i in snap.items if i.label.startswith("Cache: ")], ["Cache: ferramenta-x"])
@@ -517,12 +527,17 @@ class MountsTest(unittest.TestCase):
         self.assertFalse(hogs.under_mount(Path("/u/dev/dbx"), m))
 
     @staticmethod
-    def gather_with(mounts_reply, state="exited", containers=True):
-        """gather_docker com `docker inspect` de mounts respondendo `mounts_reply` (None = sh falhou)."""
+    def gather_with(mounts_reply, state="exited", containers=True, volumes_reply=None, calls=None):
+        """gather_docker com `docker inspect` de mounts respondendo `mounts_reply` (None = sh falhou) e
+        `docker volume inspect` respondendo `volumes_reply`."""
         cs = [{"ID": "a" * 64, "Names": "db", "State": state, "Labels": "", "Size": "1MB"}] if containers else []
         sh, _ = DockerCleanItemsTest.fake_docker(containers=cs, inspect=None)
 
         def sh2(cmd, timeout=60):
+            if calls is not None:
+                calls.append(cmd)
+            if cmd[:3] == ["docker", "volume", "inspect"]:
+                return volumes_reply
             if cmd[:2] == ["docker", "inspect"]:
                 if "Mounts" in cmd[3]:
                     return mounts_reply(cmd) if callable(mounts_reply) else mounts_reply
@@ -562,6 +577,37 @@ class MountsTest(unittest.TestCase):
         d = self.gather_with(None, containers=False)
         self.assertTrue(d.mounts_ok)
         self.assertEqual(d.mounts, [])
+
+    # Volume nomeado com driver_opts de bind (`--opt type=none --opt o=bind --opt device=/pasta`): o mount do
+    # container é `volume`, mas os dados ficam na pasta do host.
+    VOLUMES = json.dumps([{"Type": "volume", "Name": "pgdata", "Source": "/var/lib/docker/volumes/pgdata/_data"},
+                          {"Type": "volume", "Name": "cache", "Source": "/var/lib/docker/volumes/cache/_data"},
+                          {"Type": "volume", "Name": "pgdata", "Source": "/var/lib/docker/volumes/pgdata/_data"}]) + "\n"
+
+    def test_bind_backed_named_volume_protects_its_host_folder(self):
+        host = Path(tempfile.mkdtemp())
+        calls = []
+        options = json.dumps({"device": str(host), "o": "bind", "type": "none"}) + "\nnull\n"
+        d = self.gather_with(self.ok(self.VOLUMES), volumes_reply=self.ok(options), calls=calls)
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [host.resolve()])
+        volume_calls = [c for c in calls if c[:3] == ["docker", "volume", "inspect"]]
+        self.assertEqual(len(volume_calls), 1)   # uma chamada só, cada volume uma vez
+        self.assertEqual(volume_calls[0][-2:], ["pgdata", "cache"])
+        self.assertTrue(hogs.under_mount(host / "base.mdf", d.mounts))
+
+    def test_rbind_with_options_also_protects(self):
+        host = Path(tempfile.mkdtemp())
+        options = json.dumps({"device": str(host), "o": "rbind,ro", "type": "none"}) + "\nnull\n"
+        d = self.gather_with(self.ok(self.VOLUMES), volumes_reply=self.ok(options))
+        self.assertEqual(d.mounts, [host.resolve()])
+
+    def test_volume_options_unknown_means_mounts_unknown(self):
+        for reply in (None, subprocess.CompletedProcess([], 1, "", "Error: no such volume"), self.ok("lixo\n"),
+                      self.ok("null\n")):   # resposta com menos linhas que volumes
+            d = self.gather_with(self.ok(self.VOLUMES), volumes_reply=reply)
+            self.assertFalse(d.mounts_ok, reply)
+            self.assertEqual(d.mounts, [])
 
     def test_under_mount_resolves_the_path(self):
         tmp = Path(tempfile.mkdtemp()).resolve()
@@ -680,6 +726,30 @@ class BreakdownTest(unittest.TestCase):
         con.print(hogs.header(s))
         self.assertIn("com o recomendado: 28,0 GB livres", con.file.getvalue())
 
+    def test_trim_off_docker_space_is_not_recommended_space(self):
+        s = self.snap(92e9, 0, 0)
+        cleanable = [hogs.Item("docker", "Docker: cache de build", 10e9, hogs.SAFE, lambda: None),
+                     hogs.Item("apps", "Lixeira", 2e9, hogs.SAFE, lambda: None)]
+        tmp = Path(tempfile.mkdtemp())
+
+        def header(settings):
+            if settings is not None:
+                (tmp / "settings.json").write_text(json.dumps(settings))
+            con = hogs.Console(file=io.StringIO(), width=220)
+            with mock.patch.object(hogs, "DOCKER_SETTINGS", tmp / "settings.json"):
+                con.print(hogs.header(s, [], cleanable))
+            return " ".join(con.file.getvalue().split())
+        note = "(Docker não devolve espaço: TRIM desligado)"
+        out = header(None)                       # sem o arquivo: TRIM desconhecido, não é "desligado"
+        self.assertIn("com o recomendado: 40,0 GB livres", out)
+        self.assertNotIn(note, out)
+        out = header({"DiskTRIM": True})
+        self.assertIn("com o recomendado: 40,0 GB livres", out)
+        self.assertNotIn(note, out)
+        out = header({"DiskTRIM": False})
+        self.assertIn("com o recomendado: 30,0 GB livres", out)
+        self.assertIn(note, out)
+
     def render_report(self, s):
         con = hogs.Console(file=io.StringIO(), width=160)
         with mock.patch.object(hogs, "load_config", return_value={}):
@@ -746,14 +816,38 @@ class BreakdownTest(unittest.TestCase):
             con.print(hogs.unused_images_table(d))
         self.assertEqual(clean, {"app:antes-velho": hogs.SAFE, "app:antes-novo": hogs.EVAL})
         for name, risk in clean.items():
-            row = next(r for r in rows if name in r[3])
+            row = next(r for r in rows if r[0] == f"Ponto de volta {name}")
             self.assertIs(row[2], risk)
-            self.assertTrue(row[0].startswith("Pontos de volta"))
         self.assertIn(("Imagens sem uso, construídas aqui (0)", 0), [(r[0], r[1]) for r in rows])
         table = con.file.getvalue()
         self.assertNotIn("construída aqui", table)
         self.assertIn(f"{hogs.SAFE.icon} ponto de volta", table)
         self.assertIn(f"{hogs.EVAL.icon} ponto de volta", table)
+
+    def test_each_rollback_point_has_its_own_line_never_hidden_in_a_total(self):
+        now = time.time()
+
+        def img(tag, used=False):
+            return {"name": f"app:{tag}", "repo": "app", "tag": tag, "ref": f"app:{tag}", "size": 1e9, "used": used,
+                    "origin": "local", "created": "", "id": tag, "created_at": now - 60 * 86400}
+        tags = ["antes-a", "antes-b", "antes-c", "antes-d", "antes-velho"]
+        d = hogs.Docker(running=True, images=[img("latest", True)] + [img(t) for t in tags])
+        seen = {f"app:{t}": now - (30 if t == "antes-velho" else 0) * 86400 for t in tags}
+        con = hogs.Console(file=io.StringIO(), width=220)
+        with mock.patch.object(hogs, "first_seen", return_value=seen), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            rows = hogs.docker_rows(d)
+            hogs.report(con, hogs.Snapshot(494e9, 28e9, d, [], []), [])
+        labels = [r[0] for r in rows if "volta" in r[0]]
+        self.assertEqual(sorted(labels), sorted(f"Ponto de volta app:{t}" for t in tags))
+        out = con.file.getvalue()
+        docker_table = out.split("🐳 Docker")[-1]
+        for t in tags:
+            self.assertIn(f"Ponto de volta app:{t}", docker_table)
+        recommended = " ".join(out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0].split())
+        self.assertIn("Pontos de volta recentes (4)", recommended)
+        self.assertIn("app:antes-a, app:antes-b, app:antes-c, app:antes-d", recommended)
+        self.assertNotIn("…", recommended)
 
     def test_worktrees_folder_is_remembered_keeping_other_settings(self):
         tmp = Path(tempfile.mkdtemp())
@@ -919,6 +1013,43 @@ class SignCloneTest(unittest.TestCase):
         item.action()
         left = sorted(p.name for p in (root / "com.example.App.code_sign_clone").iterdir())
         self.assertEqual(left, ["code_sign_clone.a", "code_sign_clone.b"])
+
+
+class ProcessRunningTest(unittest.TestCase):
+    """A guarda de app aberto nunca diz "fechado" com o app aberto."""
+
+    @staticmethod
+    def pgrep(procs):
+        """pgrep falso (regex estendida): -x casa o nome do processo inteiro, -f a linha de comando."""
+        import re
+
+        def sh(cmd, timeout=60):
+            if cmd[0] != "pgrep":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            flag, pattern = cmd[1], cmd[2]
+            hit = any(re.fullmatch(pattern, comm) if flag == "-x" else re.search(pattern, args)
+                      for comm, args in procs)
+            return subprocess.CompletedProcess(cmd, 0 if hit else 1, "123\n" if hit else "", "")
+        return sh
+
+    def running(self, name, procs):
+        with mock.patch.object(hogs, "sh", self.pgrep(procs)):
+            return hogs.process_running(name)
+
+    def test_executable_name_longer_than_the_kernel_name(self):
+        exe = "Navegador Super Rapido Helper"          # 29 caracteres; o kernel guarda 16 (MAXCOMLEN)
+        app = f"/Applications/Navegador.app/Contents/MacOS/{exe}"
+        self.assertTrue(self.running(exe, [(exe[:16], app)]))                 # pelo nome cortado ou pelo caminho
+        self.assertTrue(self.running(exe, [(exe[:16], "")]))                  # só o nome cortado
+        self.assertTrue(self.running(exe, [("outro-nome", f"{app} --type=main")]))   # só o caminho
+
+    def test_name_with_regex_characters_is_literal(self):
+        exe = "Navegador (Beta)+"
+        self.assertTrue(self.running(exe, [(exe, f"/Applications/N.app/Contents/MacOS/{exe}")]))
+
+    def test_closed_app_is_not_running(self):
+        procs = [("Navegador2", "/Applications/N2.app/Contents/MacOS/Navegador2"), ("bash", "bash -c Navegador")]
+        self.assertFalse(self.running("Navegador", procs))
 
 
 class WorktreeTest(unittest.TestCase):

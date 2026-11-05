@@ -77,10 +77,10 @@ Confira com `hogs --version`.
 ### O que o relatório mostra
 
 - **🐷 Barra do disco:** o usado em partes (Docker, caches de dev, apps e dados, projetos, macOS e swap, outras pastas, não identificado) e o livre, sem contar nada duas vezes: a soma das partes é o usado. **macOS e swap** são os volumes do sistema (System, Preboot, VM com o swap…), lidos do `diskutil`. Ao lado do livre, quanto ficaria livre **com o recomendado**.
-- **✨ Recomendado agora:** só os itens 🟢, agrupados por bloco; as ações do macOS que liberam espaço (↻ reiniciar quando o swap está alto e o Mac ligado há muitos dias, ↻ aplicar uma atualização já baixada), que o hogs só recomenda; e linhas à parte com os arquivos parados e os pontos de volta recentes, para você avaliar. Se um item 🟢 depende de fechar um app, o motivo aparece ali.
+- **✨ Recomendado agora:** só os itens 🟢, agrupados por bloco; as ações do macOS que liberam espaço (↻ reiniciar quando o swap está alto e o Mac ligado há muitos dias, ↻ aplicar uma atualização já baixada), que o hogs só recomenda; e linhas à parte com os arquivos parados e os pontos de volta recentes (cada um pelo nome), para você avaliar. Se um item 🟢 depende de fechar um app, o motivo aparece ali.
 - **🛡 Não mexo:** o que fica protegido: containers rodando e as imagens deles, volumes do Docker e pastas montadas por containers.
 - **📈 O que mais cresceu:** comparado com o relatório de ontem, mais a variação das últimas 24h e uma minicurva dos últimos 7 dias do espaço livre e do Docker.
-- **🐳 Docker:** tamanho real do `Docker.raw` e o limite configurado. Também imagens em uso, imagens sem uso (separando as que voltam com `docker pull` das que foram construídas na sua máquina), imagens sem tag, pontos de volta (com o mesmo risco do `--clean`), cache de build (inclusive o de builders `buildx` que rodam em container), containers parados, volumes, e o espaço que a VM do Docker ocupa sem contabilizar.
+- **🐳 Docker:** tamanho real do `Docker.raw` e o limite configurado. Também imagens em uso, imagens sem uso (separando as que voltam com `docker pull` das que foram construídas na sua máquina), imagens sem tag, pontos de volta (cada um na sua linha, com o mesmo risco do `--clean`), cache de build (inclusive o de builders `buildx` que rodam em container), containers parados, volumes, e o espaço que a VM do Docker ocupa sem contabilizar.
 - **🛡 Prevenção:** se o cache de build tem limite, se a limpeza automática do Docker vale pro builder que você usa de verdade, se o TRIM está ligado e o teto do disco do Docker.
 - **🧰 Caches de dev:** npm, Yarn, pnpm, pip, Homebrew, Maven, Gradle, Go, Cargo, JetBrains, VS Code, Xcode, Playwright, Ollama, nvm, pyenv, SDKMAN e simuladores iOS.
 - **📦 Apps e dados:** WhatsApp, Chrome, Teams, a VM do Claude (Cowork), backups do iPhone, Downloads, Lixeira e `/Applications`. Também as cópias antigas que alguns apps (como o Chrome) deixam em pastas `*.code_sign_clone` depois de atualizar, e arquivos grandes (500 MB+) na Mesa, Documentos, Downloads e Imagens sem abrir há mais de 6 meses (🟡 para avaliar: vão para a Lixeira).
@@ -123,10 +123,10 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - 🛡️ Pontos de volta de imagens (`antes-*`, `backup-*`…) só viram 🟢 depois de `rollback_days` dias (padrão 2, configurável), contados a partir do sinal mais recente; antes disso ficam 🟡 para avaliar.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
 - 🛡️ Arquivo pessoal só vai para a Lixeira, nunca é apagado direto.
-- 🛡️ Nenhuma pasta montada por um container (rodando ou parado) é sugerida, nem nada dentro dela. Se o Docker está instalado mas não responde e não há uma lista salva, o hogs não sugere arquivos nem caches.
-- 🛡️ Cópias antigas de apps só saem com o app fechado, e só as de versões diferentes da instalada.
+- 🛡️ Nenhuma pasta montada por um container (rodando ou parado) é sugerida, nem nada dentro dela. Vale também para a pasta por trás de um volume nomeado com bind (`--opt o=bind --opt device=/pasta`, comum em compose de banco). Se o Docker está instalado mas não responde e não há uma lista salva, o hogs não sugere arquivos parados nem caches grandes de apps.
+- 🛡️ Cópias antigas de apps só saem com o app fechado, e só as de versões diferentes da instalada. O app conta como aberto se o nome do executável, o nome cortado pelo macOS ou o caminho dele aparecer nos processos.
 - 🛡️ Reiniciar o Mac e aplicar atualizações do macOS são só recomendações: o hogs nunca executa essas ações e elas nunca entram na limpeza nem no “com o recomendado”.
-- O “com o recomendado” soma só os itens 🟢; os 🟡 para avaliar ficam de fora.
+- O “com o recomendado” soma só os itens 🟢; os 🟡 para avaliar ficam de fora. Com o TRIM do Docker desligado, o que se apaga no Docker não volta ao macOS: ele fica fora da conta e o cabeçalho avisa.
 - Nada é apagado sem você confirmar.
 
 ## Worktrees Git

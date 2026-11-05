@@ -175,9 +175,26 @@ def run_all(cmds: list[list[str]], timeout: int = 60) -> None:
         raise RuntimeError((f"{len(errors)} de {len(cmds)} falharam: " if len(cmds) > 1 else "") + errors[0])
 
 
+MAXCOMLEN = 16   # o kernel guarda o nome do processo cortado nesse tamanho
+
+
+def ere_escape(text: str) -> str:
+    """Texto literal numa regex estendida (a do pgrep): "App (Beta)" não vira grupo."""
+    return re.sub(r"([.\[\]()*+?{}|^$\\])", r"\\\1", text)
+
+
 def process_running(name: str) -> bool:
-    r = sh(["pgrep", "-x", name])
-    return bool(r and r.returncode == 0)
+    """Processo com esse executável aberto: pelo nome inteiro, pelo nome cortado em MAXCOMLEN ou pelo caminho
+    do executável do app. Qualquer um que casar conta como aberto (na dúvida, aberto)."""
+    patterns = [["-x", ere_escape(name)]]
+    if len(name) > MAXCOMLEN:
+        patterns.append(["-x", ere_escape(name[:MAXCOMLEN])])
+    patterns.append(["-f", ere_escape(f"/Contents/MacOS/{name}") + "( |$)"])
+    for args in patterns:
+        r = sh(["pgrep", *args])
+        if r and r.returncode == 0:
+            return True
+    return False
 
 
 def empty_dir(path: Path) -> None:
@@ -285,6 +302,25 @@ def builder_of_volume(volume: str, builders: list[dict]) -> str | None:
     return next((b["name"] for b in builders if m.group(1) in b["nodes"]), m.group(1))
 
 
+def bind_volume_folders(names: list[str]) -> list[Path]:
+    """Pastas do host por trás de volumes nomeados com bind (`--opt type=none --opt o=bind --opt device=/pasta`,
+    comum em compose de banco). Qualquer falha levanta ValueError: na dúvida, mounts desconhecidos."""
+    if not names:
+        return []
+    r = sh(["docker", "volume", "inspect", "--format", "{{json .Options}}", *names])
+    if not r or r.returncode != 0:
+        raise ValueError("docker volume inspect falhou")
+    lines = [line for line in r.stdout.splitlines() if line.strip()]
+    if len(lines) != len(names):
+        raise ValueError("docker volume inspect respondeu pela metade")
+    folders = []
+    for line in lines:
+        opts = json.loads(line) or {}
+        if "bind" in str(opts.get("o", "")) and opts.get("device"):
+            folders.append(Path(opts["device"]).resolve())
+    return folders
+
+
 def gather_docker() -> Docker:
     d = Docker()
     try:
@@ -349,11 +385,15 @@ def gather_docker() -> Docker:
         try:
             if not r or r.returncode != 0:
                 raise ValueError("inspect falhou")
-            found = []
+            found, volumes = [], []
             for line in r.stdout.splitlines():
                 if line.strip():
-                    found += [Path(m["Source"]).resolve() for m in json.loads(line) or []
-                              if m.get("Type") == "bind" and m.get("Source")]
+                    for m in json.loads(line) or []:
+                        if m.get("Type") == "bind" and m.get("Source"):
+                            found.append(Path(m["Source"]).resolve())
+                        elif m.get("Type") == "volume" and m.get("Name") and m["Name"] not in volumes:
+                            volumes.append(m["Name"])
+            found += bind_volume_folders(volumes)
             d.mounts, d.mounts_ok = sorted(set(found)), True
         except (ValueError, TypeError, AttributeError, KeyError, OSError, RuntimeError):
             d.mounts, d.mounts_ok = [], False
@@ -2066,14 +2106,8 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
 
 
 def rollback_rows(rollbacks: list[tuple[dict, int, Risk, str]]) -> list[tuple[str, int, Risk, str]]:
-    """Pontos de volta numa linha por risco, o mesmo do --clean (🟢 passados do prazo, 🟡 recentes)."""
-    rows = []
-    for risk, label in ((SAFE, "Pontos de volta"), (EVAL, "Pontos de volta recentes")):
-        sel = [(img, size) for img, size, r, _ in rollbacks if r is risk]
-        if sel:
-            rows.append((f"{label} ({len(sel)})", sum(size for _, size in sel), risk,
-                         preview([img["name"] for img, _ in sel])))
-    return rows
+    """Cada ponto de volta numa linha própria, com o mesmo risco e a mesma dica do --clean."""
+    return [(f"Ponto de volta {img['name']}", size, risk, hint) for img, size, risk, hint in rollbacks]
 
 
 def stopped_rows(stopped: list[dict]) -> list[tuple[str, int, Risk, str]]:
@@ -2154,12 +2188,19 @@ def breakdown(s: Snapshot) -> list[tuple[str, int, str]]:
                        ("Não identificado", unknown, "grey50"), ("Livre", s.free, "green")]
 
 
+def docker_trim_off() -> bool:
+    """TRIM do Docker Desktop desligado de forma explícita; sem a configuração, não se sabe (conta como ligado)."""
+    return read_json(DOCKER_SETTINGS).get("DiskTRIM") is False
+
+
 def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item] | None = None) -> Panel:
     used = s.total - s.free
     segs = breakdown(s)
     if cleanable is None:
         cleanable = clean_items(s)
-    recommended = s.free + sum(i.size for i in cleanable if i.risk is SAFE)
+    # Com o TRIM desligado, o que se apaga no Docker fica preso no Docker.raw: não volta ao macOS.
+    trim_off = docker_trim_off()
+    recommended = s.free + sum(i.size for i in cleanable if i.risk is SAFE and not (trim_off and i.cat == "docker"))
 
     width = 64
     bar, cum, pos = Text(), 0, 0
@@ -2175,6 +2216,8 @@ def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item]
     line = Text.assemble(("Macintosh HD", "bold"), f"  ·  {fmt(used)} de {fmt(s.total)} usados  ·  ",
                          (f"{fmt(s.free)} livres", f"bold {free_color}"), "  ·  com o recomendado: ",
                          (f"{fmt(recommended)} livres", "bold green"))
+    if trim_off:
+        line.append(" (Docker não devolve espaço: TRIM desligado)", style="yellow")
     body = [line, Text(), bar, legend]
     if records and (t := trend(s, records, time.time())) is not None:
         body += [Text(), t]
@@ -2239,7 +2282,7 @@ def prevention_panel(s: Snapshot) -> Panel | None:
         row(bool(gc_gb), "Limpeza automática do Docker (daemon.json): desligada",
             "o --docker-gc cobre isso" if gc_gb else "Docker › Settings › Docker Engine")
 
-    if read_json(DOCKER_SETTINGS).get("DiskTRIM") is False:
+    if docker_trim_off():
         row(False, "TRIM desligado: o espaço apagado no Docker não volta pro macOS",
             "Docker › Settings › Resources › Advanced")
     if d.raw_limit:
@@ -2271,9 +2314,12 @@ def recommended_panel(s: Snapshot, cleanable: list[Item]) -> Panel:
     for label, size, how in s.advice:
         t.add_row(f"💻 {label}", f"~{fmt(size)}" if size else "", Text("↻", style="cyan"), how)
     evals = [i for i in cleanable if i.risk is EVAL]
+    files = [i for i in evals if i.cat != "docker"]
+    rollbacks = [i for i in evals if i.cat == "docker"]
+    names = ", ".join(i.label.removeprefix("Ponto de volta ") for i in rollbacks)
     for title, sel, why in (
-            ("🗂  Arquivos parados para avaliar", [i for i in evals if i.cat != "docker"], "vão para a Lixeira"),
-            ("🐳 Pontos de volta recentes", [i for i in evals if i.cat == "docker"], "o QA pode estar em andamento")):
+            ("🗂  Arquivos parados para avaliar", files, "vão para a Lixeira"),
+            ("🐳 Pontos de volta recentes", rollbacks, f"o QA pode estar em andamento: {names}")):
         if sel:
             t.add_row(f"{title} ({len(sel)})", fmt(sum(i.size for i in sel)), Text(EVAL.icon),
                       f"{why} · um por um no hogs --clean")
