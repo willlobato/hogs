@@ -2,6 +2,8 @@ import io
 import sys
 import json
 import os
+import plistlib
+import stat
 import subprocess
 import tempfile
 import time
@@ -12,6 +14,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import hogs  # noqa: E402
+
+
+class SettingTest(unittest.TestCase):
+    def test_defaults_and_valid_overrides(self):
+        with mock.patch.object(hogs, "load_config", return_value={}):
+            self.assertEqual(hogs.setting("rollback_days"), 2)
+            self.assertEqual(hogs.setting("stale_worktree_days"), 30)
+            self.assertIn("antes", hogs.setting("rollback_tags"))
+        with mock.patch.object(hogs, "load_config", return_value={"rollback_days": 5, "rollback_tags": ["old"]}):
+            self.assertEqual(hogs.setting("rollback_days"), 5)
+            self.assertEqual(hogs.setting("rollback_tags"), ["old"])
+
+    def test_invalid_values_fall_back_to_default(self):
+        for bad in ({"rollback_days": "5"}, {"rollback_days": 0}, {"rollback_days": -1}, {"rollback_tags": "antes"}):
+            with mock.patch.object(hogs, "load_config", return_value=bad):
+                self.assertEqual(hogs.setting(next(iter(bad))), hogs.DEFAULTS[next(iter(bad))])
 
 
 class ParseSizeTest(unittest.TestCase):
@@ -26,6 +44,56 @@ class ParseSizeTest(unittest.TestCase):
         self.assertEqual(hogs.parse_size(""), 0)
         self.assertEqual(hogs.parse_size("N/A"), 0)
         self.assertEqual(hogs.parse_size("-1.476e+09B"), 0)
+
+
+class ToolCacheTest(unittest.TestCase):
+    def test_only_big_cache_children_outside_mounts(self):
+        c = hogs.CACHES
+        sizes = {c / "ferramenta-x": 2_800_000_000, c / "pequeno": 10_000_000, hogs.HOME / "outra": 9e9,
+                 c / "montado": 3e9}
+        items = hogs.cache_items(sizes, [c / "montado"])
+        self.assertEqual([(i.label, i.risk) for i in items], [("Cache: ferramenta-x", hogs.REDOWN)])
+
+    def _gather(self, mounts, known):
+        import io
+        from unittest import mock
+        from rich.console import Console
+        big = hogs.CACHES / "ferramenta-x"
+        other = hogs.HOME / "pasta-grande"
+        sizes = {big: 2_800_000_000, other: 900_000_000}
+        with mock.patch.object(hogs, "gather_docker", return_value=hogs.Docker()), \
+                mock.patch.object(hogs, "scan_candidates", return_value=[big, other]), \
+                mock.patch.object(hogs, "du", side_effect=lambda p: sizes.get(p, 0)), \
+                mock.patch.object(hogs, "gather_apps", return_value=[]), \
+                mock.patch.object(hogs, "known_mounts", return_value=(mounts, known)), \
+                mock.patch.object(hogs, "under_mount", return_value=False), \
+                mock.patch.object(hogs, "gather_system", return_value=None), \
+                mock.patch.object(hogs, "sign_clone_root", return_value=None), \
+                mock.patch.object(hogs, "stale_personal", return_value=[]), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            snap = hogs.gather(Console(file=io.StringIO()))
+        return snap, hogs.short(big)
+
+    def test_gather_mounts_unknown_offers_nothing(self):
+        snap, big = self._gather([], False)
+        self.assertFalse([i for i in snap.items if i.label.startswith("Cache: ")])
+        self.assertIn(big, [n for n, _ in snap.others])
+
+    def test_mounts_unknown_blocks_only_scan_based_blocks_not_path_defs(self):
+        # CLAUDE.md: com mounts desconhecidos, só os blocos que acham arquivos por varredura (arquivos pessoais e
+        # caches grandes de apps) deixam de sugerir; os itens de PATH_DEFS continuam como sempre.
+        snap, _ = self._gather([], False)
+        labels = {i.label for i in snap.items}
+        self.assertTrue({pd.label for pd in hogs.PATH_DEFS} <= labels)
+        self.assertFalse([i for i in snap.items if i.label.startswith(("Cache: ", "Parado: "))])
+        claude_md = (Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text()
+        self.assertFalse("no file suggestions at all" in claude_md, "CLAUDE.md promete mais do que o código faz")
+
+    def test_gather_mounts_known_moves_cache_out_of_others(self):
+        snap, big = self._gather([], True)
+        self.assertEqual([i.label for i in snap.items if i.label.startswith("Cache: ")], ["Cache: ferramenta-x"])
+        self.assertNotIn(big, [n for n, _ in snap.others])
+        self.assertEqual(len(snap.others), 1)
 
 
 class FmtTest(unittest.TestCase):
@@ -49,6 +117,124 @@ class ImageOriginTest(unittest.TestCase):
         self.assertEqual(hogs.image_origin("grafana/grafana"), "hub")
         self.assertEqual(hogs.image_origin("nginx"), "hub")
         self.assertEqual(hogs.image_origin("my-local-build"), "local")
+
+
+class PersonalTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.old = time.time() - 400 * 86400
+
+    def file(self, rel, blocks):
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+        os.utime(p, (self.old, self.old))
+        return p, blocks
+
+    def test_only_big_old_allocated_files_outside_packages_repos_and_mounts(self):
+        files = dict([self.file("video.mov", 2_000_000), self.file("nuvem.zip", 0),
+                      self.file("Fotos.photoslibrary/db", 2_000_000), self.file("proj/.git/HEAD", 1),
+                      self.file("proj/dump.bak", 2_000_000), self.file("db/data.mdf", 2_000_000),
+                      self.file("novo.iso", 2_000_000)])
+        os.utime(self.root / "novo.iso", None)
+        real_stat = Path.lstat
+        def lstat(p):
+            st = real_stat(p)
+            if p in files:
+                return mock.Mock(st_blocks=files[p], st_mtime=st.st_mtime, st_mode=st.st_mode,
+                                 st_birthtime=self.old, st_ctime=self.old)
+            return st
+        with mock.patch.object(hogs.Path, "lstat", lstat), \
+                mock.patch.object(hogs, "spotlight_last_used", return_value=None):
+            found = hogs.stale_personal([self.root], [self.root / "db"], time.time())
+        self.assertEqual([p.name for p, _, _ in found], ["video.mov"])
+        self.assertEqual(found[0][1], 2_000_000 * 512)
+
+    def walk(self, mounts=(), spotlight=None, over=None):
+        """Roda o walker no tempdir; arquivos regulares viram 2 GB alocados, com datas antigas salvo `over`."""
+        real = Path.lstat
+        def lstat(p):
+            st = real(p)
+            if not stat.S_ISREG(st.st_mode):
+                return st
+            f = dict(st_blocks=4_000_000, st_mtime=self.old, st_birthtime=self.old, st_ctime=self.old,
+                     st_mode=st.st_mode)
+            f.update((over or {}).get(p.name, {}))
+            return mock.Mock(**f)
+        with mock.patch.object(hogs.Path, "lstat", lstat), \
+                mock.patch.object(hogs, "spotlight_last_used", return_value=spotlight):
+            return [p.relative_to(self.root).as_posix()
+                    for p, _, _ in hogs.stale_personal([self.root], list(mounts), time.time())]
+
+    def test_recent_birthtime_or_ctime_excludes_copied_files(self):
+        self.file("copiado.mov", 0)
+        self.assertEqual(self.walk(over={"copiado.mov": {"st_birthtime": time.time()}}), [])
+        self.assertEqual(self.walk(over={"copiado.mov": {"st_ctime": time.time()}}), [])
+        self.assertEqual(self.walk(), ["copiado.mov"])
+
+    def test_recent_spotlight_use_excludes_file(self):
+        self.file("a.mov", 0)
+        self.assertEqual(self.walk(spotlight=time.time()), [])
+        self.assertEqual(self.walk(spotlight=self.old), ["a.mov"])
+
+    def test_spotlight_last_used_parsing(self):
+        def run(out, rc=0):
+            return lambda cmd, timeout=60: subprocess.CompletedProcess(cmd, rc, out, "")
+        p = Path("/tmp/x")
+        with mock.patch.object(hogs, "sh", run("(null)\n")):
+            self.assertIsNone(hogs.spotlight_last_used(p))
+        with mock.patch.object(hogs, "sh", run("2025-01-02 03:04:05 +0000")):
+            self.assertEqual(hogs.spotlight_last_used(p), 1735787045.0)
+        with mock.patch.object(hogs, "sh", run("2025-01-02 03:04:05 +0000", 1)):
+            self.assertIsNone(hogs.spotlight_last_used(p))
+        with mock.patch.object(hogs, "sh", lambda cmd, timeout=60: None):
+            self.assertIsNone(hogs.spotlight_last_used(p))
+
+    def test_bind_mounted_file_and_dir_containing_mount(self):
+        self.file("cont/db.img", 0)
+        self.file("cont/outro.mov", 0)
+        self.file("solto.mov", 0)
+        got = self.walk(mounts=[self.root / "cont" / "db.img"])
+        self.assertEqual(sorted(got), ["cont/outro.mov", "solto.mov"])
+        # pasta que apenas contém um mount continua sendo percorrida
+        got = self.walk(mounts=[self.root / "cont" / "sub"])
+        self.assertEqual(sorted(got), ["cont/db.img", "cont/outro.mov", "solto.mov"])
+
+    def test_symlinks_not_followed(self):
+        self.file("real/grande.mov", 0)
+        (self.root / "link.mov").symlink_to(self.root / "real" / "grande.mov")
+        (self.root / "linkdir").symlink_to(self.root / "real")
+        self.assertEqual(self.walk(), ["real/grande.mov"])
+
+    def test_unreadable_dir_skipped(self):
+        self.file("ok.mov", 0)
+        self.file("fechada/x.mov", 0)
+        d = self.root / "fechada"
+        d.chmod(0)
+        try:
+            self.assertEqual(self.walk(), ["ok.mov"])
+        finally:
+            d.chmod(0o755)
+
+    def test_packages_skipped_case_insensitive(self):
+        for pkg in ("A.app", "B.APP", "C.logicx", "D.Photoslibrary", "E.utm"):
+            self.file(pkg + "/Contents/big.bin", 0)
+        self.file("normal/x.mov", 0)
+        self.assertEqual(self.walk(), ["normal/x.mov"])
+
+    def test_trash_passes_path_as_argument_never_inside_script(self):
+        calls = []
+        ok = lambda cmd, timeout=60: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")
+        weird = Path('/tmp/a "b" ção.mov')
+        with mock.patch.object(hogs, "sh", ok):
+            hogs.move_to_trash(weird)
+        self.assertEqual(calls[0][-1], str(weird))
+        self.assertTrue(all(str(weird) not in part for part in calls[0][:-1]))
+
+    def test_personal_items_are_eval_never_safe(self):
+        items = hogs.personal_items([(Path("/tmp/x.mov"), 2e9, time.time() - 200 * 86400)], time.time())
+        self.assertIs(items[0].risk, hogs.EVAL)
+        self.assertIn("Lixeira", items[0].hint)
 
 
 class SelectionTest(unittest.TestCase):
@@ -83,6 +269,126 @@ class ParseGbTest(unittest.TestCase):
         for bad in ("nan", "inf", "0", "-3", "x"):
             with self.assertRaises(SystemExit, msg=bad):
                 hogs.parse_gb(bad, "uso")
+
+
+class RollbackTest(unittest.TestCase):
+    W = ["antes", "backup"]
+
+    def test_base_of_rollback_tags(self):
+        self.assertEqual(hogs.rollback_base("antes-20261104-2004", self.W), "latest")
+        self.assertEqual(hogs.rollback_base("web-local-antes-checkout", self.W), "web-local")
+        self.assertEqual(hogs.rollback_base("Backup-1", self.W), "latest")
+        self.assertIsNone(hogs.rollback_base("latest", self.W))
+        self.assertIsNone(hogs.rollback_base("antesx", self.W))
+
+    def test_tag_date(self):
+        self.assertEqual(hogs.tag_date("antes-20261104-2004"), time.mktime((2026, 11, 4, 20, 4, 0, 0, 0, -1)))
+        self.assertIsNone(hogs.tag_date("antes-tema-qa"))
+
+    def test_age_uses_youngest_signal(self):
+        now = time.time()
+        img = {"tag": "antes-20200101-0000"}
+        self.assertAlmostEqual(hogs.rollback_age_days(img, {"created_at": now - 3 * 86400}, now - 10 * 86400, now), 3, 1)
+        self.assertAlmostEqual(hogs.rollback_age_days(img, {"created_at": None}, now - 1 * 86400, now), 1, 1)
+
+    def test_first_seen_corrupt_or_future_is_now(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "SEEN_TAGS", tmp / "s.json"), mock.patch.object(hogs, "DATA_DIR", tmp):
+            (tmp / "s.json").write_text("{lixo")
+            self.assertEqual(hogs.first_seen(["a:antes-1"], 100.0), {"a:antes-1": 100.0})
+            (tmp / "s.json").write_text(json.dumps({"a:antes-1": 999.0, "sumiu:x": 5.0}))
+            self.assertEqual(hogs.first_seen(["a:antes-1"], 100.0), {"a:antes-1": 100.0})
+
+    def items(self, ages_days, current=True):
+        now = time.time()
+        d = hogs.Docker(running=True)
+        d.images = [{"name": "app:antes-x", "repo": "app", "tag": "antes-x", "ref": "app:antes-x", "size": 7e8,
+                     "used": False, "origin": "local", "created": "", "id": "1", "created_at": now - 90 * 86400}]
+        if current:
+            d.images.append({"name": "app:latest", "repo": "app", "tag": "latest", "ref": "app:latest", "size": 7e8,
+                             "used": True, "origin": "local", "created": "", "id": "2",
+                             "created_at": now - ages_days * 86400})
+        with mock.patch.object(hogs, "first_seen", return_value={"app:antes-x": now - 90 * 86400}), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            return {i.label: i for i in hogs.docker_clean_items(d)}
+
+    def test_old_rollback_is_safe_recent_is_eval_and_never_grouped(self):
+        item = self.items(3)["Ponto de volta app:antes-x"]
+        self.assertIs(item.risk, hogs.SAFE)
+        self.assertIs(self.items(1)["Ponto de volta app:antes-x"].risk, hogs.EVAL)
+        calls = []
+        with mock.patch.object(hogs, "sh", lambda cmd, timeout=60: calls.append(cmd) or
+                               subprocess.CompletedProcess(cmd, 0, "", "")):
+            item.action()
+        self.assertEqual(calls, [["docker", "rmi", "app:antes-x"]])  # só a tag, nunca o ID
+
+    def test_without_current_image_it_stays_a_local_loss(self):
+        labels = self.items(3, current=False)
+        self.assertNotIn("Ponto de volta app:antes-x", labels)
+        self.assertIs(labels["Imagem app:antes-x"].risk, hogs.LOSS)
+
+
+    def build(self, rollback_extra=None, current_extra=None, tag="antes-x"):
+        now = time.time()
+        d = hogs.Docker(running=True)
+        roll = {"name": f"app:{tag}", "repo": "app", "tag": tag, "ref": f"app:{tag}", "size": 7e8, "used": False,
+                "origin": "local", "created": "", "id": "1", "created_at": now - 90 * 86400}
+        cur = {"name": "app:latest", "repo": "app", "tag": "latest", "ref": "app:latest", "size": 7e8,
+               "used": True, "origin": "local", "created": "", "id": "2", "created_at": now - 90 * 86400}
+        roll.update(rollback_extra or {})
+        cur.update(current_extra or {})
+        d.images = [roll, cur]
+        return d, now
+
+    def run_items(self, d, seen):
+        with mock.patch.object(hogs, "first_seen", return_value=seen), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            return {i.label: i for i in hogs.docker_clean_items(d)}
+
+    def test_no_reliable_old_signal_is_eval(self):
+        d, now = self.build(current_extra={"created_at": None})
+        item = self.run_items(d, {"app:antes-x": now})["Ponto de volta app:antes-x"]
+        self.assertIs(item.risk, hogs.EVAL)
+
+    def test_recent_date_in_tag_name_drives_eval(self):
+        tag = "antes-" + time.strftime("%Y%m%d") + "-0000"
+        d, now = self.build(tag=tag)
+        item = self.run_items(d, {f"app:{tag}": now - 90 * 86400})[f"Ponto de volta app:{tag}"]
+        self.assertIs(item.risk, hogs.EVAL)
+
+    def test_first_seen_not_called_without_rollback_candidates(self):
+        d = hogs.Docker(running=True)
+        d.images = [{"name": "app:v1", "repo": "app", "tag": "v1", "ref": "app:v1", "size": 7e8, "used": False,
+                     "origin": "local", "created": "", "id": "1"}]
+        with mock.patch.object(hogs, "first_seen") as fs, mock.patch.object(hogs, "load_config", return_value={}):
+            hogs.docker_clean_items(d)
+        fs.assert_not_called()
+
+    def test_small_hub_rollback_is_not_repeated_in_small_images_group(self):
+        d, now = self.build(rollback_extra={"origin": "hub", "size": 1e8}, current_extra={"origin": "hub"})
+        labels = self.run_items(d, {"app:antes-x": now - 90 * 86400})
+        self.assertIn("Ponto de volta app:antes-x", labels)
+        self.assertFalse([k for k in labels if k.startswith("Imagens pequenas")])
+
+    def test_same_image_as_current_frees_nothing(self):
+        d, now = self.build(rollback_extra={"id": "2"})
+        item = self.run_items(d, {"app:antes-x": now - 90 * 86400})["Ponto de volta app:antes-x"]
+        self.assertEqual(item.size, 0)
+        self.assertIn("só remove a tag", item.hint)
+
+    def test_parse_epoch(self):
+        self.assertEqual(hogs.parse_epoch("2026-11-04 20:04:12 -0300 -03"),
+                         datetime(2026, 11, 4, 23, 4, 12, tzinfo=timezone.utc).timestamp())
+        self.assertIsNone(hogs.parse_epoch("lixo"))
+        self.assertIsNone(hogs.parse_epoch(""))
+
+    def test_gather_docker_reads_created_at(self):
+        img = {"Repository": "app", "Tag": "latest", "ID": "sha256:" + "a" * 64, "UniqueSize": "1GB",
+               "Containers": "0", "CreatedSince": "1 hour ago", "CreatedAt": "2026-11-04 20:04:12 -0300 -03"}
+        sh, _ = DockerCleanItemsTest.fake_docker(images=[img])
+        with mock.patch.object(hogs, "sh", sh):
+            d = hogs.gather_docker()
+        self.assertEqual(d.images[0]["created_at"], hogs.parse_epoch("2026-11-04 20:04:12 -0300 -03"))
 
 
 class AgoTest(unittest.TestCase):
@@ -213,6 +519,125 @@ class DockerCleanItemsTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
+class MountsTest(unittest.TestCase):
+    def test_under_mount_both_directions(self):
+        m = [Path("/u/dev/db/data")]
+        self.assertTrue(hogs.under_mount(Path("/u/dev/db/data/x.mdf"), m))
+        self.assertTrue(hogs.under_mount(Path("/u/dev/db"), m))
+        self.assertFalse(hogs.under_mount(Path("/u/dev/dbx"), m))
+
+    @staticmethod
+    def gather_with(mounts_reply, state="exited", containers=True, volumes_reply=None, calls=None):
+        """gather_docker com `docker inspect` de mounts respondendo `mounts_reply` (None = sh falhou) e
+        `docker volume inspect` respondendo `volumes_reply`."""
+        cs = [{"ID": "a" * 64, "Names": "db", "State": state, "Labels": "", "Size": "1MB"}] if containers else []
+        sh, _ = DockerCleanItemsTest.fake_docker(containers=cs, inspect=None)
+
+        def sh2(cmd, timeout=60):
+            if calls is not None:
+                calls.append(cmd)
+            if cmd[:3] == ["docker", "volume", "inspect"]:
+                return volumes_reply
+            if cmd[:2] == ["docker", "inspect"]:
+                if "Mounts" in cmd[3]:
+                    return mounts_reply(cmd) if callable(mounts_reply) else mounts_reply
+                return subprocess.CompletedProcess(cmd, 0, f"{'a' * 64}|2020-01-01T00:00:00Z|2019-01-01T00:00:00Z\n", "")
+            return sh(cmd, timeout)
+        with mock.patch.object(hogs, "sh", sh2):
+            return hogs.gather_docker()
+
+    @staticmethod
+    def ok(out):
+        return subprocess.CompletedProcess([], 0, out, "")
+
+    BINDS = json.dumps([{"Type": "bind", "Source": "/tmp/dados-db"}, {"Type": "volume", "Source": "/var/lib/x"}]) + "\n"
+
+    def test_gather_reads_bind_mounts_of_stopped_containers_too(self):
+        d = self.gather_with(self.ok(self.BINDS))
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [Path("/tmp/dados-db").resolve()])
+
+    def test_gather_reads_bind_mounts_of_running_containers(self):
+        d = self.gather_with(self.ok(self.BINDS), state="running")
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [Path("/tmp/dados-db").resolve()])
+
+    def test_gather_mounts_unknown_when_inspect_fails(self):
+        for reply in (None, subprocess.CompletedProcess([], 1, "", "erro"), self.ok("não é json\n")):
+            d = self.gather_with(reply)
+            self.assertFalse(d.mounts_ok)
+            self.assertEqual(d.mounts, [])
+
+    def test_gather_mounts_unknown_when_resolve_raises(self):
+        with mock.patch.object(Path, "resolve", side_effect=OSError("x")):
+            d = self.gather_with(self.ok(self.BINDS))
+        self.assertFalse(d.mounts_ok)
+
+    def test_gather_without_containers_is_ok_and_empty(self):
+        d = self.gather_with(None, containers=False)
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [])
+
+    # Volume nomeado com driver_opts de bind (`--opt type=none --opt o=bind --opt device=/pasta`): o mount do
+    # container é `volume`, mas os dados ficam na pasta do host.
+    VOLUMES = json.dumps([{"Type": "volume", "Name": "pgdata", "Source": "/var/lib/docker/volumes/pgdata/_data"},
+                          {"Type": "volume", "Name": "cache", "Source": "/var/lib/docker/volumes/cache/_data"},
+                          {"Type": "volume", "Name": "pgdata", "Source": "/var/lib/docker/volumes/pgdata/_data"}]) + "\n"
+
+    def test_bind_backed_named_volume_protects_its_host_folder(self):
+        host = Path(tempfile.mkdtemp())
+        calls = []
+        options = json.dumps({"device": str(host), "o": "bind", "type": "none"}) + "\nnull\n"
+        d = self.gather_with(self.ok(self.VOLUMES), volumes_reply=self.ok(options), calls=calls)
+        self.assertTrue(d.mounts_ok)
+        self.assertEqual(d.mounts, [host.resolve()])
+        volume_calls = [c for c in calls if c[:3] == ["docker", "volume", "inspect"]]
+        self.assertEqual(len(volume_calls), 1)   # uma chamada só, cada volume uma vez
+        self.assertEqual(volume_calls[0][-2:], ["pgdata", "cache"])
+        self.assertTrue(hogs.under_mount(host / "base.mdf", d.mounts))
+
+    def test_rbind_with_options_also_protects(self):
+        host = Path(tempfile.mkdtemp())
+        options = json.dumps({"device": str(host), "o": "rbind,ro", "type": "none"}) + "\nnull\n"
+        d = self.gather_with(self.ok(self.VOLUMES), volumes_reply=self.ok(options))
+        self.assertEqual(d.mounts, [host.resolve()])
+
+    def test_volume_options_unknown_means_mounts_unknown(self):
+        for reply in (None, subprocess.CompletedProcess([], 1, "", "Error: no such volume"), self.ok("lixo\n"),
+                      self.ok("null\n")):   # resposta com menos linhas que volumes
+            d = self.gather_with(self.ok(self.VOLUMES), volumes_reply=reply)
+            self.assertFalse(d.mounts_ok, reply)
+            self.assertEqual(d.mounts, [])
+
+    def test_under_mount_resolves_the_path(self):
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        (tmp / "real").mkdir()
+        (tmp / "link").symlink_to(tmp / "real")
+        self.assertTrue(hogs.under_mount(tmp / "link" / "x.mdf", [tmp / "real"]))
+        self.assertTrue(hogs.under_mount(tmp / "link", [tmp / "real"]))
+
+    def test_corrupt_saved_mounts_count_as_nothing_saved(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "MOUNTS_FILE", tmp / "m.json"), \
+                mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"):
+            for body in ('{"mounts": [1, 2]}', '{"mounts": "x"}', '[1]', 'lixo', '{"mounts": [""]}'):
+                (tmp / "m.json").write_text(body)
+                self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], False), body)
+
+    def test_known_mounts_falls_back_to_saved_then_unknown(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "MOUNTS_FILE", tmp / "m.json"), \
+                mock.patch.object(hogs.shutil, "which", return_value="/usr/bin/docker"):
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], False))
+            hogs.known_mounts(hogs.Docker(running=True, mounts=[Path("/x/db")], mounts_ok=True))
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([Path("/x/db")], True))
+
+    def test_no_docker_installed_means_no_mounts_known_ok(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "MOUNTS_FILE", tmp / "m.json"), mock.patch.object(hogs.shutil, "which", return_value=None):
+            self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], True))
+
+
 class BuilderTest(unittest.TestCase):
     builders = [{"name": "multiarch", "driver": "docker-container", "nodes": ["multiarch0"], "running": True},
                 {"name": "default", "driver": "docker", "nodes": ["default"], "running": True},
@@ -250,6 +675,237 @@ class BuilderTest(unittest.TestCase):
 
         with mock.patch.object(hogs, "sh", fake_sh), mock.patch.object(hogs, "list_builders", return_value=self.builders[:1]):
             self.assertEqual(hogs.trim_builders(20), [("multiarch", 0, "ERROR: boom")])
+
+
+class SystemTest(unittest.TestCase):
+    APFS = plistlib.dumps({"Containers": [{"ContainerReference": "disk3", "Volumes": [
+        {"Roles": ["System"], "CapacityInUse": 18_000_000_000}, {"Roles": ["Preboot"], "CapacityInUse": 17_300_000_000},
+        {"Roles": ["Data"], "CapacityInUse": 411_000_000_000}, {"Roles": ["VM"], "CapacityInUse": 15_000_000_000},
+        {"Roles": [], "CapacityInUse": 1}]}, {"ContainerReference": "disk6", "Volumes": [
+        {"Roles": ["Data"], "CapacityInUse": 43_000_000}]}]})
+
+    def test_parse_apfs_only_our_container(self):
+        v = hogs.parse_apfs(self.APFS, "disk3")
+        self.assertEqual(v["Preboot"], 17_300_000_000)
+        self.assertEqual(v["Data"], 411_000_000_000)
+        self.assertNotIn("", v)
+
+    def test_parse_swap_and_boot(self):
+        self.assertEqual(hogs.parse_swap("total = 15360,00M  used = 13799,12M  free = 1560,88M  (encrypted)"),
+                         int(13799.12 * 2**20))
+        self.assertEqual(hogs.parse_swap("total = 2048.00M  used = 0.00M  free = 2048.00M"), 0)
+        self.assertAlmostEqual(hogs.parse_boottime("{ sec = 1000, usec = 0 } Mon", 1000 + 86 * 86400), 86)
+
+    def test_advice_only_when_it_pays_and_never_an_item(self):
+        si = hogs.SystemInfo({"Preboot": 17_300_000_000}, 13_800_000_000, 86, True)
+        labels = [a[0] for a in hogs.system_advice(si)]
+        self.assertEqual(labels, ["Reiniciar o Mac", "Aplicar a atualização do macOS"])
+        self.assertEqual(hogs.system_advice(hogs.SystemInfo({"Preboot": 5e9}, 13_800_000_000, 3, False)), [])
+
+
+class BreakdownTest(unittest.TestCase):
+    def snap(self, raw, dev, others):
+        d = hogs.Docker(raw_real=raw)
+        items = [hogs.Item("dev", "npm", dev, hogs.SAFE)]
+        si = hogs.SystemInfo({"System": 18e9, "Preboot": 17e9, "VM": 15e9, "Data": 400e9}, 0, 1, False)
+        return hogs.Snapshot(494e9, 28e9, d, items, [("~/x", others)], system=si)
+
+    def test_parts_sum_to_used_and_unknown_is_never_negative(self):
+        for raw, dev, others in ((92e9, 18e9, 60e9), (300e9, 100e9, 200e9)):
+            parts = dict((k, v) for k, v, _ in hogs.breakdown(self.snap(raw, dev, others)))
+            self.assertGreaterEqual(parts["Não identificado"], 0)
+            self.assertAlmostEqual(sum(v for k, v in parts.items() if k != "Livre"), 466e9, delta=1e6)
+            self.assertEqual(parts["macOS e swap"], 50e9)
+            self.assertEqual(parts["Livre"], 28e9)
+
+    def test_advice_and_eval_never_count_as_recommended_space(self):
+        s = self.snap(92e9, 0, 0)
+        s.items.append(hogs.Item("apps", "Parado: ~/x.mov", 5e9, hogs.EVAL, lambda: None))
+        s.advice = [("Reiniciar o Mac", 13e9, "")]
+        con = hogs.Console(file=io.StringIO(), width=140)
+        con.print(hogs.header(s))
+        self.assertIn("com o recomendado: 28,0 GB livres", con.file.getvalue())
+
+    def test_trim_off_docker_space_is_not_recommended_space(self):
+        s = self.snap(92e9, 0, 0)
+        cleanable = [hogs.Item("docker", "Docker: cache de build", 10e9, hogs.SAFE, lambda: None),
+                     hogs.Item("apps", "Lixeira", 2e9, hogs.SAFE, lambda: None)]
+        tmp = Path(tempfile.mkdtemp())
+
+        def header(settings):
+            if settings is not None:
+                (tmp / "settings.json").write_text(json.dumps(settings))
+            con = hogs.Console(file=io.StringIO(), width=220)
+            with mock.patch.object(hogs, "DOCKER_SETTINGS", tmp / "settings.json"):
+                con.print(hogs.header(s, [], cleanable))
+            return " ".join(con.file.getvalue().split())
+        note = "(Docker não devolve espaço: TRIM desligado)"
+        out = header(None)                       # sem o arquivo: TRIM desconhecido, não é "desligado"
+        self.assertIn("com o recomendado: 40,0 GB livres", out)
+        self.assertNotIn(note, out)
+        out = header({"DiskTRIM": True})
+        self.assertIn("com o recomendado: 40,0 GB livres", out)
+        self.assertNotIn(note, out)
+        out = header({"DiskTRIM": False})
+        self.assertIn("com o recomendado: 30,0 GB livres", out)
+        self.assertIn(note, out)
+
+    def render_report(self, s):
+        con = hogs.Console(file=io.StringIO(), width=160)
+        with mock.patch.object(hogs, "load_config", return_value={}):
+            hogs.report(con, s, [])
+        return con.file.getvalue()
+
+    def test_report_recommends_only_safe_and_lists_what_it_protects(self):
+        s = self.snap(92e9, 0, 0)
+        s.items += [hogs.Item("apps", "Lixeira", 2e9, hogs.SAFE, lambda: None),
+                    hogs.Item("apps", "Parado: ~/a.mov", 5e9, hogs.EVAL, lambda: None, kind="pessoal"),
+                    hogs.Item("apps", "Parado: ~/b.iso", 1e9, hogs.EVAL, lambda: None, kind="pessoal"),
+                    hogs.Item("docker", "Ponto de volta app:antes-x", 3e9, hogs.EVAL, lambda: None,
+                              kind="ponto_de_volta")]
+        s.advice = [("Reiniciar o Mac", 13e9, "swap 13,0 GB · ligado há 20 dias")]
+        s.docker.live = ["shop-db"]
+        s.mounts = [Path("/u/dev/db/data")]
+        out = self.render_report(s)
+        self.assertIn("com o recomendado: 30,0 GB livres", out)
+        recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        self.assertIn("Lixeira", recommended)
+        self.assertIn("↻", recommended)
+        files = next(line for line in recommended.splitlines() if "Arquivos parados para avaliar (2)" in line)
+        self.assertIn("6,0 GB", files)
+        rollbacks = next(line for line in recommended.splitlines() if "Pontos de volta recentes (1)" in line)
+        self.assertIn("3,0 GB", rollbacks)
+        self.assertNotIn("Docker não respondeu", out)
+        protected = out.split("🛡 Não mexo")[1]
+        self.assertIn("1 container rodando (shop-db)", protected)
+        self.assertIn("1 caminho montado em containers (/u/dev/db/data)", protected)
+
+    def test_report_says_why_files_are_not_suggested_without_docker(self):
+        s = self.snap(0, 0, 0)
+        s.mounts_known = False
+        out = " ".join(self.render_report(s).split())
+        self.assertIn("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.", out)
+        protected = out.split("🛡 Não mexo")[1]
+        self.assertIn("Docker não respondeu: não sei o que está em uso.", protected)
+        self.assertNotIn("Nada em uso pelo Docker agora", protected)
+
+    def test_report_shows_guard_reason_of_open_app(self):
+        s = self.snap(0, 0, 0)
+        group = hogs.CloneGroup("Navegador", "Navegador", "122.0", {"120.0": [Path("/x/c1")]})
+        with mock.patch.object(hogs, "du", return_value=2e9):
+            s.items += hogs.sign_clone_items([group])
+        with mock.patch.object(hogs, "process_running", return_value=True):
+            recommended = self.render_report(s).split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        line = next(line for line in recommended.splitlines() if "Cópias antigas do Navegador" in line)
+        self.assertIn("feche o Navegador antes", line)
+
+    def test_rollback_risk_in_report_rows_matches_clean(self):
+        tmp = Path(tempfile.mkdtemp())
+        now = time.time()
+        (tmp / "s.json").write_text(json.dumps({"app:antes-velho": now - 30 * 86400}))
+
+        def img(tag, used=False):
+            return {"name": f"app:{tag}", "repo": "app", "tag": tag, "ref": f"app:{tag}", "size": 1e9, "used": used,
+                    "origin": "local", "created": "", "id": tag, "created_at": now - 60 * 86400}
+        d = hogs.Docker(running=True, images=[img("latest", True), img("antes-velho"), img("antes-novo")])
+        with mock.patch.object(hogs, "SEEN_TAGS", tmp / "s.json"), mock.patch.object(hogs, "DATA_DIR", tmp), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            clean = {i.label.split()[-1]: i.risk for i in hogs.clean_items(hogs.Snapshot(1, 1, d, [], []))
+                     if i.label.startswith("Ponto de volta")}
+            rows = hogs.docker_rows(d)
+            con = hogs.Console(file=io.StringIO(), width=160)
+            con.print(hogs.unused_images_table(d))
+        self.assertEqual(clean, {"app:antes-velho": hogs.SAFE, "app:antes-novo": hogs.EVAL})
+        for name, risk in clean.items():
+            row = next(r for r in rows if r[0] == f"Ponto de volta {name}")
+            self.assertIs(row[2], risk)
+        self.assertIn(("Imagens sem uso, construídas aqui (0)", 0), [(r[0], r[1]) for r in rows])
+        table = con.file.getvalue()
+        self.assertNotIn("construída aqui", table)
+        self.assertIn(f"{hogs.SAFE.icon} ponto de volta", table)
+        self.assertIn(f"{hogs.EVAL.icon} ponto de volta", table)
+
+    def test_each_rollback_point_has_its_own_line_never_hidden_in_a_total(self):
+        now = time.time()
+
+        def img(tag, used=False):
+            return {"name": f"app:{tag}", "repo": "app", "tag": tag, "ref": f"app:{tag}", "size": 1e9, "used": used,
+                    "origin": "local", "created": "", "id": tag, "created_at": now - 60 * 86400}
+        tags = ["antes-a", "antes-b", "antes-c", "antes-d", "antes-velho"]
+        d = hogs.Docker(running=True, images=[img("latest", True)] + [img(t) for t in tags])
+        seen = {f"app:{t}": now - (30 if t == "antes-velho" else 0) * 86400 for t in tags}
+        con = hogs.Console(file=io.StringIO(), width=220)
+        with mock.patch.object(hogs, "first_seen", return_value=seen), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            rows = hogs.docker_rows(d)
+            hogs.report(con, hogs.Snapshot(494e9, 28e9, d, [], []), [])
+        labels = [r[0] for r in rows if "volta" in r[0]]
+        self.assertEqual(sorted(labels), sorted(f"Ponto de volta app:{t}" for t in tags))
+        out = con.file.getvalue()
+        docker_table = out.split("🐳 Docker")[-1]
+        for t in tags:
+            self.assertIn(f"Ponto de volta app:{t}", docker_table)
+        recommended = " ".join(out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0].split())
+        self.assertIn("Pontos de volta recentes (4)", recommended)
+        self.assertIn("app:antes-a, app:antes-b, app:antes-c, app:antes-d", recommended)
+        self.assertNotIn("…", recommended)
+
+    def test_worktrees_folder_is_remembered_keeping_other_settings(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "projetos").mkdir()
+        (tmp / "config.json").write_text(json.dumps({"alert_gb": 30}))
+        with mock.patch.object(hogs, "DATA_DIR", tmp), mock.patch.object(hogs, "CONFIG", tmp / "config.json"), \
+                mock.patch.object(sys, "argv", ["hogs", "--worktrees", str(tmp / "projetos")]), \
+                mock.patch.object(hogs, "gather_worktrees", return_value=([], [])), \
+                mock.patch.object(hogs, "worktrees_report"):
+            hogs.run()
+            self.assertEqual(hogs.load_config(),
+                             {"alert_gb": 30, "worktrees_root": str((tmp / "projetos").resolve())})
+            self.assertEqual(hogs.projects_root(), (tmp / "projetos").resolve())
+
+    def test_history_keys_skip_counts_and_files_to_evaluate(self):
+        s = self.snap(0, 0, 0)
+        s.items = [hogs.Item("apps", "Cópias antigas do Navegador (3)", 2e9, hogs.SAFE),
+                   hogs.Item("apps", "Parado: ~/a.mov", 5e9, hogs.EVAL)]
+        s.projects = 7e9
+        sizes = hogs.snapshot_sizes(s)
+        self.assertIn("Cópias antigas do Navegador", sizes)
+        self.assertNotIn("Parado: ~/a.mov", sizes)
+        self.assertEqual(sizes["Projetos"], 7e9)
+
+    def _gather(self, root, known, candidates, sizes):
+        si = hogs.SystemInfo({"Preboot": 5e9}, 13e9, 30, False)
+        stale = mock.Mock(return_value=[])
+        with mock.patch.object(hogs, "gather_docker", return_value=hogs.Docker()), \
+                mock.patch.object(hogs, "scan_candidates", return_value=candidates), \
+                mock.patch.object(hogs, "du", side_effect=lambda p: sizes.get(p, 0)), \
+                mock.patch.object(hogs, "gather_apps", return_value=[]), \
+                mock.patch.object(hogs, "known_mounts", return_value=([], known)), \
+                mock.patch.object(hogs, "gather_system", return_value=si), \
+                mock.patch.object(hogs, "sign_clone_root", return_value=None), \
+                mock.patch.object(hogs, "stale_personal", stale), \
+                mock.patch.object(hogs, "load_config", return_value={"worktrees_root": str(root)}):
+            return hogs.gather(hogs.Console(file=io.StringIO())), stale
+
+    def test_gather_counts_projects_once_and_files_only_when_mounts_known(self):
+        tmp = Path(tempfile.mkdtemp())
+        dev, other = tmp / "dev", tmp / "outra"
+        (dev / "wt").mkdir(parents=True)
+        other.mkdir()
+        sizes = {dev: 50e9, dev / "wt": 20e9, other: 3e9}
+        snap, stale = self._gather(dev / "wt", True, [dev, other], sizes)
+        self.assertEqual(snap.projects, 20e9)
+        self.assertEqual(dict(snap.others)[hogs.short(dev)], 30e9)
+        self.assertEqual([a[0] for a in snap.advice], ["Reiniciar o Mac"])
+        stale.assert_called_once()
+        snap, stale = self._gather(dev, False, [dev, other], sizes)
+        self.assertEqual(snap.projects, 50e9)
+        self.assertNotIn(hogs.short(dev), dict(snap.others))
+        self.assertFalse(snap.mounts_known)
+        stale.assert_not_called()
+        snap, _ = self._gather(tmp / "nao-existe", True, [dev, other], sizes)
+        self.assertEqual(snap.projects, 0)
+        self.assertEqual(dict(snap.others)[hogs.short(dev)], 50e9)
 
 
 class HistoryTest(unittest.TestCase):
@@ -299,6 +955,100 @@ class HistoryTest(unittest.TestCase):
     def test_fmt_delta(self):
         self.assertEqual(hogs.fmt_delta(17 * 10**9), "+17,0 GB")
         self.assertEqual(hogs.fmt_delta(-3_200_000_000), "−3,2 GB")
+
+
+class SignCloneTest(unittest.TestCase):
+    def make(self, root, clone, app, version, exe="App"):
+        c = root / "com.example.App.code_sign_clone" / clone / f"{app}.app.bundle" / "Contents"
+        c.mkdir(parents=True)
+        (c / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": version, "CFBundleExecutable": exe}))
+        (c / "blob").write_bytes(b"x" * 4096)
+
+    def tmpdir(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return Path(d.name)
+
+    def install(self, base, app, version):
+        (base / f"{app}.app/Contents").mkdir(parents=True)
+        (base / f"{app}.app/Contents/Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleShortVersionString": version}))
+
+    def test_unknown_installed_version_offers_nothing(self):
+        tmp = self.tmpdir()
+        root = tmp / "X"
+        self.make(root, "code_sign_clone.a", "Navegador", "155")
+        with mock.patch.object(hogs, "APP_GLOBS", [tmp / "Applications", tmp / "home" / "Applications"]):
+            self.assertEqual(hogs.sign_clone_items(hogs.gather_sign_clones(root)), [])
+
+    def test_app_found_in_user_applications(self):
+        tmp = self.tmpdir()
+        root = tmp / "X"
+        self.install(tmp / "home" / "Applications", "Navegador", "156")
+        self.make(root, "code_sign_clone.a", "Navegador", "155")
+        with mock.patch.object(hogs, "APP_GLOBS", [tmp / "Applications", tmp / "home" / "Applications"]), \
+                mock.patch.object(hogs, "du", return_value=10):
+            items = hogs.sign_clone_items(hogs.gather_sign_clones(root))
+        self.assertEqual(len(items), 1)
+        self.assertIn("a instalada é 156", items[0].hint)
+
+    def test_only_old_versions_one_copy_counted_and_guarded(self):
+        tmp = self.tmpdir()
+        apps, root = tmp / "Applications", tmp / "X"
+        (apps / "Navegador.app/Contents").mkdir(parents=True)
+        (apps / "Navegador.app/Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "156"}))
+        for n, v in (("a", "156"), ("b", "156"), ("c", "155"), ("d", "155"), ("e", "152")):
+            self.make(root, f"code_sign_clone.{n}", "Navegador", v)
+        with mock.patch.object(hogs, "APP_GLOBS", [apps]), \
+                mock.patch.object(hogs, "du", side_effect=lambda p: 1_000_000_000):
+            items = hogs.sign_clone_items(hogs.gather_sign_clones(root))
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual((item.label, item.size, item.risk), ("Cópias antigas do Navegador (3)", 2_000_000_000, hogs.SAFE))
+        with mock.patch.object(hogs, "process_running", return_value=True):
+            self.assertEqual(item.guard(), "feche o Navegador antes")
+        with mock.patch.object(hogs, "process_running", return_value=False):
+            self.assertIsNone(item.guard())
+        item.action()
+        left = sorted(p.name for p in (root / "com.example.App.code_sign_clone").iterdir())
+        self.assertEqual(left, ["code_sign_clone.a", "code_sign_clone.b"])
+
+
+class ProcessRunningTest(unittest.TestCase):
+    """A guarda de app aberto nunca diz "fechado" com o app aberto."""
+
+    @staticmethod
+    def pgrep(procs):
+        """pgrep falso (regex estendida): -x casa o nome do processo inteiro, -f a linha de comando."""
+        import re
+
+        def sh(cmd, timeout=60):
+            if cmd[0] != "pgrep":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            flag, pattern = cmd[1], cmd[2]
+            hit = any(re.fullmatch(pattern, comm) if flag == "-x" else re.search(pattern, args)
+                      for comm, args in procs)
+            return subprocess.CompletedProcess(cmd, 0 if hit else 1, "123\n" if hit else "", "")
+        return sh
+
+    def running(self, name, procs):
+        with mock.patch.object(hogs, "sh", self.pgrep(procs)):
+            return hogs.process_running(name)
+
+    def test_executable_name_longer_than_the_kernel_name(self):
+        exe = "Navegador Super Rapido Helper"          # 29 caracteres; o kernel guarda 16 (MAXCOMLEN)
+        app = f"/Applications/Navegador.app/Contents/MacOS/{exe}"
+        self.assertTrue(self.running(exe, [(exe[:16], app)]))                 # pelo nome cortado ou pelo caminho
+        self.assertTrue(self.running(exe, [(exe[:16], "")]))                  # só o nome cortado
+        self.assertTrue(self.running(exe, [("outro-nome", f"{app} --type=main")]))   # só o caminho
+
+    def test_name_with_regex_characters_is_literal(self):
+        exe = "Navegador (Beta)+"
+        self.assertTrue(self.running(exe, [(exe, f"/Applications/N.app/Contents/MacOS/{exe}")]))
+
+    def test_closed_app_is_not_running(self):
+        procs = [("Navegador2", "/Applications/N2.app/Contents/MacOS/Navegador2"), ("bash", "bash -c Navegador")]
+        self.assertFalse(self.running("Navegador", procs))
 
 
 class WorktreeTest(unittest.TestCase):

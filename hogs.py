@@ -18,6 +18,7 @@ import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -25,10 +26,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 try:
     from rich import box
+    from rich.columns import Columns
     from rich.console import Console, Group
     from rich.padding import Padding
     from rich.panel import Panel
@@ -39,7 +41,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -66,6 +68,7 @@ HISTORY_DAYS = 90
 
 GB = 1e9
 MIN_SHOW = 50e6          # itens menores que isso não aparecem
+BIG_ITEM = 500e6         # a partir daqui vale uma linha própria: cache de app, arquivo parado, imagem de registry
 OLD_CONTAINER_DAYS = 30
 
 
@@ -83,6 +86,7 @@ SAFE = Risk("🟢", "seguro", "green", 0)
 REDOWN = Risk("🟡", "baixa de novo", "yellow", 1)
 LOSS = Risk("🔴", "perde algo", "red", 2)
 INFO = Risk("⚪", "só informação", "bright_black", 3)
+EVAL = Risk("🟡", "para avaliar", "yellow", 1)
 
 
 @dataclass
@@ -94,6 +98,7 @@ class Item:
     action: Callable[[], object] | None = None
     hint: str = ""
     guard: Callable[[], str | None] | None = None
+    kind: str = ""               # "pessoal" | "ponto_de_volta": separa os 🟡 para avaliar no Recomendado
 
 
 # ---------------------------------------------------------------- utilidades
@@ -143,6 +148,14 @@ def short(p: Path | str) -> str:
     return str(p).replace(str(HOME), "~", 1)
 
 
+def plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def preview(names: list[str], n: int = 3) -> str:
+    return ", ".join(names[:n]) + ("…" if len(names) > n else "")
+
+
 def require(r: subprocess.CompletedProcess | None, what: str) -> subprocess.CompletedProcess:
     """Comando ausente, sem resposta ou com código ≠ 0 vira RuntimeError com a última linha do erro."""
     if r is None:
@@ -164,9 +177,50 @@ def run_all(cmds: list[list[str]], timeout: int = 60) -> None:
         raise RuntimeError((f"{len(errors)} de {len(cmds)} falharam: " if len(cmds) > 1 else "") + errors[0])
 
 
+MAXCOMLEN = 16   # o kernel guarda o nome do processo cortado nesse tamanho
+
+
+def ere_escape(text: str) -> str:
+    """Texto literal numa regex estendida (a do pgrep): "App (Beta)" não vira grupo."""
+    return re.sub(r"([.\[\]()*+?{}|^$\\])", r"\\\1", text)
+
+
 def process_running(name: str) -> bool:
-    r = sh(["pgrep", "-x", name])
-    return bool(r and r.returncode == 0)
+    """Processo com esse executável aberto: pelo nome inteiro, pelo nome cortado em MAXCOMLEN ou pelo caminho
+    do executável do app. Qualquer um que casar conta como aberto (na dúvida, aberto)."""
+    patterns = [["-x", ere_escape(name)]]
+    if len(name) > MAXCOMLEN:
+        patterns.append(["-x", ere_escape(name[:MAXCOMLEN])])
+    patterns.append(["-f", ere_escape(f"/Contents/MacOS/{name}") + "( |$)"])
+    for args in patterns:
+        r = sh(["pgrep", *args])
+        if r and r.returncode == 0:
+            return True
+    return False
+
+
+def plist_dict(data: bytes) -> dict | None:
+    """Plist (XML ou binário) que é um dicionário; qualquer outra coisa ou erro de leitura vira None."""
+    try:
+        d = plistlib.loads(data)
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def plist_file(path: Path) -> dict:
+    try:
+        return plist_dict(path.read_bytes()) or {}
+    except OSError:
+        return {}
+
+
+def plist_cmd(cmd: list[str]) -> dict | None:
+    """Saída -plist de um comando; None se o comando falhou ou a saída não é um dicionário."""
+    r = sh(cmd)
+    if not r or r.returncode != 0 or not r.stdout:
+        return None
+    return plist_dict(r.stdout.encode())
 
 
 def empty_dir(path: Path) -> None:
@@ -238,6 +292,9 @@ class Docker:
     builders: list[dict] = field(default_factory=list)
     builder_caches: list[dict] = field(default_factory=list)   # volumes de estado do BuildKit
     current_builder: str = ""
+    mounts: list[Path] = field(default_factory=list)   # origens de bind mount de qualquer container
+    mounts_ok: bool = False                            # True só se o inspect respondeu
+    live: list[str] = field(default_factory=list)      # containers rodando (nomes)
 
 
 def list_builders() -> list[dict]:
@@ -269,6 +326,25 @@ def builder_of_volume(volume: str, builders: list[dict]) -> str | None:
     if not m:
         return None
     return next((b["name"] for b in builders if m.group(1) in b["nodes"]), m.group(1))
+
+
+def bind_volume_folders(names: list[str]) -> list[Path]:
+    """Pastas do host por trás de volumes nomeados com bind (`--opt type=none --opt o=bind --opt device=/pasta`,
+    comum em compose de banco). Qualquer falha levanta ValueError: na dúvida, mounts desconhecidos."""
+    if not names:
+        return []
+    r = sh(["docker", "volume", "inspect", "--format", "{{json .Options}}", *names])
+    if not r or r.returncode != 0:
+        raise ValueError("docker volume inspect falhou")
+    lines = [line for line in r.stdout.splitlines() if line.strip()]
+    if len(lines) != len(names):
+        raise ValueError("docker volume inspect respondeu pela metade")
+    folders = []
+    for line in lines:
+        opts = json.loads(line) or {}
+        if "bind" in str(opts.get("o", "")) and opts.get("device"):
+            folders.append(Path(opts["device"]).resolve())
+    return folders
 
 
 def gather_docker() -> Docker:
@@ -316,6 +392,7 @@ def gather_docker() -> Docker:
             "repo": repo, "tag": tag, "id": image_id, "name": name, "ref": ref,
             "size": parse_size(img.get("UniqueSize", "")), "used": used,
             "origin": image_origin(repo), "created": img.get("CreatedSince", ""),
+            "created_at": parse_epoch(img.get("CreatedAt", "")),
         })
     # Com o containerd, a soma dos UniqueSize passa do total real (camadas contadas em dobro).
     # Escala cada grupo pra bater com os totais do `docker system df`.
@@ -327,10 +404,30 @@ def gather_docker() -> Docker:
                 i["size"] = int(i["size"] * target / reported)
 
     containers = v.get("Containers") or []
+    if not containers:
+        d.mounts_ok = True
+    else:
+        r = sh(["docker", "inspect", "--format", "{{json .Mounts}}"] + [c["ID"] for c in containers])
+        try:
+            if not r or r.returncode != 0:
+                raise ValueError("inspect falhou")
+            found, volumes = [], []
+            for line in r.stdout.splitlines():
+                if line.strip():
+                    for m in json.loads(line) or []:
+                        if m.get("Type") == "bind" and m.get("Source"):
+                            found.append(Path(m["Source"]).resolve())
+                        elif m.get("Type") == "volume" and m.get("Name") and m["Name"] not in volumes:
+                            volumes.append(m["Name"])
+            found += bind_volume_folders(volumes)
+            d.mounts, d.mounts_ok = sorted(set(found)), True
+        except (ValueError, TypeError, AttributeError, KeyError, OSError, RuntimeError):
+            d.mounts, d.mounts_ok = [], False
     running_projects = {
         _labels(c.get("Labels", "")).get("com.docker.compose.project")
         for c in containers if c.get("State") in ACTIVE_STATES
     } - {None}
+    d.live = sorted(c.get("Names", c["ID"][:12]) for c in containers if c.get("State") in ACTIVE_STATES)
     stopped = [c for c in containers if c.get("State") not in ACTIVE_STATES]
     ages: dict[str, int | None] = {}
     if stopped:
@@ -358,6 +455,40 @@ def gather_docker() -> Docker:
             continue
         d.volumes.append({"name": name, "size": size, "used": vol.get("Links", "0") not in ("0", "N/A")})
     return d
+
+
+MOUNTS_FILE = DATA_DIR / "mounts.json"
+
+
+def known_mounts(d: Docker) -> tuple[list[Path], bool]:
+    """Pastas montadas por containers e se a lista é confiável. Sem resposta do Docker, usa a última salva."""
+    if d.mounts_ok:
+        try:
+            MOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            MOUNTS_FILE.write_text(json.dumps({"mounts": [str(m) for m in d.mounts]}))
+        except OSError:
+            pass
+        return d.mounts, True
+    saved = read_json(MOUNTS_FILE).get("mounts")
+    if isinstance(saved, list) and all(isinstance(m, str) and m for m in saved):
+        return [Path(m) for m in saved], True
+    return [], not shutil.which("docker")
+
+
+def under_mount(path: Path, mounts: list[Path], containing: bool = True) -> bool:
+    """`path` dentro de uma pasta montada (ou igual a ela); com `containing`, também se contém uma."""
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        return True   # na dúvida, protege
+    for m in mounts:
+        try:
+            m = m.resolve()
+        except (OSError, RuntimeError):
+            pass
+        if path == m or m in path.parents or (containing and path in m.parents):
+            return True
+    return False
 
 
 def prune_builder(name: str, max_gb: float | None = None) -> subprocess.CompletedProcess | None:
@@ -394,6 +525,64 @@ def trim_builders(max_gb: float) -> list[tuple[str, int, str]]:
     return done
 
 
+def parse_epoch(text: str) -> float | None:
+    """Data com fuso em epoch: `CreatedAt` do docker ("2026-11-04 20:04:12 -0300 -03") ou do `mdls`
+    ("2025-01-02 03:04:05 +0000"); o que vem depois do fuso é ignorado e o ilegível vira None."""
+    try:
+        return datetime.strptime(" ".join(text.split()[:3]), "%Y-%m-%d %H:%M:%S %z").timestamp()
+    except ValueError:
+        return None
+
+
+def rollback_base(tag: str, words: list[str]) -> str | None:
+    """Tag de ponto de volta: "<w>-..." volta para "latest"; "<base>-<w>-..." volta para "<base>"."""
+    parts = tag.lower().split("-")
+    ws = {w.lower() for w in words}
+    if len(parts) > 1 and parts[0] in ws:
+        return "latest"
+    for i in range(1, len(parts) - 1):
+        if parts[i] in ws:
+            return tag[:len("-".join(parts[:i]))]
+    return None
+
+
+def tag_date(tag: str) -> float | None:
+    """Data embutida no nome da tag (AAAAMMDD-HHMM ou AAAAMMDD), em hora local."""
+    m = re.search(r"(?<!\d)(\d{8})(?:-(\d{4}))?(?!\d)", tag)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1) + (m.group(2) or "0000"), "%Y%m%d%H%M")
+        return time.mktime(dt.timetuple())
+    except (ValueError, OverflowError):
+        return None
+
+
+SEEN_TAGS = DATA_DIR / "seen_tags.json"
+
+
+def first_seen(refs: list[str], now: float) -> dict[str, float]:
+    """Quando o hogs viu cada tag pela primeira vez (o Docker não guarda a data da tag)."""
+    old = read_json(SEEN_TAGS)
+    seen: dict[str, float] = {}
+    for ref in refs:
+        t = old.get(ref)
+        ok = isinstance(t, (int, float)) and not isinstance(t, bool) and t <= now
+        seen[ref] = float(t) if ok else now
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SEEN_TAGS.write_text(json.dumps(seen, indent=2))
+    except OSError:
+        pass
+    return seen
+
+
+def rollback_age_days(img: dict, current: dict, seen: float, now: float) -> float:
+    """Idade pelo sinal mais recente: data no nome da tag, criação da imagem atual ou primeira vez vista."""
+    signals = [t for t in (tag_date(img["tag"]), current.get("created_at"), seen) if t is not None]
+    return (now - max(signals)) / 86400
+
+
 def is_old_stopped(c: dict) -> bool:
     """Parado há +30 dias, idade conhecida e sem projeto rodando: vai para o grupo 🟢."""
     return c["age"] is not None and c["age"] >= OLD_CONTAINER_DAYS and not c["project_running"]
@@ -405,6 +594,52 @@ def stopped_risk(c: dict) -> Risk:
 
 def image_ref(img: dict) -> str:
     return img.get("ref") or img["name"]
+
+
+def rollback_pairs(d: Docker) -> list[tuple[dict, dict]]:
+    """(ponto de volta, imagem atual da mesma origem); sem a imagem atual, não é ponto de volta."""
+    words = setting("rollback_tags")
+    by_ref = {i["name"]: i for i in d.images}
+    pairs: list[tuple[dict, dict]] = []
+    for img in d.images:
+        if img["used"] or img["origin"] == "none" or img.get("tag", "<none>") == "<none>":
+            continue
+        base = rollback_base(img["tag"], words)
+        current = by_ref.get(f"{img['repo']}:{base}") if base else None
+        if current is not None and current is not img:
+            pairs.append((img, current))
+    return pairs
+
+
+class Rollback(NamedTuple):
+    img: dict
+    size: int       # quanto libera
+    risk: Risk
+    hint: str
+
+
+RECENT_ROLLBACK = "o QA pode estar em andamento"
+
+
+def rollback_info(d: Docker) -> dict[int, Rollback]:
+    """Cada ponto de volta, pelo id() da imagem em `d.images`, do maior para o menor.
+    O relatório e o --clean usam esta mesma função, então o risco mostrado é sempre o mesmo."""
+    pairs = rollback_pairs(d)
+    if not pairs:
+        return {}
+    now = time.time()
+    seen = first_seen([i["name"] for i, _ in pairs], now)
+    days = setting("rollback_days")
+    out: dict[int, Rollback] = {}
+    for img, current in sorted(pairs, key=lambda p: -p[0]["size"]):
+        age = rollback_age_days(img, current, seen[img["name"]], now)
+        old = age > days
+        hint = f"ponto de volta há {int(age)} dias" if old else f"ponto de volta recente: {RECENT_ROLLBACK}"
+        same = bool(img["id"]) and img["id"] == current["id"]
+        if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
+            hint = "mesma imagem da atual: só remove a tag"
+        out[id(img)] = Rollback(img, 0 if same else img["size"], SAFE if old else EVAL, hint)
+    return out
 
 
 def docker_clean_items(d: Docker) -> list[Item]:
@@ -431,10 +666,9 @@ def docker_clean_items(d: Docker) -> list[Item]:
     old = [c for c in d.stopped if is_old_stopped(c)]
     if old:
         names = [c["name"] for c in old]
-        preview = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
         items.append(Item("docker", f"Docker: containers parados há +{OLD_CONTAINER_DAYS} dias ({len(old)})",
                           sum(c["size"] for c in old), SAFE,
-                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview))
+                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview(names)))
     for c in d.stopped:
         if is_old_stopped(c):
             continue
@@ -443,12 +677,18 @@ def docker_clean_items(d: Docker) -> list[Item]:
         items.append(Item("docker", f"Docker: container {c['name']}", c["size"], stopped_risk(c),
                           lambda n=c["name"]: run_all([["docker", "rm", n]]), why))
 
+    rollbacks = rollback_info(d)
+    for rb in rollbacks.values():
+        items.append(Item("docker", f"Ponto de volta {rb.img['name']}", rb.size, rb.risk,
+                          lambda ref=image_ref(rb.img): run_all([["docker", "rmi", ref]]), rb.hint,
+                          kind="ponto_de_volta"))
+
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):
-        if img["used"] or img["origin"] == "none":
+        if img["used"] or img["origin"] == "none" or id(img) in rollbacks:
             continue
         local = img["origin"] == "local"
-        if not local and img["size"] < 500e6:
+        if not local and img["size"] < BIG_ITEM:
             small_pullable.append(img)
             continue
         items.append(Item("docker", f"Imagem {img['name']}", img["size"], LOSS if local else REDOWN,
@@ -460,7 +700,7 @@ def docker_clean_items(d: Docker) -> list[Item]:
         items.append(Item("docker", f"Imagens pequenas de registry/Hub ({len(names)})",
                           sum(i["size"] for i in small_pullable), REDOWN,
                           lambda refs=refs: run_all([["docker", "rmi", r] for r in refs]),
-                          ", ".join(n.rsplit("/", 1)[-1] for n in names[:3]) + ("…" if len(names) > 3 else "")))
+                          preview([n.rsplit("/", 1)[-1] for n in names])))
     return items
 
 
@@ -1274,6 +1514,19 @@ def scan_candidates(known: set[str]) -> list[Path]:
     return out
 
 
+def big_cache_paths(sizes: dict[Path, int], mounts: list[Path]) -> list[Path]:
+    """Filhos grandes de ~/Library/Caches fora de pastas montadas, do maior para o menor."""
+    return [p for p, size in sorted(sizes.items(), key=lambda kv: -kv[1])
+            if p.parent == CACHES and size >= BIG_ITEM and not under_mount(p, mounts)]
+
+
+def cache_items(sizes: dict[Path, int], mounts: list[Path]) -> list[Item]:
+    """Caches grandes em ~/Library/Caches que a lista não cobre; o app recria quando precisar."""
+    return [Item("dev", f"Cache: {p.name}", int(sizes[p]), REDOWN, lambda p=p: shutil.rmtree(p),
+                 "cache do app; ele recria quando precisar")
+            for p in big_cache_paths(sizes, mounts)]
+
+
 # ---------------------------------------------------------------- apps menos usados
 
 APP_GLOBS = [Path("/Applications"), HOME / "Applications"]
@@ -1289,10 +1542,7 @@ class AppInfo:
 
 
 def _app_info(app: Path) -> AppInfo:
-    try:
-        info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        info = {}
+    info = plist_file(app / "Contents/Info.plist")
     bundle_id = info.get("CFBundleIdentifier", "")
     name = info.get("CFBundleName") or app.stem
 
@@ -1377,6 +1627,136 @@ def apps_footer() -> Text:
                 "o AppCleaner (grátis) leva tudo junto.", style="dim")
 
 
+# ---------------------------------------------------------------- cópias de assinatura
+
+def sign_clone_root() -> Path | None:
+    r = sh(["getconf", "DARWIN_USER_TEMP_DIR"])
+    if not r or r.returncode != 0 or not r.stdout.strip():
+        return None
+    root = Path(r.stdout.strip()).parent / "X"
+    return root if root.is_dir() else None
+
+
+@dataclass
+class CloneGroup:
+    app: str
+    executable: str
+    installed: str
+    by_version: dict[str, list[Path]]
+
+
+def gather_sign_clones(root: Path) -> list[CloneGroup]:
+    groups: dict[str, CloneGroup] = {}
+    try:
+        clones = sorted(root.glob("*.code_sign_clone/code_sign_clone.*"))
+    except OSError:
+        return []
+    for clone in clones:
+        plist = next(iter(sorted(clone.glob("*/Contents/Info.plist"))), None)
+        if plist is None:
+            continue
+        info = plist_file(plist)
+        version = str(info.get("CFBundleShortVersionString") or "")
+        bundle = plist.parent.parent.name
+        app = bundle.removesuffix(".bundle").removesuffix(".app")
+        if not version or not app:
+            continue
+        group = groups.get(app)
+        if group is None:
+            installed = ""
+            for base in APP_GLOBS:
+                installed = str(plist_file(base / f"{app}.app" / "Contents" / "Info.plist")
+                                .get("CFBundleShortVersionString") or "")
+                if installed:
+                    break
+            group = groups[app] = CloneGroup(app, str(info.get("CFBundleExecutable") or app), installed, {})
+        group.by_version.setdefault(version, []).append(clone)
+    return list(groups.values())
+
+
+def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
+    items = []
+    for g in groups:
+        if not g.installed:      # versão instalada desconhecida: na dúvida, não oferece nada
+            continue
+        old = {v: paths for v, paths in g.by_version.items() if v != g.installed}
+        if not old:
+            continue
+        copies = [p for paths in old.values() for p in paths]
+        size = sum(du(paths[0]) for paths in old.values())
+
+        def action(copies=copies):
+            for p in copies:
+                shutil.rmtree(p)
+
+        def guard(g=g):
+            return f"feche o {g.app} antes" if process_running(g.executable) else None
+
+        hint = f"versões {', '.join(sorted(old))}; a instalada é {g.installed}"
+        items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard))
+    return items
+
+
+# ---------------------------------------------------------------- arquivos pessoais
+
+PERSONAL_ROOTS = [HOME / "Desktop", HOME / "Documents", HOME / "Downloads", HOME / "Pictures"]
+STALE_PERSONAL_DAYS = 180
+SKIP_PACKAGES = (".photoslibrary", ".musiclibrary", ".app", ".tvlibrary", ".logicx", ".band", ".fcpbundle",
+                 ".imovielibrary", ".vmwarevm", ".pvm", ".utm", ".bundle", ".pkg")
+
+
+def spotlight_last_used(path: Path) -> float | None:
+    r = sh(["mdls", "-name", "kMDItemLastUsedDate", "-raw", str(path)], timeout=10)
+    if r is None or r.returncode != 0:
+        return None
+    return parse_epoch(r.stdout)
+
+
+def stale_personal(roots: list[Path], mounts: list[Path], now: float) -> list[tuple[Path, int, float]]:
+    """Arquivos grandes (bytes alocados) sem uso há muito tempo. Não segue links; pasta sem permissão é ignorada."""
+    cutoff = now - STALE_PERSONAL_DAYS * 86400
+    found: list[tuple[Path, int, float]] = []
+    for root in roots:
+        for dp, dirs, names in os.walk(root, followlinks=False, onerror=lambda e: None):
+            here = Path(dp)
+            if (here.name.lower().endswith(SKIP_PACKAGES) or (here / ".git").exists()
+                    or under_mount(here, mounts, containing=False)):
+                dirs[:] = []
+                continue
+            for name in names:
+                p = here / name
+                try:
+                    st = p.lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                size = st.st_blocks * 512
+                recent = max(st.st_mtime, getattr(st, "st_birthtime", 0), st.st_ctime)
+                if size < BIG_ITEM or recent >= cutoff or under_mount(p, mounts, containing=False):
+                    continue
+                last = max(recent, spotlight_last_used(p) or 0)
+                if last < cutoff:
+                    found.append((p, size, last))
+    return found
+
+
+def move_to_trash(path: Path) -> None:
+    """Move para a Lixeira pelo Finder; o caminho vai como argv, nunca dentro do script."""
+    require(sh(["osascript", "-e", "on run argv",
+                "-e", 'tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)',
+                "-e", "end run", str(path)]), "Finder")
+
+
+def personal_items(found: list[tuple[Path, int, float]], now: float) -> list[Item]:
+    items = []
+    for p, size, last in found:
+        meses = int((now - last) // (30 * 86400))
+        items.append(Item("apps", f"Parado: {short(p)}", size, EVAL, lambda p=p: move_to_trash(p),
+                          f"sem abrir há {meses} meses · vai para a Lixeira", kind="pessoal"))
+    return items
+
+
 # ---------------------------------------------------------------- coleta
 
 @dataclass
@@ -1387,18 +1767,41 @@ class Snapshot:
     items: list[Item]               # dev + apps
     others: list[tuple[str, int]]
     apps: list[AppInfo] = field(default_factory=list)
+    system: SystemInfo | None = None
+    advice: list[tuple[str, int, str]] = field(default_factory=list)   # só texto, nunca um Item
+    mounts_known: bool = True
+    projects: int = 0
+    mounts: list[Path] = field(default_factory=list)
+
+
+def projects_root() -> Path | None:
+    """A pasta dos projetos (`worktrees_root` no config.json), se for uma pasta que existe."""
+    root = load_config().get("worktrees_root")
+    if not isinstance(root, str) or not root:
+        return None
+    path = Path(root).expanduser()
+    return path if path.is_dir() else None
+
+
+def clone_items() -> list[Item]:
+    root = sign_clone_root()
+    return sign_clone_items(gather_sign_clones(root)) if root else []
 
 
 def gather(con: Console) -> Snapshot:
     known = {str(p) for pd in PATH_DEFS for p in pd.paths} | {str(DOCKER_CONTAINER)}
     def_paths = [p for pd in PATH_DEFS for p in pd.paths]
     candidates = scan_candidates(known)
-    paths = def_paths + candidates
+    root = projects_root()
+    paths = def_paths + candidates + ([root] if root and root not in candidates else [])
+    now = time.time()
 
     sizes: dict[Path, int] = {}
     with con.status("[bold]🐷 Farejando o disco…[/]", spinner="dots") as status:
         with ThreadPoolExecutor(max_workers=8) as ex:
             fut_docker = ex.submit(gather_docker)
+            fut_system = ex.submit(gather_system, now)
+            fut_clones = ex.submit(clone_items)
             futs = {ex.submit(du, p): p for p in paths}
             for n, f in enumerate(as_completed(futs), 1):
                 sizes[futs[f]] = f.result()
@@ -1407,13 +1810,115 @@ def gather(con: Console) -> Snapshot:
             apps = gather_apps()
             status.update("[bold]🐷 Perguntando pro Docker…[/]")
             docker = fut_docker.result()
+            mounts, mounts_known = known_mounts(docker)
+            personal: list[Item] = []
+            if mounts_known:
+                status.update("[bold]🐷 Procurando arquivos grandes parados…[/]")
+                personal = personal_items(stale_personal(PERSONAL_ROOTS, mounts, now), now)
+            system = fut_system.result()
+            clones = fut_clones.result()
 
     items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
                   make_action(pd), pd.hint, make_guard(pd)) for pd in PATH_DEFS]
+    shown: set[Path] = set()
+    if mounts_known:
+        cand_sizes = {p: sizes.get(p, 0) for p in candidates}
+        shown = set(big_cache_paths(cand_sizes, mounts))
+        items += cache_items(cand_sizes, mounts)
+    items += clones + personal
+    projects = sizes.get(root, 0) if root else 0
+
+    def rest(p: Path) -> int:
+        """Tamanho de `p` fora da pasta dos projetos, para não contar duas vezes na barra."""
+        if root and inside(p, root):
+            return 0
+        return sizes.get(p, 0) - (projects if root and inside(root, p) else 0)
     # guarda a partir de 100 MB pro histórico; o relatório só mostra os de 1 GB+
-    others = sorted(((short(p), sizes[p]) for p in candidates if sizes.get(p, 0) >= 100e6), key=lambda x: -x[1])
+    others = sorted(((short(p), rest(p)) for p in candidates if rest(p) >= 100e6 and p not in shown),
+                    key=lambda x: -x[1])
     usage = shutil.disk_usage(DATA_VOLUME)
-    return Snapshot(usage.total, usage.free, docker, items, others, apps)
+    return Snapshot(usage.total, usage.free, docker, items, others, apps, system,
+                    system_advice(system) if system else [], mounts_known, projects, mounts)
+
+
+# ---------------------------------------------------------------- sistema
+
+SWAP_HIGH = 4e9
+UPTIME_LONG_DAYS = 14
+PREBOOT_NORMAL = 6e9
+UPDATE_SNAPSHOT = "com.apple.os.update-MSUPrepareUpdate"
+
+
+@dataclass
+class SystemInfo:
+    volumes: dict[str, int]
+    swap_used: int
+    uptime_days: float
+    update_pending: bool
+
+
+def parse_apfs(data: bytes, container: str) -> dict[str, int]:
+    """CapacityInUse por papel (Roles[0]) dos volumes do container; volumes sem papel ficam de fora."""
+    info = plist_dict(data) or {}
+    out: dict[str, int] = {}
+    for c in info.get("Containers", []):
+        if c.get("ContainerReference") != container:
+            continue
+        for v in c.get("Volumes", []):
+            roles = v.get("Roles") or []
+            if roles:
+                out[roles[0]] = out.get(roles[0], 0) + int(v.get("CapacityInUse", 0))
+    return out
+
+
+def parse_swap(text: str) -> int:
+    m = re.search(r"used\s*=\s*([\d.,]+)M", text)
+    if not m:
+        return 0
+    try:
+        return int(float(m.group(1).replace(",", ".")) * 2**20)
+    except ValueError:
+        return 0
+
+
+def parse_boottime(text: str, now: float) -> float:
+    m = re.search(r"sec\s*=\s*(\d+)", text)
+    if not m:
+        return 0.0
+    return max(0.0, (now - int(m.group(1))) / 86400)
+
+
+def gather_system(now: float) -> SystemInfo | None:
+    info = plist_cmd(["diskutil", "info", "-plist", "/"])
+    container = (info or {}).get("APFSContainerReference")
+    if not container:
+        return None
+    r = sh(["diskutil", "apfs", "list", "-plist"])
+    if not r or r.returncode != 0 or not r.stdout:
+        return None
+    volumes = parse_apfs(r.stdout.encode(), container)
+    snaps = plist_cmd(["diskutil", "apfs", "listSnapshots", "-plist", "/"])
+    if snaps is None:
+        return None
+    pending = any(s.get("SnapshotName") == UPDATE_SNAPSHOT for s in snaps.get("Snapshots", []))
+    sw = sh(["sysctl", "-n", "vm.swapusage"])
+    swap = parse_swap(sw.stdout) if sw and sw.returncode == 0 else 0
+    bt = sh(["sysctl", "-n", "kern.boottime"])
+    days = parse_boottime(bt.stdout, now) if bt and bt.returncode == 0 else 0.0
+    return SystemInfo(volumes, swap, days, pending)
+
+
+def system_advice(si: SystemInfo) -> list[tuple[str, int, str]]:
+    """Só texto: (rótulo, estimativa em bytes, como fazer). Nunca executado, nunca um Item."""
+    out: list[tuple[str, int, str]] = []
+    if si.swap_used >= SWAP_HIGH and si.uptime_days >= UPTIME_LONG_DAYS:
+        out.append(("Reiniciar o Mac", si.swap_used,
+                    f"swap {fmt(si.swap_used)} · ligado há {int(si.uptime_days)} dias"))
+    if si.update_pending:
+        out.append(("Aplicar a atualização do macOS",
+                    int(max(0, si.volumes.get("Preboot", 0) - PREBOOT_NORMAL)),
+                    "Ajustes do Sistema › Geral › Atualização de Software"))
+    return out
 
 
 # ---------------------------------------------------------------- histórico
@@ -1467,7 +1972,10 @@ def snapshot_sizes(s: Snapshot) -> dict[str, int]:
         sizes["Docker: imagens"] = sum(i["size"] for i in d.images)
         sizes["Docker: cache de build"] = d.build_cache + sum(b["size"] for b in d.builder_caches)
         sizes["Docker: volumes"] = sum(v["size"] for v in d.volumes)
-    sizes.update({i.label: i.size for i in s.items})
+    # Sem a contagem "(n)" no nome, pro histórico seguir o mesmo item; os parados para avaliar não são crescimento.
+    sizes.update({re.sub(r" \(\d+\)$", "", i.label): i.size for i in s.items if i.risk is not EVAL})
+    if s.projects:
+        sizes["Projetos"] = s.projects
     sizes.update(dict(s.others))
     return {k: v for k, v in sizes.items() if v >= 10e6}
 
@@ -1560,8 +2068,10 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
         rows.append(("Docker parado", 0, INFO, "abra o Docker Desktop pra ver o detalhe"))
         return rows
 
+    rollbacks = rollback_info(d)
+
     def group(pred):
-        sel = [i for i in d.images if pred(i)]
+        sel = [i for i in d.images if pred(i) and id(i) not in rollbacks]
         return sel, sum(i["size"] for i in sel)
 
     used, used_size = group(lambda i: i["used"])
@@ -1576,6 +2086,7 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
         (f"Imagens em uso ({len(used)})", used_size, INFO, "usadas por containers"),
         (f"Imagens sem uso, de registry ({len(pull)})", pull_size, REDOWN, "voltam com docker pull"),
         (f"Imagens sem uso, construídas aqui ({len(local)})", local_size, LOSS, local_names),
+        *rollback_rows(list(rollbacks.values())),
         (f"Imagens sem tag ({len(none)})", none_size, SAFE, "versões antigas órfãs"),
         ("Cache de build", d.build_cache, SAFE, "próximo build fica mais lento"),
         *[(f"Cache do builder {bc['builder']}", bc["size"], SAFE, "volume do BuildKit; o daemon.json não limita")
@@ -1588,6 +2099,11 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
     if untracked > 3 * GB:
         rows.append(("Não contabilizado pelo Docker", untracked, INFO, "VM e sobras; parte volta ao reiniciar o Docker"))
     return rows
+
+
+def rollback_rows(rollbacks: list[Rollback]) -> list[tuple[str, int, Risk, str]]:
+    """Cada ponto de volta numa linha própria, com o mesmo risco e a mesma dica do --clean."""
+    return [(f"Ponto de volta {rb.img['name']}", rb.size, rb.risk, rb.hint) for rb in rollbacks]
 
 
 def stopped_rows(stopped: list[dict]) -> list[tuple[str, int, Risk, str]]:
@@ -1615,10 +2131,14 @@ def unused_images_table(d: Docker) -> Table | None:
     t.add_column("Tamanho", justify="right", no_wrap=True)
     t.add_column("Origem", no_wrap=True)
     t.add_column("Criada", style="dim", no_wrap=True)
+    rollbacks = rollback_info(d)
     for i in imgs:
-        risk = LOSS if i["origin"] == "local" else REDOWN
+        if id(i) in rollbacks:
+            risk, origin = rollbacks[id(i)].risk, "ponto de volta"
+        else:
+            risk, origin = (LOSS if i["origin"] == "local" else REDOWN), ORIGIN_LABEL[i["origin"]]
         t.add_row(i["name"], Text(fmt(i["size"]), style="bold"),
-                  Text(f"{risk.icon} {ORIGIN_LABEL[i['origin']]}", style=risk.color), i["created"])
+                  Text(f"{risk.icon} {origin}", style=risk.color), i["created"])
     return t
 
 
@@ -1645,14 +2165,38 @@ def trend(s: Snapshot, records: list[dict], now: float) -> Text | None:
     return t
 
 
-def header(s: Snapshot, records: list[dict] | None = None) -> Panel:
+def breakdown(s: Snapshot) -> list[tuple[str, int, str]]:
+    """O disco usado em partes (rótulo, bytes, cor), sem contar nada duas vezes: a soma menos "Livre" é o usado."""
     used = s.total - s.free
-    dev = sum(i.size for i in s.items if i.cat == "dev")
-    apps = sum(i.size for i in s.items if i.cat == "apps")
-    docker = s.docker.raw_real
-    rest = max(0, used - dev - apps - docker)
-    segs = [("Docker", docker, "dodger_blue1"), ("Caches de dev", dev, "magenta"),
-            ("Apps e dados", apps, "yellow"), ("Sistema e outros", rest, "grey50"), ("Livre", s.free, "green")]
+    volumes = s.system.volumes if s.system else {}
+    macos = min(used, sum(v for k, v in volumes.items() if k != "Data"))
+    # Os 🟡 para avaliar (arquivos parados) já estão dentro de pastas medidas: Downloads ou "Outras pastas".
+    data = [("Docker", s.docker.raw_real, "dodger_blue1"),
+            ("Caches de dev", sum(i.size for i in s.items if i.cat == "dev"), "magenta"),
+            ("Apps e dados", sum(i.size for i in s.items if i.cat == "apps" and i.risk is not EVAL), "yellow"),
+            ("Projetos", s.projects, "cyan"),
+            ("Outras pastas", sum(size for _, size in s.others), "dark_orange")]
+    room, known = used - macos, sum(v for _, v, _ in data)
+    if known > room:   # medidas que se sobrepõem (clones APFS, pastas aninhadas): encolhe só as do volume Data
+        data = [(label, int(v * room / known), color) for label, v, color in data]
+    unknown = max(0, room - sum(v for _, v, _ in data))
+    return data[:4] + [("macOS e swap", macos, "steel_blue1"), data[4],
+                       ("Não identificado", unknown, "grey50"), ("Livre", s.free, "green")]
+
+
+def docker_trim_off() -> bool:
+    """TRIM do Docker Desktop desligado de forma explícita; sem a configuração, não se sabe (conta como ligado)."""
+    return read_json(DOCKER_SETTINGS).get("DiskTRIM") is False
+
+
+def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item] | None = None) -> Panel:
+    used = s.total - s.free
+    segs = breakdown(s)
+    if cleanable is None:
+        cleanable = clean_items(s)
+    # Com o TRIM desligado, o que se apaga no Docker fica preso no Docker.raw: não volta ao macOS.
+    trim_off = docker_trim_off()
+    recommended = s.free + sum(i.size for i in cleanable if i.risk is SAFE and not (trim_off and i.cat == "docker"))
 
     width = 64
     bar, cum, pos = Text(), 0, 0
@@ -1661,13 +2205,15 @@ def header(s: Snapshot, records: list[dict] | None = None) -> Panel:
         end = round(cum / s.total * width)
         bar.append("█" * (end - pos), style=color)
         pos = end
-    legend = Text()
-    for label, size, color in segs:
-        legend.append("■ ", style=color).append(f"{label} ").append(fmt(size), style="bold").append("  ")
+    legend = Columns([Text.assemble(("■ ", color), f"{label} ", (fmt(size), "bold"))
+                      for label, size, color in segs if size or label == "Livre"], padding=(0, 2))
 
     free_color = "red" if s.free < 30 * GB else "yellow" if s.free < 60 * GB else "green"
     line = Text.assemble(("Macintosh HD", "bold"), f"  ·  {fmt(used)} de {fmt(s.total)} usados  ·  ",
-                         (f"{fmt(s.free)} livres", f"bold {free_color}"))
+                         (f"{fmt(s.free)} livres", f"bold {free_color}"), "  ·  com o recomendado: ",
+                         (f"{fmt(recommended)} livres", "bold green"))
+    if trim_off:
+        line.append(" (Docker não devolve espaço: TRIM desligado)", style="yellow")
     body = [line, Text(), bar, legend]
     if records and (t := trend(s, records, time.time())) is not None:
         body += [Text(), t]
@@ -1732,7 +2278,7 @@ def prevention_panel(s: Snapshot) -> Panel | None:
         row(bool(gc_gb), "Limpeza automática do Docker (daemon.json): desligada",
             "o --docker-gc cobre isso" if gc_gb else "Docker › Settings › Docker Engine")
 
-    if read_json(DOCKER_SETTINGS).get("DiskTRIM") is False:
+    if docker_trim_off():
         row(False, "TRIM desligado: o espaço apagado no Docker não volta pro macOS",
             "Docker › Settings › Resources › Advanced")
     if d.raw_limit:
@@ -1741,14 +2287,79 @@ def prevention_panel(s: Snapshot) -> Panel | None:
     return Panel(grid, title="[bold]🛡  Prevenção[/]", title_align="left", border_style="grey50", padding=(0, 2))
 
 
+CAT_TITLES = {"docker": "🐳 Docker", "dev": "🧰 Caches de dev", "apps": "📦 Apps e dados", "worktree": "🌳 Worktrees"}
+
+
+def recommended_panel(s: Snapshot, cleanable: list[Item]) -> Panel:
+    """Só os 🟢 contam como recomendado; as ações do macOS (↻) e os 🟡 para avaliar aparecem à parte."""
+    t = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
+    t.add_column("O quê", ratio=4, overflow="fold")
+    t.add_column("Libera", justify="right", no_wrap=True)
+    t.add_column("Risco", no_wrap=True)
+    t.add_column("Por quê", style="dim", ratio=3, overflow="fold")
+    groups: dict[str, list[Item]] = {}
+    for i in cleanable:
+        if i.risk is SAFE:
+            groups.setdefault(i.cat, []).append(i)
+    for cat, items in sorted(groups.items(), key=lambda kv: -sum(i.size for i in kv[1])):
+        t.add_row(Text(CAT_TITLES.get(cat, cat), style="bold"), Text(fmt(sum(i.size for i in items)), style="bold"),
+                  "", "")
+        for i in sorted(items, key=lambda i: -i.size):
+            why = i.guard() if i.guard else None   # ex.: app aberto; a guarda vale de novo na hora de apagar
+            t.add_row(f"   {i.label}", fmt(i.size), Text(SAFE.icon), Text(why, style="yellow") if why else i.hint)
+    for label, size, how in s.advice:
+        t.add_row(f"💻 {label}", f"~{fmt(size)}" if size else "", Text("↻", style="cyan"), how)
+    evals = [i for i in cleanable if i.risk is EVAL]
+    files = [i for i in evals if i.kind == "pessoal"]
+    rollbacks = [i for i in evals if i.kind == "ponto_de_volta"]
+    names = ", ".join(i.label.removeprefix("Ponto de volta ") for i in rollbacks)
+    for title, sel, why in (
+            ("🗂  Arquivos parados para avaliar", files, "vão para a Lixeira"),
+            ("🐳 Pontos de volta recentes", rollbacks, f"{RECENT_ROLLBACK}: {names}")):
+        if sel:
+            t.add_row(f"{title} ({len(sel)})", fmt(sum(i.size for i in sel)), Text(EVAL.icon),
+                      f"{why} · um por um no hogs --clean")
+    body: list = [t] if t.row_count else [Text("Nada recomendado agora. 🎉", style="green")]
+    if not s.mounts_known:
+        body.append(Text("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.",
+                         style="yellow"))
+    if s.advice:
+        body.append(Text("↻ é só recomendação: o hogs nunca reinicia nem atualiza o Mac.", style="dim"))
+    return Panel(Group(*body), title="[bold]✨ Recomendado agora[/]", title_align="left", border_style="green",
+                 padding=(0, 2))
+
+
+def protected_panel(s: Snapshot) -> Panel:
+    d = s.docker
+    lines = []
+    if d.live:
+        lines.append(f"{plural(len(d.live), 'container rodando', 'containers rodando')} ({preview(d.live)}) "
+                     "e as imagens deles")
+    if d.volumes:
+        lines.append(f"{plural(len(d.volumes), 'volume', 'volumes')} do Docker "
+                     f"({fmt(sum(v['size'] for v in d.volumes))}): dados de bancos, só você decide")
+    if s.mounts:
+        lines.append(f"{plural(len(s.mounts), 'caminho montado', 'caminhos montados')} em containers "
+                     f"({preview([short(m) for m in s.mounts])}): nada ali dentro é sugerido")
+    if not s.mounts_known:
+        lines.append("Docker não respondeu: não sei o que está em uso.")
+    text = Text("\n".join(lines) if lines else "Nada em uso pelo Docker agora.")
+    return Panel(text, title="[bold]🛡 Não mexo[/]", title_align="left", border_style="grey50", padding=(0, 2))
+
+
 def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None:
     records = records or []
-    con.print(header(s, records))
+    cleanable = clean_items(s)
+    con.print(header(s, records, cleanable))
+    con.print(recommended_panel(s, cleanable))
+    con.print(protected_panel(s))
     con.print(growth_table(s, records))
     con.print()
-    for t in (category_table("🐳 Docker", docker_rows(s.docker)), prevention_panel(s), unused_images_table(s.docker),
-              category_table("🧰 Caches de dev", [(i.label, i.size, i.risk, i.hint) for i in s.items if i.cat == "dev"]),
-              category_table("📦 Apps e dados", [(i.label, i.size, i.risk, i.hint) for i in s.items if i.cat == "apps"]),
+    def rows(cat: str) -> list[tuple[str, int, Risk, str]]:
+        return [(i.label, i.size, i.risk, i.hint) for i in s.items if i.cat == cat]
+    for t in (category_table(CAT_TITLES["docker"], docker_rows(s.docker)), prevention_panel(s),
+              unused_images_table(s.docker),
+              category_table(CAT_TITLES["dev"], rows("dev")), category_table(CAT_TITLES["apps"], rows("apps")),
               category_table("🔎 Outros grandes (fora da lista acima)",
                              [(label, size, INFO, "") for label, size in s.others if size >= GB][:12])):
         if t is not None:
@@ -1759,7 +2370,6 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
         con.print(Text("Lista maior: hogs --apps 20", style="dim"))
         con.print()
 
-    cleanable = clean_items(s)
     safe = sum(i.size for i in cleanable if i.risk is SAFE)
     redown = sum(i.size for i in cleanable if i.risk is REDOWN)
     con.print(Panel(Text.assemble(
@@ -1858,6 +2468,32 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+DEFAULTS: dict[str, object] = {
+    "rollback_tags": ["antes", "backup", "bkp", "before", "rollback"],
+    "rollback_days": 2,
+    "stale_worktree_days": 30,
+}
+
+
+def setting(key: str) -> object:
+    """Valor do config.json se tiver o mesmo tipo do padrão (lista de str; int > 0), senão o padrão."""
+    default = DEFAULTS[key]
+    value = load_config().get(key)
+    if isinstance(default, list):
+        if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+            return value
+    elif isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return default
+
+
+def remember_worktrees_root(path: Path) -> None:
+    """Guarda a pasta do último --worktrees; o relatório mede ela como "Projetos"."""
+    cfg = load_config()
+    cfg["worktrees_root"] = str(path.expanduser().resolve())
+    save_config(cfg)
 
 
 def log(msg: str) -> None:
@@ -2074,6 +2710,7 @@ def run() -> None:
 
     con = Console()
     if args.worktrees:
+        remember_worktrees_root(args.worktrees)
         with con.status("[bold]🌳 Conferindo worktrees, alterações e sinais de uso…[/]"):
             rows, warnings = gather_worktrees(args.worktrees, args.worktree_days)
         root = args.worktrees.expanduser().resolve()
