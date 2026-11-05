@@ -2,48 +2,54 @@
 """hogs: mostra quem está comendo o disco do Mac (Docker incluso) e ajuda a limpar com segurança.
 
 Uso:
-  hogs                 relatório
-  hogs --clean         escolhe o que apagar
-  hogs --alert 30      avisa quando o espaço livre cair abaixo de 30 GB
-  hogs --alert off     desliga o aviso
-  hogs --alert         mostra se o aviso está ativo
-  hogs --alert test    manda uma notificação de teste
+  hogs                    num terminal, abre a tela para ver e escolher o que apagar; fora dele, o relatório
+  hogs --report           o relatório, mesmo num terminal
+  hogs --worktrees PASTA  a tela na aba Worktrees, só com os worktrees Git de PASTA
+  hogs --alert 30         avisa quando o espaço livre cair abaixo de 30 GB
+  hogs --alert off        desliga o aviso
+  hogs --alert            mostra se o aviso está ativo
+  hogs --alert test       manda uma notificação de teste
 """
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
 import plistlib
 import re
+import select
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import termios
 import time
+import tty
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable, Iterator, NamedTuple, TextIO
 
 try:
     from rich import box
+    from rich.cells import cell_len
     from rich.columns import Columns
-    from rich.console import Console, Group
+    from rich.console import Console, Group, RenderableType
     from rich.padding import Padding
     from rich.panel import Panel
-    from rich.prompt import Confirm, Prompt
     from rich.table import Table
     from rich.text import Text
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -108,6 +114,11 @@ class Item:
     hint: str = ""
     guard: Callable[[], str | None] | None = None
     kind: str = ""               # "pessoal" | "ponto_de_volta": separa os 🟡 para avaliar no Recomendado
+    path: Path | None = None     # onde o item mora no disco (para abrir no Finder e mostrar no 🔎)
+    worktree: Worktree | None = None   # o worktree, quando o item é um só
+    refs: list[str] = field(default_factory=list)   # imagens do Docker (image_ref) que o item remove
+    checks: list[tuple[bool, str]] = field(default_factory=list)   # o que o hogs conferiu: (passou, texto), no 🔎
+    guard_app: str = ""          # o app que a guarda confere; com ela passando, o 🔎 diz "<app> fechado"
 
 
 # ---------------------------------------------------------------- utilidades
@@ -305,6 +316,7 @@ class Docker:
     mounts_ok: bool = False                            # True só se o inspect respondeu
     live: list[str] = field(default_factory=list)      # containers rodando (nomes)
     released: dict[str, str] = field(default_factory=dict)  # imagem atual → branch padrão (de um clone local) com o commit dela
+    containers: list[dict] = field(default_factory=list)    # todos: {"name", "image", "running", "mounts"}
 
 
 def list_builders() -> list[dict]:
@@ -437,6 +449,7 @@ def gather_docker() -> Docker:
                 i["size"] = int(i["size"] * target / reported)
 
     containers = v.get("Containers") or []
+    per_container: list[list[str]] = []
     if not containers:
         d.mounts_ok = True
     else:
@@ -447,15 +460,24 @@ def gather_docker() -> Docker:
             found, volumes = [], []
             for line in r.stdout.splitlines():
                 if line.strip():
+                    binds: list[str] = []
                     for m in json.loads(line) or []:
                         if m.get("Type") == "bind" and m.get("Source"):
                             found.append(Path(m["Source"]).resolve())
+                            binds.append(str(found[-1]))
                         elif m.get("Type") == "volume" and m.get("Name") and m["Name"] not in volumes:
                             volumes.append(m["Name"])
+                    per_container.append(binds)
             found += bind_volume_folders(volumes)
             d.mounts, d.mounts_ok = sorted(set(found)), True
         except (ValueError, TypeError, AttributeError, KeyError, OSError, RuntimeError):
             d.mounts, d.mounts_ok = [], False
+            per_container = []
+    if len(per_container) != len(containers):
+        per_container = [[] for _ in containers]
+    d.containers = [{"name": c.get("Names", c["ID"][:12]), "image": c.get("Image", ""),
+                     "running": c.get("State") in ACTIVE_STATES, "mounts": m}
+                    for c, m in zip(containers, per_container)]
     running_projects = {
         _labels(c.get("Labels", "")).get("com.docker.compose.project")
         for c in containers if c.get("State") in ACTIVE_STATES
@@ -723,6 +745,7 @@ class Rollback(NamedTuple):
     size: int       # quanto libera
     risk: Risk
     hint: str
+    checks: tuple = ()   # o que foi conferido, para o 🔎: (passou, texto)
 
 
 RECENT_ROLLBACK = "o QA pode estar em andamento"
@@ -730,7 +753,7 @@ RECENT_ROLLBACK = "o QA pode estar em andamento"
 
 def rollback_info(d: Docker) -> dict[int, Rollback]:
     """Cada ponto de volta, pelo id() da imagem em `d.images`, do maior para o menor.
-    O relatório e o --clean usam esta mesma função, então o risco mostrado é sempre o mesmo."""
+    O relatório e a tela usam esta mesma função, então o risco mostrado é sempre o mesmo."""
     pairs = rollback_pairs(d)
     if not pairs:
         return {}
@@ -746,12 +769,14 @@ def rollback_info(d: Docker) -> dict[int, Rollback]:
         if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
             hint = "mesma imagem da atual: só remove a tag"
         risk = SAFE if old else EVAL
+        checks = [(True, f"a imagem atual {image_ref(current)} existe"), (old, f"mais de {days} dias (tem {int(age)})")]
         branch = d.released.get(current["name"])
         if branch:   # o commit da imagem atual já está na branch padrão: voltar não perde nada
             risk, hint = SAFE, f"o commit da {current['name']} já está na {branch}"
+            checks.append((True, f"o commit da {current['name']} já está na {branch}"))
             if same:
                 hint = "mesma imagem da atual: só remove a tag"
-        out[id(img)] = Rollback(img, 0 if same else img["size"], risk, hint)
+        out[id(img)] = Rollback(img, 0 if same else img["size"], risk, hint, tuple(checks))
     return out
 
 
@@ -762,39 +787,42 @@ def docker_clean_items(d: Docker) -> list[Item]:
     if d.build_cache:
         items.append(Item("docker", "Docker: cache de build", d.build_cache, SAFE,
                           lambda: run_all([["docker", "builder", "prune", "-a", "-f"]], timeout=900),
-                          "próximo build fica mais lento"))
+                          "próximo build fica mais lento", kind="cache"))
 
     for bc in d.builder_caches:
         if bc["size"] >= 1e6:
             items.append(Item("docker", f"Docker: cache do builder {bc['builder']}", bc["size"], SAFE,
                               lambda n=bc["builder"]: require(prune_builder(n), "docker buildx prune"),
-                              "próximo build fica mais lento"))
+                              "próximo build fica mais lento", kind="cache"))
 
     untagged = [i for i in d.images if not i["used"] and i["origin"] == "none"]
     if untagged:
         ids = [i["id"] for i in untagged]
         items.append(Item("docker", f"Docker: imagens sem tag ({len(untagged)})", sum(i["size"] for i in untagged),
-                          SAFE, lambda ids=ids: run_all([["docker", "rmi", x] for x in ids]), "versões antigas órfãs"))
+                          SAFE, lambda ids=ids: run_all([["docker", "rmi", x] for x in ids]), "versões antigas órfãs",
+                          kind="sem_tag", refs=[image_ref(i) for i in untagged]))
 
     old = [c for c in d.stopped if is_old_stopped(c)]
     if old:
         names = [c["name"] for c in old]
         items.append(Item("docker", f"Docker: containers parados há +{OLD_CONTAINER_DAYS} dias ({len(old)})",
                           sum(c["size"] for c in old), SAFE,
-                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview(names)))
+                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview(names),
+                          kind="container"))
     for c in d.stopped:
         if is_old_stopped(c):
             continue
         why = (f"projeto {c['project']} está rodando" if c["project_running"]
                else f"parado há {c['age']} dias" if c["age"] is not None else "idade desconhecida")
         items.append(Item("docker", f"Docker: container {c['name']}", c["size"], stopped_risk(c),
-                          lambda n=c["name"]: run_all([["docker", "rm", n]]), why))
+                          lambda n=c["name"]: run_all([["docker", "rm", n]]), why,
+                          kind="container"))
 
     rollbacks = rollback_info(d)
     for rb in rollbacks.values():
         items.append(Item("docker", f"Ponto de volta {rb.img['name']}", rb.size, rb.risk,
                           lambda ref=image_ref(rb.img): run_all([["docker", "rmi", ref]]), rb.hint,
-                          kind="ponto_de_volta"))
+                          kind="ponto_de_volta", refs=[image_ref(rb.img)], checks=list(rb.checks)))
 
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):
@@ -806,14 +834,15 @@ def docker_clean_items(d: Docker) -> list[Item]:
             continue
         items.append(Item("docker", f"Imagem {img['name']}", img["size"], LOSS if local else REDOWN,
                           lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]),
-                          f"{ORIGIN_LABEL[img['origin']]} · {img['created']}"))
+                          f"{ORIGIN_LABEL[img['origin']]} · {img['created']}", kind="imagem",
+                          refs=[image_ref(img)]))
     if small_pullable:
         names = [i["name"] for i in small_pullable]
         refs = [image_ref(i) for i in small_pullable]
         items.append(Item("docker", f"Imagens pequenas de registry/Hub ({len(names)})",
                           sum(i["size"] for i in small_pullable), REDOWN,
                           lambda refs=refs: run_all([["docker", "rmi", r] for r in refs]),
-                          preview([n.rsplit("/", 1)[-1] for n in names])))
+                          preview([n.rsplit("/", 1)[-1] for n in names]), kind="imagens_pequenas", refs=refs))
     return items
 
 
@@ -841,6 +870,10 @@ class Worktree:
     @property
     def verdict(self) -> str:
         return "seguro" if self.eligible else ("manter" if self.blockers or not self.waits else "depois")
+
+    def latest_conversation(self) -> ConvLink | None:
+        """A conversa ligada mais recente (pela última mensagem); None sem conversa."""
+        return max(self.conversations, key=lambda link: link.conv.last) if self.conversations else None
 
 
 def branch_name(w: Worktree) -> str:
@@ -1123,6 +1156,11 @@ class Conversation:
     branches: set[tuple[str, str]] = field(default_factory=set)       # (cwd, gitBranch)
     mentions: set[str] = field(default_factory=set)                   # caminhos citados, relativos ao escopo
     live: bool = False
+
+    @property
+    def name(self) -> str:
+        """Como a conversa aparece: o título ou, sem ele, o começo do id da sessão."""
+        return self.title or self.session[:8]
 
 
 @dataclass
@@ -1507,7 +1545,7 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
             if recent:
                 conv = max(recent, key=lambda c: c.last)
                 result.waits.append(f"conversa do Claude Code {elapsed(conv.last)}: "
-                                    f"{conv.title or conv.session[:8]}")
+                                    f"{conv.name}")
             if result.sessions:
                 result.waits.append(f"conversa aberta do Claude Code: {', '.join(result.sessions)}")
             if links is None:
@@ -1686,7 +1724,7 @@ VERDICT_LABELS = {"seguro": "seguro", "depois": "em andamento", "manter": "com t
 
 
 def safe_worktrees(rows: list[Worktree]) -> list[Worktree]:
-    """Os 🟢 na ordem em que recebem número (#1, #2…), a mesma no quadro e no --clean."""
+    """Os 🟢, por projeto e do maior para o menor."""
     return sorted((w for w in rows if w.eligible), key=lambda w: (w.repo.name.lower(), -w.size))
 
 
@@ -1703,7 +1741,7 @@ def hogs_command(root: Path, days: int) -> str:
 
 
 def merge_cell(w: Worktree) -> Text:
-    """Coluna da branch principal no quadro e no --clean: merge comprovado, só enviado ou nada comprovado."""
+    """Coluna da branch principal no quadro: merge comprovado, só enviado ou nada comprovado."""
     if w.merged:
         return Text(f"✓ {w.merged}", style="green")
     if w.pushed:
@@ -1715,7 +1753,7 @@ def conversation_cell(w: Worktree) -> Text:
     """A conversa mais recente ligada ao worktree; embaixo, há quanto tempo, quantas outras e o aviso de reabrir."""
     if not w.conversations:
         return Text("—")
-    last = max(w.conversations, key=lambda link: link.conv.last).conv
+    last = w.latest_conversation().conv
     head = ("● " if last.live else "") + (last.title or "(sem título)")
     foot = elapsed(last.last)
     if len(w.conversations) > 1:
@@ -1729,7 +1767,6 @@ def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = Non
                      stale_days: int = DEFAULTS["stale_worktree_days"]) -> None:
     """Quadro por projeto e, por último (o que fica na tela), o resumo."""
     order = {"seguro": 0, "depois": 1, "manter": 2}
-    number = {id(w): n for n, w in enumerate(safe_worktrees(rows), 1)}
     projects: dict[Path, list[Worktree]] = {}
     for w in rows:
         projects.setdefault(w.repo, []).append(w)
@@ -1746,7 +1783,7 @@ def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = Non
         t.add_column("Veredito", ratio=3, overflow="fold")   # "ellipsis" corta a palavra depois de um emoji (rich)
         for w in items:
             icon, style = VERDICTS[w.verdict]
-            verdict = (f"{icon} seguro · #{number[id(w)]}" if w.eligible
+            verdict = (f"{icon} seguro" if w.eligible
                        else f"{icon} {VERDICT_LABELS[w.verdict]}: {w.reason}")
             if w.eligible and not w.merged:
                 verdict += "\na pasta sai, a branch fica"
@@ -1870,9 +1907,9 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
     todo = [Text(""), Text("O que fazer", style="bold")]
     step = 1
     if safe:
-        todo.append(Text(f"  {step}. Apagar os 🟢: {cmd} --clean", style="bold"))
-        todo.append(indent("Digite a para todos ou os números do quadro (ex: 1,3,5-7). Ele confirma antes e "
-                           "confere tudo de novo antes de cada remoção."))
+        todo.append(Text(f"  {step}. Apagar os 🟢: {cmd}", style="bold"))
+        todo.append(indent("Num terminal, abre a tela na aba Worktrees: espaço marca (a marca todos os 🟢), Enter "
+                           "mostra a lista e s apaga. Cada um é conferido de novo antes de sair."))
         step += 1
     if later:
         todo.append(Text(f"  {step}. 🟡 ficam: estão em uso ou em andamento (motivo na coluna Veredito). "
@@ -1886,87 +1923,6 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
                     title_align="left", border_style="green" if safe else "yellow", padding=(1, 2)))
     con.print(Text("Merge e envio conferidos nas referências remotas locais; rode git fetch nos repositórios para "
                    "atualizá-las.", style="dim"))
-
-
-def clean_worktrees(con: Console, rows: list[Worktree], days: int, root: Path | None = None) -> None:
-    """Só os 🟢: todos de uma vez (a) ou pelos números do quadro, com confirmação e reverificação."""
-    safe = safe_worktrees(rows)
-    if not safe:
-        con.print(Panel("Nenhum worktree 🟢 agora. O resumo acima diz o que falta para cada grupo.",
-                        border_style="yellow", padding=(0, 2)))
-        return
-    t = Table(title="🗑  Worktrees seguros para apagar", title_justify="left", title_style="bold",
-              box=box.SIMPLE_HEAD, expand=True)
-    t.add_column("#", justify="right", style="cyan", no_wrap=True)
-    t.add_column("Projeto", no_wrap=True)
-    t.add_column("Worktree / branch", ratio=3)
-    t.add_column("Tamanho", justify="right", no_wrap=True)
-    t.add_column("Mexido", no_wrap=True)
-    t.add_column("Na main", ratio=2)
-    t.add_column("Sessão que trabalhou nele", ratio=2)
-    for n, w in enumerate(safe, 1):
-        t.add_row(str(n), w.repo.name, Text(where(w, root)).append(f"\n{branch_name(w)}", style="dim"),
-                  fmt(w.size), elapsed(w.last_activity), merge_cell(w),
-                  Text(", ".join(w.sessions) or "—", style="dim"))
-    con.print(t)
-    raw = Prompt.ask(f"Quais apagar? [cyan]a[/] = todos os {len(safe)} ({fmt(sum(w.size for w in safe))}) · "
-                     "números, ex: [cyan]1,3,5-7[/] · Enter cancela", default="", show_default=False)
-    numbers = selection_numbers(raw, len(safe))
-    chosen = [w for n, w in enumerate(safe, 1) if n in numbers]
-    if not chosen:
-        con.print("[dim]Nada apagado.[/]")
-        return
-
-    con.print(Text(f"\nVou remover {n_worktrees(len(chosen))}, {fmt(sum(w.size for w in chosen))}:", style="bold"))
-    for w in chosen:
-        note = f"  · sessão {', '.join(w.sessions)}" if w.sessions else ""
-        con.print(Text(f"  • {w.repo.name} / {where(w, root)}  ({branch_name(w)}){note}"))
-        for link in w.conversations:
-            if link.reopen:
-                con.print(Text(f"    ⚠ reabra antes de apagar “{link.conv.title or link.conv.session[:8]}”: "
-                               f"{resume_command(link.conv)}", style="yellow"))
-    con.print(Text("As branches ficam. Antes de cada remoção confiro tudo de novo; se algo mudou, ele fica.",
-                   style="dim"))
-    if not Confirm.ask("Remover?", default=False):
-        con.print("[dim]Nada apagado.[/]")
-        return
-
-    done, kept = [], []
-    for w in chosen:
-        try:
-            with con.status(f"Removendo {where(w, root)}…"):
-                remove_worktree(w, days, root)
-        except (OSError, RuntimeError) as exc:
-            kept.append((w, str(exc)))
-            con.print(Text(f"  ↷ {where(w, root)}: mantido, {exc}", style="yellow"))
-            continue
-        done.append(w)
-        con.print(Text(f"  ✔ {where(w, root)} removido", style="green"))
-    msg = Text.assemble((f"✔ {n_worktrees(len(done))} removido{'s' if len(done) != 1 else ''}", "bold green"),
-                        f" · {fmt(sum(w.size for w in done))} · livre agora: "
-                        f"{fmt(shutil.disk_usage(DATA_VOLUME).free)}")
-    if kept:
-        msg.append(f"\n↷ {n_worktrees(len(kept))} mantido{'s' if len(kept) != 1 else ''} porque algo mudou "
-                   "desde a análise (motivo acima)", style="yellow")
-    if done:
-        w = done[0]
-        msg.append(f"\nPara recriar um: git -C {short(w.repo)} worktree add {short(w.path)} {branch_name(w)}",
-                   style="dim")
-    con.print(Panel(msg, border_style="green" if done else "yellow", padding=(0, 2)))
-
-
-def selection_numbers(raw: str, total: int, everything: set[int] | None = None) -> set[int]:
-    """'a' = `everything` (padrão: todos); '1,3,5-7' = esses. Números fora da lista são ignorados."""
-    chosen: set[int] = set()
-    for tok in re.split(r"[,\s]+", raw.strip().lower()):
-        if tok == "a":
-            chosen |= set(range(1, total + 1)) if everything is None else everything
-        elif m := re.fullmatch(r"(\d+)-(\d+)", tok):
-            # limitado à lista: "1-99999999999" não cria bilhões de números
-            chosen |= set(range(max(1, int(m.group(1))), min(total, int(m.group(2))) + 1))
-        elif tok.isdigit():
-            chosen.add(int(tok))
-    return {n for n in chosen if 1 <= n <= total}
 
 
 def verdict_counts(rows: list[Worktree]) -> dict[str, tuple[int, int]]:
@@ -2008,7 +1964,7 @@ def remove_worktrees(rows: list[Worktree], scope: Path) -> None:
 
 
 def worktree_item(rows: list[Worktree], root: Path) -> Item | None:
-    """Os 🟢 viram um Item só no relatório principal e no --clean."""
+    """Os 🟢 viram um Item só no relatório principal (a tela usa `worktree_items`, um por worktree)."""
     safe = safe_worktrees(rows)
     if not safe:
         return None
@@ -2091,6 +2047,16 @@ def make_guard(pd: PathDef) -> Callable[[], str | None] | None:
     return lambda: f"feche o {pd.guard_proc} antes" if process_running(pd.guard_proc) else None
 
 
+RECREATES = "o app ou a ferramenta recria quando precisar"
+
+
+def path_item(pd: PathDef, sizes: dict[Path, int]) -> Item:
+    """O Item de uma pasta conhecida; as que se apagam (rm ou comando da ferramenta) voltam sozinhas."""
+    checks = [(True, RECREATES)] if pd.action is not None and pd.action != "empty" else []
+    return Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk, make_action(pd), pd.hint,
+                make_guard(pd), path=pd.paths[0], checks=checks, guard_app=pd.guard_proc or "")
+
+
 # Pastas varridas pra achar o que não está na lista acima.
 SCAN_ROOTS = [HOME, APP_SUPPORT, CONTAINERS, GROUP_CONTAINERS, CACHES]
 
@@ -2122,7 +2088,7 @@ def big_cache_paths(sizes: dict[Path, int], mounts: list[Path]) -> list[Path]:
 def cache_items(sizes: dict[Path, int], mounts: list[Path]) -> list[Item]:
     """Caches grandes em ~/Library/Caches que a lista não cobre; o app recria quando precisar."""
     return [Item("dev", f"Cache: {p.name}", int(sizes[p]), REDOWN, lambda p=p: shutil.rmtree(p),
-                 "cache do app; ele recria quando precisar")
+                 "cache do app; ele recria quando precisar", path=p, checks=[(True, RECREATES)])
             for p in big_cache_paths(sizes, mounts)]
 
 
@@ -2292,7 +2258,9 @@ def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
             return f"feche o {g.app} antes" if process_running(g.executable) else None
 
         hint = f"versões {', '.join(sorted(old))}; a instalada é {g.installed}"
-        items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard))
+        checks = [(True, f"versão {v} ≠ instalada {g.installed}") for v in sorted(old)]
+        items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard,
+                          path=copies[0], checks=checks, guard_app=g.app))
     return items
 
 
@@ -2352,7 +2320,8 @@ def personal_items(found: list[tuple[Path, int, float]], now: float) -> list[Ite
     for p, size, last in found:
         meses = int((now - last) // (30 * 86400))
         items.append(Item("apps", f"Parado: {short(p)}", size, EVAL, lambda p=p: move_to_trash(p),
-                          f"sem abrir há {meses} meses · vai para a Lixeira", kind="pessoal"))
+                          f"sem abrir há {meses} meses · vai para a Lixeira", kind="pessoal", path=p,
+                          checks=[(True, f"sem abrir há {meses} meses"), (True, "vai para a Lixeira")]))
     return items
 
 
@@ -2437,8 +2406,7 @@ def gather(con: Console) -> Snapshot:
                 except Exception as exc:   # o relatório nunca cai por causa dos worktrees: diz que não conferiu
                     worktrees_error = str(exc) or type(exc).__name__
 
-    items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
-                  make_action(pd), pd.hint, make_guard(pd)) for pd in PATH_DEFS]
+    items = [path_item(pd, sizes) for pd in PATH_DEFS]
     shown: set[Path] = set()
     if mounts_known:
         cand_sizes = {p: sizes.get(p, 0) for p in candidates}
@@ -2749,12 +2717,12 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
 
 
 def rollback_rows(rollbacks: list[Rollback]) -> list[tuple[str, int, Risk, str]]:
-    """Cada ponto de volta numa linha própria, com o mesmo risco e a mesma dica do --clean."""
+    """Cada ponto de volta numa linha própria, com o mesmo risco e a mesma dica da tela."""
     return [(f"Ponto de volta {rb.img['name']}", rb.size, rb.risk, rb.hint) for rb in rollbacks]
 
 
 def stopped_rows(stopped: list[dict]) -> list[tuple[str, int, Risk, str]]:
-    """Containers parados com o mesmo risco do --clean: os antigos 🟢 e o resto pelo pior risco."""
+    """Containers parados com o mesmo risco da tela: os antigos 🟢 e o resto pelo pior risco."""
     old = [c for c in stopped if is_old_stopped(c)]
     rest = [c for c in stopped if not is_old_stopped(c)]
     rows = []
@@ -2764,7 +2732,7 @@ def stopped_rows(stopped: list[dict]) -> list[tuple[str, int, Risk, str]]:
     if rest:
         risk = max((stopped_risk(c) for c in rest), key=lambda r: r.rank)
         rows.append((f"Outros containers parados ({len(rest)})", sum(c["size"] for c in rest), risk,
-                     "recentes ou de projeto rodando; veja um por um no --clean"))
+                     "recentes ou de projeto rodando; veja um por um na aba Disco do hogs"))
     return rows
 
 
@@ -2853,7 +2821,7 @@ def trim_trapped(cat: str, trim_off: bool) -> bool:
 
 
 def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item] | None = None,
-           trim_off: bool | None = None) -> Panel:
+           trim_off: bool | None = None, compact: bool = False) -> Panel:
     used = s.total - s.free
     segs = breakdown(s)
     if cleanable is None:
@@ -2878,11 +2846,11 @@ def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item]
                          (f"{fmt(recommended)} livres", "bold green"))
     if trim_off:
         line.append(f" ({TRIM_OFF_NOTE})", style="yellow")
-    body = [line, Text(), bar, legend]
+    body = [line, bar, legend] if compact else [line, Text(), bar, legend]
     if records and (t := trend(s, records, time.time())) is not None:
         body += [Text(), t]
     return Panel(Group(*body), title="[bold]🐷 hogs[/]  [dim]quem está comendo seu disco[/]",
-                 title_align="left", border_style="grey50", padding=(1, 2))
+                 title_align="left", border_style="grey50", padding=(0, 1) if compact else (1, 2))
 
 
 def growth_table(s: Snapshot, records: list[dict]) -> Table | Text:
@@ -3014,7 +2982,7 @@ def recommended_panel(s: Snapshot, cleanable: list[Item], trim_off: bool | None 
             ("🐳 Pontos de volta recentes", rollbacks, f"{RECENT_ROLLBACK}: {names}")):
         if sel:
             t.add_row(f"{title} ({len(sel)})", fmt(sum(i.size for i in sel)), Text(EVAL.icon),
-                      f"{why} · um por um no hogs --clean")
+                      f"{why} · marque um por um na tela do hogs")
     body: list = [t] if t.row_count else [Text("Nada recomendado agora. 🎉", style="green")]
     if not s.mounts_known:
         body.append(Text("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.",
@@ -3083,8 +3051,8 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
                          (f"🟡 {fmt(redown)} que baixam de novo", "bold yellow"))
     if trim_off:
         line.append(f"  ({TRIM_OFF_NOTE})", style="yellow")
-    line.append_text(Text.assemble("\n", ("Rode ", "dim"), ("hogs --clean", "bold cyan"),
-                                   (" pra escolher o que apagar.", "dim")))
+    line.append_text(Text.assemble("\n", ("Rode ", "dim"), ("hogs", "bold cyan"),
+                                   (" num terminal para escolher o que apagar.", "dim")))
     con.print(Panel(line, border_style="green", padding=(0, 2)))
 
 
@@ -3096,68 +3064,1428 @@ def clean_items(s: Snapshot) -> list[Item]:
     return sorted(items, key=lambda i: (i.risk.rank, -i.size))
 
 
-def parse_selection(raw: str, items: list[Item]) -> list[Item]:
-    """Como selection_numbers, mas 'a' são só os 🟢."""
-    safe = {n for n, i in enumerate(items, 1) if i.risk is SAFE}
-    return [items[n - 1] for n in sorted(selection_numbers(raw, len(items), safe))]
+# ---------------------------------------------------------------- tela: terminal
 
 
-def clean(con: Console, s: Snapshot) -> None:
-    items = clean_items(s)
-    if not items:
-        con.print("[green]Nada pra limpar. 🎉[/]")
-        return
+class Key(NamedTuple):
+    name: str
+    x: int = -1
+    y: int = -1
 
-    t = Table(title="🧹 O que dá pra apagar", title_justify="left", title_style="bold",
-              box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
-    t.add_column("#", justify="right", style="cyan", no_wrap=True)
-    t.add_column("Item", ratio=4, no_wrap=True, overflow="ellipsis")
-    t.add_column("Tamanho", justify="right", no_wrap=True)
-    t.add_column("Risco", no_wrap=True)
-    t.add_column("Detalhe", style="dim", ratio=3, overflow="ellipsis", no_wrap=True)
-    for n, i in enumerate(items, 1):
-        t.add_row(str(n), i.label, Text(fmt(i.size), style="bold"), risk_text(i.risk), i.hint)
-    con.print(t)
-    con.print("[dim]🟢 seguro · 🟡 volta com download/rebuild · 🔴 perde algo (só se tiver certeza). "
-              "Containers rodando e volumes nunca aparecem aqui.[/]\n")
 
-    raw = Prompt.ask("Quais apagar? [cyan]a[/] = todos 🟢 · ex: [cyan]1,3,5-7[/] · Enter cancela", default="",
-                     show_default=False)
-    chosen = parse_selection(raw, items)
-    if not chosen:
-        con.print("[dim]Nada apagado.[/]")
-        return
+SCREEN_ON = "\x1b[?1049h\x1b[?25l"
+SCREEN_OFF = "\x1b[?25h\x1b[?1049l"
+MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1006l\x1b[?1000l"
 
-    con.print()
-    for i in chosen:
-        con.print(f"  [green]✔[/] {i.label}  [bold]{fmt(i.size)}[/]  {i.risk.icon}")
-    con.print(f"\n  Total: [bold]{fmt(sum(i.size for i in chosen))}[/]")
-    if any(i.risk is LOSS for i in chosen):
-        con.print("  [red]Atenção: tem item 🔴 na lista, ele não volta.[/]")
-    if not Confirm.ask("\nApagar esses itens?", default=False):
-        con.print("[dim]Nada apagado.[/]")
-        return
+_CSI_FINAL_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left",
+                   "H": "home", "F": "end", "Z": "backtab"}
+_CSI_TILDE_KEYS = {"1": "home", "7": "home", "4": "end", "8": "end", "5": "pgup", "6": "pgdn"}
+_CONTROL_KEYS = {0x0d: "enter", 0x0a: "enter", 0x20: "space", 0x09: "tab",
+                 0x7f: "backspace", 0x08: "backspace", 0x03: "ctrl_c"}
 
-    before = shutil.disk_usage(DATA_VOLUME).free
-    for i in chosen:
-        if i.guard and (why := i.guard()):
-            con.print(f"  [yellow]↷[/] {i.label}: pulei, {why}")
-            continue
+
+def _csi_key(params: str, final: str) -> Key | None:
+    """Tecla de uma sequência CSI completa; None quando não é uma que conhecemos."""
+    if params.startswith("<") and final in "Mm":
+        if final == "m":
+            return None
         try:
-            with con.status(f"Limpando {i.label}…"):
-                i.action()
-        except (OSError, RuntimeError) as exc:
-            con.print(Text(f"  ↷ {i.label}: {exc}", style="yellow"))
-            continue
-        con.print(f"  [green]✔[/] {i.label}")
+            b, x, y = (int(p) for p in params[1:].split(";"))
+        except ValueError:
+            return None
+        if b == 0:
+            return Key("click", x - 1, y - 1)
+        if b == 64:
+            return Key("wheel_up", x - 1, y - 1)
+        if b == 65:
+            return Key("wheel_down", x - 1, y - 1)
+        return None
+    if final == "~":
+        name = _CSI_TILDE_KEYS.get(params)
+        return Key(name) if name else None
+    name = _CSI_FINAL_KEYS.get(final)
+    return Key(name) if name else None
 
-    after = shutil.disk_usage(DATA_VOLUME).free
-    msg = Text.assemble(("Liberado: ", "bold"), (fmt(max(0, after - before)), "bold green"),
-                        f"  ·  livre agora: {fmt(after)}")
-    if any(i.cat == "docker" for i in chosen):
-        msg.append("\nO Docker devolve o espaço do Docker.raw aos poucos; se não mudar, reinicie o Docker Desktop.",
-                   style="dim")
-    con.print(Panel(msg, border_style="green", padding=(0, 2)))
+
+def parse_input(data: bytes, final: bool = False) -> tuple[list[Key], bytes]:
+    """Teclas e mouse (SGR) de bytes crus do terminal, mais o resto incompleto."""
+    keys: list[Key] = []
+    i, n = 0, len(data)
+    while i < n:
+        b = data[i]
+        if b == 0x1b:
+            if i + 1 >= n:
+                if final:
+                    keys.append(Key("esc"))
+                    i += 1
+                break
+            nxt = data[i + 1]
+            if nxt == 0x5b:  # CSI
+                j = i + 2
+                while j < n and not 0x40 <= data[j] <= 0x7e:
+                    j += 1
+                if j >= n:
+                    break
+                key = _csi_key(data[i + 2:j].decode("latin-1"), chr(data[j]))
+                if key:
+                    keys.append(key)
+                i = j + 1
+            elif nxt == 0x4f:  # SS3
+                if i + 2 >= n:
+                    break
+                name = _CSI_FINAL_KEYS.get(chr(data[i + 2]))
+                if name:
+                    keys.append(Key(name))
+                i += 3
+            else:
+                keys.append(Key("esc"))
+                i += 1
+            continue
+        if b in _CONTROL_KEYS:
+            keys.append(Key(_CONTROL_KEYS[b]))
+            i += 1
+        elif b < 0x20:
+            i += 1
+        elif b < 0x80:
+            keys.append(Key(chr(b)))
+            i += 1
+        else:
+            size = 2 if b >= 0xc0 and b < 0xe0 else 3 if 0xe0 <= b < 0xf0 else 4 if 0xf0 <= b < 0xf8 else 1
+            if i + size > n:
+                break
+            text = data[i:i + size].decode("utf-8", "ignore")
+            if text:
+                keys.append(Key(text))
+            i += size
+    return keys, (b"" if final else data[i:])
+
+
+class Terminal:
+    """Terminal em modo cru, tela alternativa e mouse; sempre restaurado ao sair."""
+
+    def __init__(self, mouse: bool = True, fd: int | None = None, out: TextIO | None = None):
+        self.mouse = mouse
+        self.fd = sys.stdin.fileno() if fd is None else fd
+        self.out = sys.stdout if out is None else out
+        self._saved = None
+        self._pending = b""
+
+    def _start(self) -> None:
+        self._saved = termios.tcgetattr(self.fd)
+        raw = termios.tcgetattr(self.fd)
+        raw[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
+        raw[0] &= ~(termios.IXON | termios.ICRNL)
+        termios.tcsetattr(self.fd, termios.TCSANOW, raw)
+        try:
+            self.out.write(SCREEN_ON + (MOUSE_ON if self.mouse else ""))
+            self.out.flush()
+        except BaseException:   # sem a tela, o terminal não pode ficar cru
+            termios.tcsetattr(self.fd, termios.TCSAFLUSH, self._saved)
+            raise
+
+    def _stop(self) -> None:
+        try:
+            self.out.write((MOUSE_OFF if self.mouse else "") + SCREEN_OFF)
+            self.out.flush()
+        finally:
+            if self._saved is not None:
+                termios.tcsetattr(self.fd, termios.TCSAFLUSH, self._saved)
+
+    def __enter__(self) -> "Terminal":
+        self._start()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._stop()
+        return False
+
+    def _read_bytes(self) -> bytes:
+        try:
+            return os.read(self.fd, 4096)
+        except OSError:   # EIO quando o terminal some: o mesmo que fim da entrada
+            return b""
+
+    def read(self, timeout: float) -> list[Key]:
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            keys, self._pending = parse_input(self._pending, final=True) if self._pending == b"\x1b" else ([], self._pending)
+            return keys
+        data = self._read_bytes()
+        if not data:   # fim da entrada (terminal fechado): sair em vez de girar em falso
+            self._pending = b""
+            return [Key("ctrl_c")]
+        self._pending += data
+        keys, self._pending = parse_input(self._pending)
+        if self._pending == b"\x1b":
+            more, _, _ = select.select([self.fd], [], [], 0.03)
+            if more:
+                data = self._read_bytes()
+                if not data:
+                    self._pending = b""
+                    return keys + [Key("ctrl_c")]
+                self._pending += data
+                extra, self._pending = parse_input(self._pending)
+                keys += extra
+            else:
+                extra, self._pending = parse_input(self._pending, final=True)
+                keys += extra
+        return keys
+
+    def size(self) -> tuple[int, int]:
+        s = shutil.get_terminal_size((80, 24))
+        return s.columns, s.lines
+
+    def draw(self, lines: list[str]) -> None:
+        body = "".join(f"\x1b[{y + 1};1H{line}\x1b[K" for y, line in enumerate(lines))
+        self.out.write("\x1b[?2026h" + body + "\x1b[?2026l")
+        self.out.flush()
+
+    @contextmanager
+    def suspended(self) -> Iterator[None]:
+        self._stop()
+        try:
+            yield
+        finally:
+            self._pending = b""
+            self._start()
+
+
+# ---------------------------------------------------------------- tela: lista
+
+
+class Column(NamedTuple):
+    title: str
+    justify: str = "left"
+    ratio: int | None = None
+    width: int | None = None
+
+
+@dataclass
+class Row:
+    key: str
+    cells: list
+    item: Item | None = None
+    children: list[Row] = field(default_factory=list)
+    limit: int = 0
+    kind: str = "item"  # item | group | more | advice | info
+    detail: list = field(default_factory=list)
+    title: str = ""
+    path: Path | None = None
+    resume: Conversation | None = None
+    how: str = ""
+    group: str = ""
+    size: int = 0          # o tamanho que a linha mostra; a linha "… mais N" soma o dos escondidos
+
+
+def item_key(i: Item) -> str:
+    return f"{i.cat}|{i.label}"
+
+
+class Visible(NamedTuple):
+    row: Row
+    depth: int
+    parent: Row | None
+
+
+@dataclass
+class ListState:
+    cursor: int = 0
+    scroll: int = 0
+    expanded: set[str] = field(default_factory=set)
+    flt: str = ""
+
+
+def _hidden_size(hidden: list[Row]) -> int:
+    return sum(c.size for c in hidden)
+
+
+def visible_rows(rows: list[Row], expanded: set[str]) -> list[Visible]:
+    out: list[Visible] = []
+
+    def walk(row: Row, depth: int, parent: Row | None) -> None:
+        out.append(Visible(row, depth, parent))
+        if row.key not in expanded:
+            return
+        kids = row.children
+        shown = kids
+        if row.limit > 0 and len(kids) > row.limit and f"{row.key}/+" not in expanded:
+            shown = kids[:row.limit]
+        for c in shown:
+            walk(c, depth + 1, row)
+        if len(shown) < len(kids):
+            hidden = kids[len(shown):]
+            more = Row(key=f"{row.key}/+",
+                       cells=[Text(f"… mais {len(hidden)}", style="dim"), fmt(_hidden_size(hidden))],
+                       kind="more")
+            out.append(Visible(more, depth + 1, row))
+
+    for r in rows:
+        walk(r, 0, None)
+    return out
+
+
+def checkable(row: Row) -> bool:
+    return row.item is not None and row.item.action is not None and row.kind == "item"
+
+
+def safe_row(row: Row) -> bool:
+    """Linha 🟢: um item seguro, ou um grupo só de linhas 🟢 (o 🔎 dela diz "Por que é seguro")."""
+    if row.item is not None and row.kind == "item":
+        return row.item.risk is SAFE
+    return bool(row.children) and all(safe_row(c) for c in row.children)
+
+
+def leaf_items(row: Row) -> list[Item]:
+    out: list[Item] = []
+    if checkable(row):
+        out.append(row.item)
+    for c in row.children:
+        out.extend(leaf_items(c))
+    return out
+
+
+def box_items(row: Row) -> list[Item]:
+    """O que a caixinha da linha marca: o próprio item; num grupo, só os 🟢 dele (🟡 e 🔴 só um por um)."""
+    leaves = leaf_items(row)
+    return leaves if row.kind == "item" else [i for i in leaves if i.risk is SAFE]
+
+
+def mark_box(row: Row, marked: set[str]) -> str:
+    """A caixinha reflete o que ela marca: grupo sem nenhum 🟢 não tem caixinha."""
+    leaves = box_items(row)
+    if not leaves:
+        return ""
+    n = sum(1 for i in leaves if item_key(i) in marked)
+    return "[x]" if n == len(leaves) else "[-]" if n else "[ ]"
+
+
+def toggle(row: Row, marked: set[str]) -> None:
+    keys = {item_key(i) for i in box_items(row)}
+    if not keys:
+        return
+    if keys <= marked:
+        marked -= keys
+    else:
+        marked |= keys
+
+
+def _all_rows(rows: list[Row]) -> Iterator[Row]:
+    for r in rows:
+        yield r
+        yield from _all_rows(r.children)
+
+
+def mark_all_safe(rows: list[Row], marked: set[str]) -> int:
+    n = 0
+    for r in _all_rows(rows):
+        if checkable(r) and r.item.risk is SAFE:
+            k = item_key(r.item)
+            if k not in marked:
+                marked.add(k)
+                n += 1
+    return n
+
+
+def collect_items(rows: list[Row]) -> dict[str, Item]:
+    return {item_key(r.item): r.item for r in _all_rows(rows) if checkable(r)}
+
+
+def move(state: ListState, total: int, delta: int, height: int) -> None:
+    state.cursor = max(0, min(state.cursor + delta, total - 1)) if total > 0 else 0
+    if state.cursor < state.scroll:
+        state.scroll = state.cursor
+    elif state.cursor >= state.scroll + height:
+        state.scroll = state.cursor - height + 1
+    state.scroll = max(0, min(state.scroll, max(0, total - height)))
+
+
+def open_row(state: ListState, vis: list[Visible]) -> None:
+    if not 0 <= state.cursor < len(vis):
+        return
+    v = vis[state.cursor]
+    if v.row.kind == "more" and v.parent is not None:
+        state.expanded.add(f"{v.parent.key}/+")
+    elif v.row.children:
+        if v.row.key not in state.expanded:
+            state.expanded.add(v.row.key)
+        elif state.cursor + 1 < len(vis):
+            state.cursor += 1
+
+
+def close_row(state: ListState, vis: list[Visible]) -> None:
+    if not 0 <= state.cursor < len(vis):
+        return
+    v = vis[state.cursor]
+    if v.row.children and v.row.key in state.expanded:
+        state.expanded.discard(v.row.key)
+    elif v.parent is not None:
+        for n, o in enumerate(vis):
+            if o.row is v.parent:
+                state.cursor = n
+                break
+
+
+# ---------------------------------------------------------------- tela: itens e ações
+
+RISK_WHY = {
+    "seguro": "volta sozinho ou já está guardado em outro lugar",
+    "baixa de novo": "volta baixando de novo",
+    "perde algo": "não volta: só apague se tiver certeza",
+    "para avaliar": "não volta sozinho: avalie você (arquivos vão para a Lixeira)",
+    "só informação": "só informação: o hogs não apaga",
+}
+
+
+def worktree_items(rows: list[Worktree], root: Path, days: int = 0) -> list[Item]:
+    """Um Item por worktree 🟢 (a tela apaga um por um; o relatório continua com `worktree_item`)."""
+    items = []
+    for w in safe_worktrees(rows):
+        hint = f"já na main ({w.merged})" if w.merged else f"enviado ({w.pushed}), parado {elapsed(w.last_activity)}"
+        if any(link.reopen for link in w.conversations):
+            hint += " · ⚠ reabra antes de apagar"
+        items.append(Item("worktree", f"{w.repo.name} / {where(w, root)}", w.size, SAFE,
+                          lambda w=w: remove_worktree(w, days, root), hint, path=w.path, worktree=w))
+    return items
+
+
+def tui_items(s: Snapshot) -> list[Item]:
+    items = [i for i in clean_items(s) if i.cat != "worktree"]
+    if s.worktrees_root:
+        items += worktree_items(s.worktrees, s.worktrees_root)
+    return sorted(items, key=lambda i: (i.risk.rank, -i.size))
+
+
+def apply_items(items: list[Item], notify: Callable[[Item, bool, str], None]) -> int:
+    """Roda cada item reconferindo a guarda na hora; devolve os bytes livres a mais no volume de dados."""
+    before = shutil.disk_usage(DATA_VOLUME).free
+    for i in items:
+        ok, why = False, ""
+        try:
+            guard = i.guard() if i.guard else None
+            if guard:
+                why = f"pulei, {guard}"
+            else:
+                i.action()
+                ok = True
+        except (OSError, RuntimeError) as exc:
+            why = str(exc)
+        except Exception as exc:   # um erro inesperado vira ↷ e não interrompe o resto
+            why = f"{type(exc).__name__}: {exc}"
+        notify(i, ok, why)
+    return max(0, shutil.disk_usage(DATA_VOLUME).free - before)
+
+
+WT_KEYS = "o abrir no Finder · c copiar · r reabrir a conversa"
+
+
+def check_line(ok: bool, text: str) -> Text:
+    return Text(f"✓ {text}", style="green") if ok else Text(f"✗ {text}", style="yellow")
+
+
+def path_line(path: Path) -> Text:
+    return Text(f"📁 {short(path)}", style=f"link file://{path}")
+
+
+def worktree_detail(w: Worktree, root: Path | None) -> list[Text]:
+    lines = [Text(f"{where(w, root)} · {branch_name(w)}", style="bold"), path_line(w.path),
+             Text(f"{fmt(w.size)} · mexido {elapsed(w.last_activity)}")]
+    lines += [check_line(ok, text) for ok, text in w.checks]
+    if w.users:
+        lines.append(Text(f"▶ em uso por: {', '.join(w.users)}"))
+    lines += [Text(f"🟡 {t}") for t in w.waits]
+    lines += [Text(f"⚪ {t}") for t in w.blockers]
+    icon, color = VERDICTS[w.verdict]
+    verdict = f"{icon} {VERDICT_LABELS[w.verdict]}"
+    if w.eligible:
+        verdict += " · a pasta sai, a branch fica"
+    lines.append(Text(verdict, style=color))
+    for link in sorted(w.conversations, key=lambda l: -l.conv.last):
+        c = link.conv
+        lines.append(Text(f"💬 {'● ' if c.live else ''}“{c.name}” · última msg {elapsed(c.last)}"))
+        lines.append(Text(resume_command(c), style="cyan"))
+        if link.reopen:
+            lines.append(Text("⚠ reabra antes de apagar: depois da remoção ela não abre mais", style="yellow"))
+    if w.conversations:
+        lines.append(Text(WT_KEYS, style="grey62"))
+    return lines
+
+
+def item_detail(i: Item, guard_text: str | None = None) -> list[Text]:
+    """O 🔎 de um item: risco, dica, o que o hogs conferiu (✓/✗) e a guarda (`guard_text`: o motivo, se falhou)."""
+    lines = [Text(i.label, style="bold"),
+             Text(f"{fmt(i.size)} · {i.risk.icon} {i.risk.label}: {RISK_WHY[i.risk.label]}")]
+    if i.hint:
+        lines.append(Text(i.hint))
+    lines += [check_line(ok, text) for ok, text in i.checks]
+    if guard_text:
+        lines.append(check_line(False, guard_text))
+    elif i.guard is not None:
+        lines.append(check_line(True, f"{i.guard_app or 'o app'} fechado"))
+    if i.worktree:
+        lines += worktree_detail(i.worktree, None)
+    elif i.path:
+        lines.append(path_line(i.path))
+    return lines
+
+
+# ---------------------------------------------------------------- tela: desenho
+
+MIN_W, MIN_H = 60, 20
+LIST_TOP = 3  # borda, cabeçalho e régua: o primeiro item fica 3 linhas abaixo do topo do painel
+MARK_X = 6
+TOO_SMALL = "Janela pequena demais: aumente para pelo menos 60×20."
+
+
+def render_lines(renderable: RenderableType, width: int, color_system: str | None = None) -> list[str]:
+    buf = io.StringIO()
+    console = Console(file=buf, width=width, force_terminal=color_system is not None,
+                      color_system=color_system, legacy_windows=False)
+    console.print(renderable)
+    out = buf.getvalue()
+    if out.endswith("\n"):
+        out = out[:-1]
+    return out.split("\n")
+
+
+def list_panel(title: str, columns: list[Column], vis: list[Visible], state: ListState, marked: set[str],
+               height: int, border: str = "green", empty: str = "") -> Panel:
+    table = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
+    table.add_column("", width=3, no_wrap=True, overflow="ellipsis")
+    for c in columns:
+        table.add_column(c.title, justify=c.justify, ratio=c.ratio, width=c.width,
+                         no_wrap=True, overflow="ellipsis")
+    shown = vis[state.scroll:state.scroll + max(height - 4, 0)]
+    for k, v in enumerate(shown):
+        row = v.row
+        cells = []
+        for j in range(len(columns)):
+            cell = row.cells[j] if j < len(row.cells) else ""
+            if j == 0:
+                arrow = ("▾ " if row.key in state.expanded else "▸ ") if row.kind == "group" or row.children else ""
+                prefix = "  " * v.depth + arrow
+                cell = prefix + cell if isinstance(cell, str) else Text(prefix) + cell
+            cells.append(Text(cell) if isinstance(cell, str) else cell)
+        table.add_row(Text(mark_box(row, marked)), *cells,
+                      style="reverse" if state.scroll + k == state.cursor else "")
+    if not vis:
+        table.add_row("", Text(empty, style="grey62"), *[""] * (len(columns) - 1))
+    return Panel(table, title=title, title_align="left", border_style=border, padding=(0, 1), height=height)
+
+
+def detail_panel(title: str, lines: list, width: int, max_height: int) -> Panel:
+    body = Group(*lines)
+    panel = Panel(body, title=title, title_align="left", padding=(0, 1))
+    if len(render_lines(panel, width)) <= max_height:
+        return panel
+    console = Console(file=io.StringIO(), width=width, legacy_windows=False)
+    segs = console.render_lines(body, console.options.update_width(max(width - 4, 1)), pad=False)
+    keep = max(max_height - 3, 0)
+    text = Text()
+    for line in segs[:keep]:
+        for seg in line:
+            text.append(seg.text, seg.style)
+        text.append("\n")
+    text.append(f"… mais {len(segs) - keep} linhas: aumente a janela", style="grey62")
+    return Panel(text, title=title, title_align="left", padding=(0, 1))
+
+
+def tab_bar(names: list[str], active: int) -> tuple[Text, list[tuple[int, int, int]]]:
+    text = Text(" ")
+    ranges: list[tuple[int, int, int]] = []
+    for i, name in enumerate(names):
+        if i:
+            text.append(" │ ")
+        label = f"{i + 1} {name}"
+        x0 = cell_len(text.plain)
+        text.append(label, style="bold reverse" if i == active else "")
+        ranges.append((x0, x0 + cell_len(label), i))
+    return text, ranges
+
+
+class Flex(NamedTuple):
+    name: str
+    build: Callable[[int], RenderableType]
+    first: int
+    count: int
+
+
+class Frame(NamedTuple):
+    lines: list[str]
+    rows: dict[int, tuple[str, int]]
+    tabs: list[tuple[int, int, int]]
+
+
+def _too_small(width: int, height: int) -> Frame:
+    msg = TOO_SMALL
+    while cell_len(msg) > width and msg:
+        msg = msg[:-1]
+    pad = max((width - cell_len(msg)) // 2, 0)
+    lines = [""] * max(height, 0)
+    if lines:
+        lines[height // 2] = " " * pad + msg
+    return Frame(lines, {}, [])
+
+
+def stack(width: int, height: int, parts: list, color_system: str | None = None,
+          tabs: list[tuple[int, int, int]] | None = None) -> Frame:
+    rendered: list = []
+    for p in parts:
+        rendered.append(p if isinstance(p, Flex) else render_lines(p, max(width, 1), color_system))
+    others = sum(len(r) for r in rendered if not isinstance(r, Flex))
+    h = height - others
+    if width < MIN_W or height < MIN_H or h < 6:
+        return _too_small(width, height)
+    lines: list[str] = []
+    rows: dict[int, tuple[str, int]] = {}
+    for r in rendered:
+        if isinstance(r, Flex):
+            top = len(lines)
+            lines.extend(render_lines(r.build(h), width, color_system))
+            for k in range(max(min(r.count - r.first, h - 4), 0)):
+                rows[top + LIST_TOP + k] = (r.name, r.first + k)
+        else:
+            lines.extend(r)
+    lines = lines[:height] + [""] * (height - len(lines))
+    return Frame(lines, {y: v for y, v in rows.items() if y < height}, list(tabs or []))
+
+
+
+# ---------------------------------------------------------------- tela: abas Recomendado e Disco
+
+REC_COLUMNS = [Column("O quê", ratio=4), Column("Libera", "right"), Column("Risco"), Column("Por quê", ratio=3)]
+DISK_COLUMNS = [Column("O quê", ratio=4), Column("Tamanho", "right"), Column("Risco"), Column("Detalhe", ratio=3)]
+
+
+def run_guards(items: list[Item]) -> dict[str, str | None]:
+    """Roda a guarda de cada item que tem uma, uma vez só (ela pode chamar pgrep)."""
+    return {item_key(i): i.guard() for i in items if i.guard}
+
+
+def item_row(i: Item, guards: dict[str, str | None]) -> Row:
+    guard = guards.get(item_key(i))
+    link = i.worktree.latest_conversation() if i.worktree else None
+    return Row(item_key(i), [i.label, fmt(i.size), i.risk.icon, Text(guard, style="yellow") if guard else i.hint],
+               i, detail=item_detail(i, guard), title=i.label, path=i.path, resume=link.conv if link else None,
+               group=f"disk/{i.cat}", size=i.size)
+
+
+def _group_row(key: str, title: str, total_cell: str, risk: str, note: str, kids: list[Row], detail: list,
+               limit: int = 0, size: int = 0) -> Row:
+    return Row(key, [title, total_cell, risk, note], children=kids, limit=limit, kind="group", title=title,
+               detail=detail, size=size)
+
+
+def recommended_tree(s: Snapshot, items: list[Item], trim_off: bool,
+                     guards: dict[str, str | None]) -> tuple[list[Column], list[Row]]:
+    safe: dict[str, list[Item]] = {}
+    for i in items:
+        if i.risk is SAFE and i.action is not None:
+            safe.setdefault(i.cat, []).append(i)
+    groups: list[tuple[int, Row]] = []
+    for cat, group in safe.items():
+        group = sorted(group, key=lambda i: -i.size)
+        total = sum(i.size for i in group)
+        trapped = trim_trapped(cat, trim_off)
+        title = f"🌳 Worktrees que podem sair ({len(group)})" if cat == "worktree" else CAT_TITLES[cat]
+        detail = [Text(title, style="bold"),
+                  Text(f"{plural(len(group), 'item', 'itens')} · {fmt(total)}")]
+        if cat == "worktree":
+            detail.append(Text("a pasta sai, a branch fica"))
+        if trapped:
+            detail.append(Text(TRIM_OFF_NOTE, style="yellow"))
+        groups.append((total, _group_row(f"rec/{cat}", title, "—" if trapped else fmt(total), "🟢",
+                                         TRIM_OFF_NOTE if trapped else "",
+                                         [item_row(i, guards) for i in group], detail,
+                                         limit=5 if cat == "worktree" else 0, size=total)))
+    rows = [r for _, r in sorted(groups, key=lambda g: -g[0])]
+    for n, (label, size, how) in enumerate(s.advice):
+        rows.append(Row(f"rec/advice/{n}", [f"💻 {label}", f"~{fmt(size)}" if size else "",
+                                            Text("↻", style="cyan"), how],
+                        kind="advice", how=how, title=label,
+                        detail=[label, how, "o hogs nunca reinicia nem atualiza o Mac"]))
+    for kind, key, title, note in (("pessoal", "rec/eval/pessoal", "🗂  Arquivos parados para avaliar", "vão para a Lixeira"),
+                                   ("ponto_de_volta", "rec/eval/ponto_de_volta", "🐳 Pontos de volta recentes",
+                                    RECENT_ROLLBACK)):
+        group = sorted((i for i in items if i.risk is EVAL and i.kind == kind), key=lambda i: -i.size)
+        if group:
+            total = sum(i.size for i in group)
+            label = f"{title} ({len(group)})"
+            rows.append(_group_row(key, label, fmt(total), "🟡", note, [item_row(i, guards) for i in group],
+                                   [Text(label, style="bold"),
+                                    Text(f"{plural(len(group), 'item', 'itens')} · {fmt(total)}"), Text(note)],
+                                   size=total))
+    if not s.mounts_known:
+        rows.append(Row("rec/note/mounts",
+                        [Text("Docker não respondeu: não sei quais pastas os containers usam, "
+                              "então não sugiro arquivos.", style="yellow")], kind="info"))
+    return REC_COLUMNS, rows
+
+
+def _info_row(key: str, cells: list, size: int = 0) -> Row:
+    return Row(key, cells, kind="info", title=str(cells[0]), detail=[str(c) for c in cells if str(c)], size=size)
+
+
+def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
+              guards: dict[str, str | None]) -> tuple[list[Column], list[Row]]:
+    blocks = [("docker", CAT_TITLES["docker"]), ("dev", CAT_TITLES["dev"]), ("apps", CAT_TITLES["apps"]),
+              ("worktree", CAT_TITLES["worktree"]), ("system", "💻 macOS e swap"), ("others", "🔎 Outros grandes")]
+    rows: list[Row] = []
+    for cat, title in blocks:
+        kids = [item_row(i, guards) for i in sorted(items, key=lambda i: -i.size) if i.cat == cat]
+        total = sum(c.item.size for c in kids)
+        infos = [i for i in s.items if i.cat == cat and i.action is None and i.size >= MIN_SHOW]
+        for i in sorted(infos, key=lambda i: -i.size):
+            kids.append(_info_row(f"disk/info/{cat}/{i.label}", [i.label, fmt(i.size), "⚪", i.hint], i.size))
+            total += i.size
+        if cat == "system":
+            si = s.system
+            if si:
+                if si.swap_used:
+                    kids.append(_info_row("disk/system/swap", ["Swap em uso", fmt(si.swap_used), "⚪", ""],
+                                          si.swap_used))
+                for role, size in sorted(si.volumes.items(), key=lambda kv: -kv[1]):
+                    kids.append(_info_row(f"disk/system/apfs/{role}", [f"Volume APFS: {role}", fmt(size), "⚪", ""],
+                                          size))
+                if si.uptime_days is not None:
+                    kids.append(_info_row("disk/system/uptime", ["Tempo ligado", "", "⚪",
+                                                                  f"{int(si.uptime_days)} dias"]))
+            for n, (label, size, how) in enumerate(s.advice):
+                kids.append(Row(f"disk/advice/{n}", [f"💻 {label}", f"~{fmt(size)}" if size else "",
+                                                     Text("↻", style="cyan"), how],
+                                kind="advice", how=how, title=label,
+                                detail=[label, how, "o hogs nunca reinicia nem atualiza o Mac"]))
+        if cat == "others":
+            for label, size in s.others:
+                if size >= GB:
+                    kids.append(_info_row(f"disk/others/{label}", [label, fmt(size), "⚪", ""], size))
+                    total += size
+        if kids:
+            count = plural(len(kids), "item", "itens")
+            if cat == "system":      # swap e volumes se sobrepõem: não há soma honesta
+                size_cell, note = Text("—", style="dim"), count
+                head = Text(count)
+            else:
+                size_cell, note = fmt(total), Text(TRIM_OFF_NOTE, style="yellow") if trim_trapped(cat, trim_off) else count
+                head = Text(f"{fmt(total)} · {count}")
+            rows.append(_group_row(f"disk/{cat}", title, size_cell, "", note, kids, [Text(title, style="bold"), head],
+                                   size=0 if cat == "system" else total))
+    return DISK_COLUMNS, rows
+
+
+
+# ---------------------------------------------------------------- tela: aba Worktrees
+
+WT_FILTERS = ["", "seguro", "depois", "manter"]
+WT_FILTER_LABELS = {"": "todos", "seguro": "🟢 podem sair", "depois": "🟡 em andamento",
+                    "manter": "⚪ com trabalho só aqui"}
+
+
+def _wt_merge_cell(w: Worktree) -> Text:
+    return Text(" · ").join(merge_cell(w).split("\n"))   # a coluna do relatório, numa linha só
+
+
+def _wt_conv_cell(w: Worktree) -> Text:
+    link = w.latest_conversation()
+    if link is None:
+        return Text("—", style="dim")
+    c = link.conv
+    return Text(f"{'● ' if c.live else ''}{c.name} · {elapsed(c.last)}")
+
+
+def _wt_group_detail(repo: Path, kids: list[Worktree]) -> list[Text]:
+    counts = verdict_counts(kids)
+    lines = [Text(f"📁 {repo.name}", style="bold"), Text(short(repo))]
+    for v, (icon, color) in VERDICTS.items():
+        n, size = counts[v]
+        lines.append(Text(f"{icon} {n} {WT_FILTER_LABELS[v][2:]} · {fmt(size)}", style=color))
+    lines.append(Text(f"{len(kids)} worktrees · {fmt(sum(w.size for w in kids))}"))
+    return lines
+
+
+def worktrees_tree(rows: list[Worktree], root: Path | None, days: int = 0, flt: str = "",
+                   conversations: bool | None = None) -> tuple[list[Column], list[Row]]:
+    if conversations is None:
+        conversations = claude_dir().is_dir()
+    cols = [Column("Worktree · branch", ratio=4), Column("Tamanho", "right"), Column("Mexido"),
+            Column("Na main?", ratio=2), Column("Em uso por", ratio=2)]
+    if conversations:
+        cols.append(Column("Conversa", ratio=3))
+    cols.append(Column("Veredito", ratio=2))
+    safe = {id(i.worktree): i for i in worktree_items(rows, root, days)} if root else {}
+    order = {v: n for n, v in enumerate(VERDICTS)}
+    by_repo: dict[Path, list[Worktree]] = {}
+    for w in rows:
+        if not flt or w.verdict == flt:
+            by_repo.setdefault(w.repo, []).append(w)
+    out = []
+    for repo in sorted(by_repo, key=lambda r: (r.name.lower(), str(r))):
+        kids = sorted(by_repo[repo], key=lambda w: (order[w.verdict], -w.size))
+        counts = verdict_counts(kids)
+        summary = " ".join(f"{VERDICTS[v][0]}{counts[v][0]}" for v in VERDICTS)
+        cells = [f"📁 {repo.name}", fmt(sum(w.size for w in kids))] + [""] * (len(cols) - 3) + [summary]
+        children = []
+        for w in kids:
+            item = safe.get(id(w))
+            icon, color = VERDICTS[w.verdict]
+            wcells = [Text.assemble(where(w, root), (f" · {branch_name(w)}", "dim")), fmt(w.size),
+                      elapsed(w.last_activity) if w.last_activity else "—", _wt_merge_cell(w),
+                      ", ".join(w.users) or "—"]
+            if conversations:
+                wcells.append(_wt_conv_cell(w))
+            wcells.append(Text(f"{icon} {VERDICT_LABELS[w.verdict]}", style=color))
+            link = w.latest_conversation()
+            children.append(Row(key=item_key(item) if item else f"wt/{w.path}", cells=wcells, item=item,
+                                detail=worktree_detail(w, root), title=f"{w.repo.name} / {where(w, root)}",
+                                path=w.path, resume=link.conv if link else None,
+                                how=link.how if link else "", size=w.size))
+        out.append(Row(key=f"wt/{repo}", cells=cells, children=children, limit=8, kind="group",
+                       detail=_wt_group_detail(repo, kids), title=repo.name, path=repo,
+                       size=sum(w.size for w in kids)))
+    return cols, out
+
+
+def worktree_totals(rows: list[Worktree], flt: str = "") -> Text:
+    counts = verdict_counts(rows)
+    parts = [f"{VERDICTS[v][0]} {counts[v][0]} {WT_FILTER_LABELS[v][2:]} · {fmt(counts[v][1])}" for v in VERDICTS]
+    text = "   ".join(parts)
+    if flt:
+        text += f"   filtro: {WT_FILTER_LABELS[flt]}"
+    return Text(text)
+
+
+# ---------------------------------------------------------------- tela: aba Docker
+
+DOCKER_FILTERS = ["", "em_uso", "sem_uso", "local"]
+DOCKER_FILTER_LABELS = {"": "todas", "em_uso": "em uso", "sem_uso": "sem uso", "local": "construídas aqui"}
+DOCKER_COLUMNS = [Column("O quê", ratio=4), Column("Tamanho", "right"), Column("Risco"), Column("Detalhe", ratio=4)]
+DOCKER_STOPPED = "Docker parado: abra o Docker Desktop pra ver o detalhe"
+
+
+def image_users(img: dict, containers: list[dict]) -> list[dict]:
+    """Containers (rodando ou parados) que usam a imagem, pelo nome, pela referência ou pelo ID."""
+    return [c for c in containers
+            if c["image"] in (img["name"], img["ref"]) or (img["id"] and c["image"].startswith(img["id"]))]
+
+
+def _users_text(users: list[dict]) -> str:
+    return ", ".join(("● " if c["running"] else "") + c["name"] for c in users)
+
+
+def _data_text(users: list[dict]) -> str:
+    folders = sorted({m for c in users for m in c["mounts"]})
+    return f"dados em {', '.join(short(m) for m in folders)}" if folders else ""
+
+
+def _image_detail(img: dict, users: list[dict]) -> Text:
+    parts = [ORIGIN_LABEL[img["origin"]], _users_text(users), _data_text(users)]
+    return Text(" · ".join(p for p in parts if p))
+
+
+def _image_row(img: dict, detail: Text, risk: str) -> Row:
+    """Uma imagem só como informação (⚪): origem, quem usa e os dados montados."""
+    return Row(f"dk/image/{image_ref(img)}", [Text(img["name"]), fmt(img["size"]), risk, detail], kind="info",
+               title=img["name"], detail=[img["name"], fmt(img["size"]), detail.plain], size=img["size"])
+
+
+def _image_passes(img: dict, flt: str) -> bool:
+    return (flt == "" or (flt == "em_uso" and img["used"]) or (flt == "sem_uso" and not img["used"])
+            or (flt == "local" and img["origin"] == "local"))
+
+
+def docker_tree(d: Docker, items: list[Item], guards: dict[str, str | None],
+                flt: str = "") -> tuple[list[Column], list[Row]]:
+    if not d.running:
+        return DOCKER_COLUMNS, []
+    mine = [i for i in items if i.cat == "docker"]
+
+    def group(key: str, title: str, kids: list[Row], size: int, note: str = "") -> Row:
+        return _group_row(key, f"{title} ({len(kids)})", fmt(size), "", note, kids,
+                          [Text(title, style="bold"), Text(f"{plural(len(kids), 'item', 'itens')} · {fmt(size)}")],
+                          size=size)
+
+    def item_group(key: str, title: str, kinds: tuple, note: str = "") -> Row | None:
+        sel = sorted((i for i in mine if i.kind in kinds), key=lambda i: -i.size)
+        return group(key, title, [item_row(i, guards) for i in sel], sum(i.size for i in sel), note) if sel else None
+
+    rows: list[Row] = []
+    for r in (item_group("dk/build", "🧱 Cache e sobras de build", ("cache", "sem_tag")),
+              item_group("dk/rollback", "⏪ Pontos de volta de QA", ("ponto_de_volta",)),
+              item_group("dk/stopped", "📦 Containers parados", ("container",))):
+        if r:
+            rows.append(r)
+
+    by_ref = {ref: i for i in mine for ref in i.refs}   # a imagem casa com o item pelas referências que ele remove
+    entries: list[tuple[int, Row]] = []
+    total = 0
+    small: dict[str, tuple[Item, list[Row]]] = {}
+    for img in d.images:
+        item = by_ref.get(image_ref(img))
+        if item is not None and item.kind not in ("imagem", "imagens_pequenas"):
+            continue   # sem tag e pontos de volta têm grupo próprio
+        if (item is None and img["tag"] == "<none>") or not _image_passes(img, flt):
+            continue
+        detail = _image_detail(img, image_users(img, d.containers))
+        if item is not None and item.kind == "imagens_pequenas":   # cada uma numa linha, dentro do item agrupado
+            small.setdefault(item_key(item), (item, []))[1].append(_image_row(img, detail, "⚪"))
+            continue
+        if item is not None:
+            row = item_row(item, guards)
+            row.cells = list(row.cells)
+            row.cells[3] = detail
+        else:
+            row = _image_row(img, detail, "⚪" if img["used"] else "")
+        entries.append((img["size"], row))
+        total += img["size"]
+    for item, kids in small.values():
+        row = item_row(item, guards)
+        row.children = sorted(kids, key=lambda r: -r.size)
+        entries.append((item.size, row))
+        total += item.size
+    if entries:
+        rows.append(group("dk/images", "🖼 Imagens", [r for _, r in sorted(entries, key=lambda e: -e[0])], total))
+
+    prot: list[Row] = []
+    for name in d.live:
+        mounts = [m for c in d.containers if c["running"] and c["name"] == name for m in c["mounts"]]
+        note = _data_text([{"mounts": mounts}])
+        prot.append(_info_row(f"dk/live/{name}", [Text(f"● {name}"), "", "⚪", Text(note)]))
+    for v in d.volumes:
+        prot.append(_info_row(f"dk/volume/{v['name']}", [Text(f"volume {v['name']}"), fmt(v["size"]), "⚪",
+                                                          "em uso" if v["used"] else "sem uso: revise à mão"],
+                              v["size"]))
+    if prot:
+        vol_size = sum(v["size"] for v in d.volumes)
+        rows.append(_group_row("dk/protected", f"🛡 Containers rodando e volumes ({len(prot)})",
+                               fmt(vol_size), "⚪", "nunca apagados", prot,
+                               [Text("🛡 Containers rodando e volumes", style="bold"),
+                                Text("o hogs nunca apaga estes")], size=vol_size))
+    return DOCKER_COLUMNS, rows
+
+
+def docker_totals(d: Docker, items: list[Item], trim_off: bool, flt: str = "") -> Text:
+    if not d.running:
+        return Text(DOCKER_STOPPED)
+    mine = [i for i in items if i.cat == "docker"]
+    safe = sum(i.size for i in mine if i.risk is SAFE)
+    mid = sum(i.size for i in mine if i.risk in (EVAL, REDOWN))
+    loss = sum(i.size for i in mine if i.risk is LOSS)
+    busy = sum(i["size"] for i in d.images if i["used"]) + sum(v["size"] for v in d.volumes if v["used"])
+    line = f"Docker.raw {fmt(d.raw_real)}" + (f" de {fmt(d.raw_limit)}" if d.raw_limit else "")
+    line += f"   🟢 {fmt(safe)} · 🟡 {fmt(mid)} · 🔴 {fmt(loss)} · ⚪ em uso {fmt(busy)}"
+    if trim_off:
+        line += f"   {TRIM_OFF_NOTE}"
+    if flt:
+        line += f"   filtro: {DOCKER_FILTER_LABELS[flt]}"
+    return Text(line)
+
+
+
+# ---------------------------------------------------------------- tela: app
+
+TABS = ["✨ Recomendado", "🌳 Worktrees", "🐳 Docker", "💾 Disco"]
+TAB_TITLES = ["✨ Recomendado agora", "🌳 Worktrees", "🐳 Docker", "💾 Disco"]
+MODE_KEYS = {"list": "↑↓ mover · →← abrir · espaço marcar · a 🟢 · Enter apagar · ? ajuda · q sair",
+             "help": "qualquer tecla volta", "confirm": "↑↓ rolam · s apaga · n ou Esc volta",
+             "done": "qualquer tecla volta"}
+HELP_LINES = [
+    "↑↓ mover · →← abrir/fechar · espaço marcar · a marcar todos 🟢 · Enter apagar",
+    "c copiar · o abrir no Finder · r reabrir conversa · e explorar · f filtro",
+    "1–4/Tab abas · ? ajuda · Esc fecha a ajuda e a confirmação · q sair",
+    "",
+    "clique foca · clique na caixinha marca · rodinha rola · Option+arrastar seleciona texto no iTerm2",
+    "--no-mouse desliga o mouse",
+    "",
+    "Nada vem marcado. a marca só os 🟢; 🟡 e 🔴 se marcam um por um.",
+    "Enter mostra a lista antes de apagar; cada item é reconferido na hora (✔ apagado, ↷ pulado com o motivo).",
+    "↻ é conselho do macOS: o hogs nunca reinicia nem atualiza o Mac.",
+]
+DOCKER_RAW_NOTE = "O Docker devolve o espaço do Docker.raw aos poucos; se não mudar, reinicie o Docker Desktop."
+SAFE_ONLY = "🟡 e 🔴 se marcam um por um: abra o grupo com →"
+
+
+def copy_text(text: str) -> bool:
+    try:
+        r = subprocess.run(["pbcopy"], input=text.encode(), timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def reveal(path: Path) -> bool:
+    r = sh(["open", "-R", str(path)])
+    return r is not None and r.returncode == 0
+
+
+def _plain(cell) -> str:
+    return cell.plain if isinstance(cell, Text) else str(cell)
+
+
+def _line(text: str, style: str = "") -> Text:
+    return Text(text, style=style, no_wrap=True, overflow="ellipsis")
+
+
+class App:
+    """A tela interativa: abas, teclas, mouse, confirmação e execução. Desenha por `frame`, reage por `handle`."""
+
+    def __init__(self, s: Snapshot | None, records: list[dict], worktrees: list[Worktree], root: Path | None,
+                 days: int = 0, tab: int = 0, color_system: str | None = None, trim_off: bool | None = None):
+        self.s, self.records, self.worktrees, self.root, self.days = s, records, worktrees, root, days
+        self.color_system = color_system
+        if s is not None:
+            self.items = tui_items(s)
+            self.trim_off = docker_trim_off() if trim_off is None else trim_off
+        else:
+            self.items = worktree_items(worktrees, root, days) if root else []
+            self.trim_off = bool(trim_off)
+        self.guards = run_guards(self.items)
+        self.conversations = claude_dir().is_dir()
+        self.tab = tab
+        self.states = [ListState() for _ in TABS]
+        self.marked: set[str] = set()
+        self.gone: set[str] = set()
+        self.gone_paths: set[Path] = set()
+        self.gone_refs: set[str] = set()
+        self.skipped: dict[str, str] = {}
+        self.mode = "list"
+        self.status = ""
+        self.log: list[str] = []
+        self.done_items: list[Item] = []
+        self.freed: int | None = 0
+        self.free_after = 0
+        self.last: Frame | None = None
+        self.list_height = 10
+        self.confirm_scroll = 0      # primeira linha da lista da confirmação à vista
+        self.confirm_max = 0         # quanto ela rola, medido no último desenho
+        self.confirm_page = 1
+        self.states[1].expanded = {r.key for r in self.tree(1)[1]}
+
+    # ---- dados
+
+    def remaining_items(self) -> list[Item]:
+        return [i for i in self.items if item_key(i) not in self.gone]
+
+    def worktrees_left(self) -> list[Worktree]:
+        return [w for w in self.worktrees if w.path not in self.gone_paths]
+
+    def docker_left(self) -> Docker:
+        """O Docker da medição sem as imagens que os itens ✔ removeram (pelas referências de cada item)."""
+        d = self.s.docker
+        images = [img for img in d.images if image_ref(img) not in self.gone_refs]
+        return Docker(**{**vars(d), "images": images})
+
+    def tree(self, n: int) -> tuple[list[Column], list[Row]]:
+        if n == 1:
+            return worktrees_tree(self.worktrees_left(), self.root, self.days, self.states[1].flt,
+                                  self.conversations)
+        if self.s is None:
+            return [], []
+        if n == 0:
+            return recommended_tree(self.s, self.remaining_items(), self.trim_off, self.guards)
+        if n == 2:
+            return docker_tree(self.docker_left(), self.remaining_items(), self.guards, self.states[2].flt)
+        return disk_tree(self.s, self.remaining_items(), self.trim_off, self.guards)
+
+    def trees(self) -> list[tuple[list[Column], list[Row]]]:
+        return [self.tree(n) for n in range(len(TABS))]
+
+    def marked_items(self) -> list[Item]:
+        pool = {item_key(i): i for i in self.items}
+        for k, i in collect_items(self.tree(1)[1]).items():   # os da aba Worktrees, se a chave não bater
+            pool.setdefault(k, i)
+        return [i for k, i in pool.items() if k in self.marked and k not in self.gone]
+
+    def view(self) -> tuple[list[Column], list[Row], ListState, list[Visible]]:
+        cols, rows = self.tree(self.tab)
+        st = self.states[self.tab]
+        vis = visible_rows(rows, st.expanded)
+        st.cursor = max(0, min(st.cursor, len(vis) - 1))
+        return cols, rows, st, vis
+
+    def focused(self) -> Row | None:
+        vis, st = self.view()[3], self.states[self.tab]
+        return vis[st.cursor].row if vis else None
+
+    # ---- desenho
+
+    def empty_text(self) -> str:
+        if self.s is None and self.tab != 1:
+            where_ = short(self.root) if self.root else "uma pasta"
+            return f"Esta abertura é só dos worktrees de {where_}: rode hogs para o disco todo."
+        if self.tab == 0:
+            return "Nada recomendado agora. 🎉"
+        if self.tab == 1:
+            if self.root is None:
+                return worktrees_line([], None).plain
+            if self.worktrees_left() and self.states[1].flt:
+                return f"Nenhum worktree no filtro {WT_FILTER_LABELS[self.states[1].flt]} (f troca)"
+            return f"Nenhum worktree em {short(self.root)}"
+        if self.tab == 2:
+            if not self.s.docker.running:
+                return DOCKER_STOPPED
+            return "Nada no Docker com este filtro (f troca)" if self.states[2].flt else "Nada no Docker agora."
+        return "Nada grande para mostrar no disco."
+
+    def detail(self, row: Row, width: int, height: int) -> Panel:
+        title = row.title or (_plain(row.cells[0]) if row.cells else "")
+        prefix = "🔎 Por que é seguro · " if safe_row(row) else "🔎 Detalhe · "
+        lines = [Text(l) if isinstance(l, str) else l for l in row.detail] or [Text(title)]
+        why = self.skipped.get(item_key(row.item)) if row.item else None
+        if why:
+            lines.append(Text(f"↷ pulado: {why}", style="yellow"))
+        return detail_panel(Text(prefix + title), lines, width, max(5, height // 3))
+
+    def fitted(self, title: str, head: list, tail: list, width: int, height: int, border: str,
+               keep_end: bool = False) -> Panel:
+        """Painel de altura `height`: o fim (`tail`) sempre aparece; do começo (`head`, uma linha cada) cabe o que der."""
+        inner = max(height - 2, 1)
+        room = inner - len(render_lines(Group(*tail), max(width - 4, 1))) if tail else inner
+        if len(head) > room:
+            cut = len(head) - max(room - 1, 0)
+            more = _line(f"… mais {cut}", "grey62")
+            head = [more] + head[cut:] if keep_end else head[:len(head) - cut] + [more]
+        return Panel(Group(*head, *tail), title=title, title_align="left", border_style=border,
+                     padding=(0, 1), height=height)
+
+    def scrolled(self, title: str, body: RenderableType, tail: list, width: int, height: int, border: str) -> Panel:
+        """Painel de altura `height`: o fim (`tail`) sempre à vista; o corpo rola por `confirm_scroll`, sem cortar."""
+        inner = max(width - 4, 1)
+        console = Console(file=io.StringIO(), width=inner, legacy_windows=False)
+        lines = []
+        for segs in console.render_lines(body, console.options.update_width(inner), pad=False):
+            line = Text(no_wrap=True, overflow="crop")
+            for seg in segs:
+                line.append(seg.text, seg.style)
+            lines.append(line)
+        room = max(height - 2 - len(render_lines(Group(*tail), inner)), 1)
+        if len(lines) <= room:
+            self.confirm_scroll = self.confirm_max = 0
+            shown = lines
+        else:
+            view = max(room - 1, 1)
+            self.confirm_page, self.confirm_max = view, len(lines) - view
+            self.confirm_scroll = max(0, min(self.confirm_scroll, self.confirm_max))
+            top = self.confirm_scroll
+            shown = lines[top:top + view] + [
+                _line(f"↑↓ rolam a lista · linhas {top + 1}–{top + view} de {len(lines)}", "grey62")]
+        return Panel(Group(*shown, *tail), title=title, title_align="left", border_style=border,
+                     padding=(0, 1), height=height)
+
+    def confirm_panel(self, width: int, height: int) -> Panel:
+        items = self.marked_items()
+        grid = Table.grid(expand=True, padding=(0, 1))
+        grid.add_column(no_wrap=True)
+        grid.add_column(ratio=1, overflow="fold")      # rótulo longo quebra a linha: nada cortado
+        grid.add_column(justify="right", no_wrap=True)
+        for i in items:
+            grid.add_row(i.risk.icon, Text(i.label), Text(fmt(i.size), style="bold"))
+        tail = [Text(""), Text(f"Total: {fmt(sum(i.size for i in items))}", style="bold")]
+        if any(i.risk is LOSS for i in items):
+            tail.append(Text("Atenção: tem item 🔴 na lista, ele não volta.", style="red"))
+        for i in items:
+            for link in (i.worktree.conversations if i.worktree else []):
+                if link.reopen:
+                    c = link.conv
+                    tail.append(Text(f"⚠ reabra antes de apagar “{c.name}”: {resume_command(c)}",
+                                     style="yellow"))
+        if any(i.kind == "pessoal" for i in items):
+            tail.append(Text("Arquivos vão para a Lixeira."))
+        tail.append(Text("s apaga · n ou Esc volta", style="bold"))
+        return self.scrolled("🗑 Vou apagar", grid, tail, width, height, "red")
+
+    def done_panel(self, width: int, height: int) -> Panel:
+        head = [_line(e, "green" if e.startswith("✔") else "yellow") for e in self.log]
+        if self.freed is None:
+            tail = [Text("Apagando…", style="bold")]
+        else:
+            tail = [Text(""), Text.assemble(("Liberado: ", "bold"), (fmt(self.freed), "bold green"),
+                                            f" · livre agora: {fmt(self.free_after)}")]
+            if any(i.cat == "docker" for i in self.done_items):
+                tail.append(Text(DOCKER_RAW_NOTE, style="dim"))
+            w = next((i.worktree for i in self.done_items if i.worktree is not None), None)
+            if w is not None:
+                tail.append(Text(f"Para recriar um: git -C {short(w.repo)} worktree add {short(w.path)} "
+                                 f"{branch_name(w)}", style="dim"))
+            tail.append(Text("números da última medição; rode hogs de novo para medir · qualquer tecla volta",
+                             style="grey62"))
+        return self.fitted("🧹 Resultado", head, tail, width, height, "green", keep_end=True)
+
+    def middle(self, cols: list[Column], vis: list[Visible], st: ListState, width: int) -> Flex:
+        name = f"tab{self.tab}"
+        if self.mode == "list":
+            def build(h: int) -> RenderableType:
+                self.list_height = max(h - 4, 1)
+                move(st, len(vis), 0, self.list_height)
+                return list_panel(TAB_TITLES[self.tab], cols if vis else [Column("", ratio=1)], vis, st, self.marked, h,
+                                  empty=self.empty_text())
+            return Flex(name, build, st.scroll, len(vis))
+        if self.mode == "help":
+            return Flex(name, lambda h: self.fitted("❓ Ajuda", [], [Text(l) for l in HELP_LINES], width, h,
+                                                     "cyan"), 0, 0)
+        if self.mode == "confirm":
+            return Flex(name, lambda h: self.confirm_panel(width, h), 0, 0)
+        return Flex(name, lambda h: self.done_panel(width, h), 0, 0)
+
+    def footer(self, width: int) -> Text:
+        items = self.marked_items()
+        base = f"Marcados: {fmt(sum(i.size for i in items))} ({len(items)})   "
+        keys = MODE_KEYS[self.mode]
+        if self.status and cell_len(base + keys + self.status) + 3 > width and self.mode == "list":
+            keys = "? ajuda · q sair"
+        line = Text(base + keys, no_wrap=True, overflow="ellipsis")
+        if self.status:
+            line.append(f"   {self.status}", style="yellow")
+        line.truncate(max(width, 1), overflow="ellipsis")
+        return line
+
+    def parts(self, cols: list[Column], vis: list[Visible], st: ListState, width: int, height: int) -> list:
+        s = self.s
+        parts: list = []
+        if s is not None and self.tab in (0, 3):
+            parts.append(header(s, self.records, self.items, self.trim_off, compact=True))
+        elif self.tab == 1:
+            parts.append(worktree_totals(self.worktrees_left(), st.flt))
+        elif s is not None and self.tab == 2:
+            parts.append(docker_totals(self.docker_left(), self.remaining_items(), self.trim_off, st.flt))
+        parts.append(self.middle(cols, vis, st, width))
+        if self.mode == "list":   # na ajuda, na confirmação e no resultado, o painel do meio fica com o espaço
+            if vis:
+                parts.append(self.detail(vis[st.cursor].row, width, height))
+            if s is not None and self.tab == 0:
+                parts.append(protected_panel(s))
+        parts.append(self.footer(width))
+        return parts
+
+    def frame(self, width: int, height: int) -> Frame:
+        cols, _, st, vis = self.view()
+        bar, ranges = tab_bar(TABS, self.tab)
+        for _ in range(2):   # se a altura da lista mudou a rolagem, desenha de novo com o mapa de linhas certo
+            first = st.scroll
+            f = stack(width, height, [bar] + self.parts(cols, vis, st, width, height), self.color_system, ranges)
+            if st.scroll == first:
+                break
+        self.last = f
+        return f
+
+    # ---- teclas
+
+    def handle(self, key: Key, height: int = 40) -> bool:
+        name = key.name
+        if name == "ctrl_c":
+            return False
+        if self.mode in ("help", "done"):
+            if name not in ("wheel_up", "wheel_down"):
+                self.mode = "list"
+            return True
+        if self.mode == "confirm":
+            page = self.confirm_page
+            steps = {"up": -1, "down": 1, "wheel_up": -3, "wheel_down": 3, "pgup": -page, "pgdn": page,
+                     "home": -self.confirm_max, "end": self.confirm_max}
+            if name == "s":
+                self.execute()
+            elif name in ("n", "esc"):
+                self.mode = "list"
+            elif name in steps:
+                self.confirm_scroll = max(0, min(self.confirm_scroll + steps[name], self.confirm_max))
+            return True
+        return self.list_key(key, height)
+
+    def list_key(self, key: Key, height: int) -> bool:
+        name = key.name
+        _, rows, st, vis = self.view()
+        row = vis[st.cursor].row if vis else None
+        self.status = ""
+        steps = {"up": -1, "down": 1, "pgup": -height, "pgdn": height, "home": -len(vis), "end": len(vis),
+                 "wheel_up": -3, "wheel_down": 3}
+        if name in steps:
+            move(st, len(vis), steps[name], height)
+        elif name in ("right", "left"):
+            (open_row if name == "right" else close_row)(st, vis)
+            move(st, len(visible_rows(rows, st.expanded)), 0, height)
+        elif name == "space":
+            self.toggle(row)
+        elif name == "a":
+            n = mark_all_safe(rows, self.marked)
+            self.status = f"marquei {plural(n, 'item', 'itens')} 🟢"
+        elif name in ("1", "2", "3", "4"):
+            self.tab = int(name) - 1
+        elif name in ("tab", "backtab"):
+            self.tab = (self.tab + (1 if name == "tab" else -1)) % len(TABS)
+        elif name == "f":
+            self.cycle_filter()
+        elif name == "e":
+            self.explore(row, height)
+        elif name == "c":
+            self.copy(row)
+        elif name == "o":
+            if row is not None and row.path is not None:
+                ok = reveal(row.path)
+                self.status = f"abri no Finder: {short(row.path)}" if ok else "não consegui abrir no Finder"
+            else:
+                self.status = "esta linha não tem pasta"
+        elif name == "r":
+            if row is None or row.resume is None:
+                self.status = "esta linha não tem conversa do Claude Code"
+        elif name == "enter":
+            if row is not None and row.kind == "advice":   # ↻: Enter só mostra como fazer
+                self.status = row.how
+            elif self.marked_items():
+                self.mode, self.confirm_scroll = "confirm", 0
+            else:
+                self.status = "marque com espaço (a marca todos 🟢) e tecle Enter"
+        elif name == "?":
+            self.mode = "help"
+        elif name == "q":
+            return False
+        elif name == "esc":   # Esc só fecha ajuda e confirmação; na lista, sair é com q
+            self.status = "q sai"
+        elif name == "click":
+            self.click(key, vis, st, height)
+        return True
+
+    def toggle(self, row: Row | None) -> None:
+        """Espaço: um item marca/desmarca; num grupo, só os 🟢 dele (🟡 e 🔴 só um por um)."""
+        if row is None:
+            return
+        leaves = leaf_items(row)
+        if not leaves:
+            return
+        safe = box_items(row)
+        if not safe:
+            self.status = SAFE_ONLY
+            return
+        toggle(row, self.marked)
+        if len(safe) < len(leaves):
+            self.status = f"só os 🟢 do grupo; {SAFE_ONLY}"
+
+    def cycle_filter(self) -> None:
+        options = {1: WT_FILTERS, 2: DOCKER_FILTERS}.get(self.tab)
+        if not options:
+            self.status = "f filtra só nas abas Worktrees e Docker"
+            return
+        st = self.states[self.tab]
+        st.flt = options[(options.index(st.flt) + 1) % len(options)]
+        st.cursor = st.scroll = 0
+
+    def explore(self, row: Row | None, height: int) -> None:
+        st = self.states[3]
+        if row is None or not row.group or self.s is None:
+            self.status = "nada para explorar aqui"
+            return
+        vis = visible_rows(self.tree(3)[1], st.expanded | {row.group})
+        idx = next((n for n, v in enumerate(vis) if v.row.key == row.group), None)
+        if idx is None:
+            self.status = "nada para explorar aqui"
+            return
+        st.expanded.add(row.group)
+        self.tab = 3
+        st.cursor = idx
+        move(st, len(vis), 0, height)
+
+    def copy(self, row: Row | None) -> None:
+        if row is None or (row.resume is None and row.path is None):
+            self.status = "nada para copiar aqui"
+            return
+        text = resume_command(row.resume) if row.resume else str(row.path)
+        self.status = f"copiado: {text}" if copy_text(text) else "não consegui copiar"
+
+    def click(self, key: Key, vis: list[Visible], st: ListState, height: int) -> None:
+        f = self.last
+        if f is None:
+            return
+        if key.y == 0:
+            for x0, x1, idx in f.tabs:
+                if x0 <= key.x < x1:
+                    self.tab = idx
+            return
+        name, idx = f.rows.get(key.y, ("", -1))
+        if name != f"tab{self.tab}" or not 0 <= idx < len(vis):
+            return
+        st.cursor = idx
+        move(st, len(vis), 0, height)
+        if key.x < MARK_X:
+            self.toggle(vis[idx].row)
+
+    # ---- ações
+
+    def execute(self, draw: Callable[[], None] = lambda: None) -> None:
+        items = self.marked_items()
+        self.log, self.done_items, self.freed, self.mode = [], [], None, "done"
+        skipped: list[str] = []
+
+        def notify(i: Item, ok: bool, why: str) -> None:
+            k = item_key(i)
+            if ok:
+                self.gone.add(k)
+                self.marked.discard(k)
+                self.skipped.pop(k, None)
+                self.done_items.append(i)
+                if i.worktree is not None:
+                    self.gone_paths.add(i.worktree.path)
+                self.gone_refs.update(i.refs)
+                self.log.append(f"✔ {i.label}")
+            else:
+                self.skipped[k] = why
+                skipped.append(f"↷ {i.label}: {why}")
+                self.log.append(skipped[-1])
+            draw()
+
+        self.freed = apply_items(items, notify)
+        self.free_after = shutil.disk_usage(DATA_VOLUME).free
+        if len(skipped) == 1:
+            self.status = skipped[0]
+        elif skipped:
+            self.status = f"↷ {len(skipped)} itens pulados: o motivo de cada um fica no 🔎"
+
+    def reopen(self, term: Terminal, conv: Conversation) -> None:
+        if not conv.start or not Path(conv.start).is_dir():
+            self.status = "a pasta da conversa não existe mais; use c para copiar o comando"
+            return
+        try:
+            with term.suspended():
+                subprocess.run(["claude", "--resume", conv.session], cwd=conv.start)
+        except OSError:
+            self.status = "não achei o comando claude; use c para copiar o comando"
+
+    def run(self, term: Terminal) -> None:
+        """Desenha, lê e reage. Depois de cada tecla o quadro é refeito antes da próxima (o clique usa o mapa de
+        linhas do que está na tela); parado, só redesenha se a janela mudar de tamanho."""
+        drawn: list[str] | None = None
+        size = (0, 0)
+
+        def redraw() -> None:
+            nonlocal drawn, size
+            size = term.size()
+            lines = self.frame(*size).lines
+            if lines != drawn:
+                term.draw(lines)
+                drawn = lines
+
+        redraw()
+        while True:
+            keys = term.read(0.25)
+            if not keys:
+                if term.size() != size:
+                    redraw()
+                continue
+            for key in keys:
+                row = self.focused() if self.mode == "list" and key.name == "r" else None
+                if self.mode == "confirm" and key.name == "s":
+                    self.execute(lambda: term.draw(self.frame(*term.size()).lines))
+                    drawn = None
+                elif row is not None and row.resume is not None:
+                    self.status = ""
+                    self.reopen(term, row.resume)
+                    drawn = None
+                elif not self.handle(key, self.list_height):
+                    return
+                redraw()
+
+
+def run_tui(app: App, mouse: bool) -> None:
+    with Terminal(mouse) as term:
+        app.run(term)
+
 
 
 # ---------------------------------------------------------------- configuração e agente
@@ -3376,19 +4704,36 @@ def main() -> None:
         sys.exit(130)
 
 
+def interactive() -> bool:
+    """A tela só abre num terminal de verdade: entrada e saída TTY e um TERM que desenha."""
+    return sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb")
+
+
+NEEDS_TTY = "A escolha do que apagar precisa de um terminal interativo."
+REPORT_ONLY = "--report só imprime o relatório; rode hogs sem --report para escolher o que apagar."
+
+
+def clean_refused(report_flag: bool) -> None:
+    """`--clean` sem a tela: explica no stderr por quê e sai com código 2."""
+    Console(stderr=True).print(REPORT_ONLY if report_flag else NEEDS_TTY, markup=False, highlight=False,
+                               soft_wrap=True)
+    sys.exit(2)
+
+
 def run() -> None:
     p = argparse.ArgumentParser(
         prog="hogs", description="Mostra quem está comendo seu disco e ajuda a limpar.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="exemplos:\n"
-               "  hogs                          relatório do disco\n"
-               "  hogs --clean                  escolhe o que apagar do relatório\n"
-               "  hogs --worktrees ~/Projetos   worktrees Git: quais dá pra apagar e por quê\n"
-               "  hogs --worktrees ~/Projetos --clean\n"
-               "                                apaga os worktrees 🟢 (todos ou por número)")
+               "  hogs                          abre a tela: o disco, o recomendado e o que dá pra apagar\n"
+               "  hogs --report                 imprime o relatório (fora de um terminal, é o padrão)\n"
+               "  hogs --worktrees ~/Projetos   a tela na aba Worktrees: quais dá pra apagar e por quê\n"
+               "  hogs --worktrees ~/Projetos --report\n"
+               "                                imprime o quadro dos worktrees")
     p.add_argument("--version", action="version", version=f"hogs {__version__}")
-    p.add_argument("--clean", action="store_true",
-                   help="escolhe o que apagar; com --worktrees, só os worktrees seguros (🟢)")
+    p.add_argument("--clean", action="store_true", help="abre a tela para escolher o que apagar (o mesmo que hogs)")
+    p.add_argument("--report", action="store_true", help="imprime o relatório estático, mesmo num terminal")
+    p.add_argument("--no-mouse", action="store_true", help="a tela sem mouse")
     p.add_argument("--worktrees", type=Path, metavar="PASTA",
                    help="acha os worktrees Git em PASTA e diz quais já estão na main e podem ser apagados")
     p.add_argument("--worktree-days", type=int, default=0, metavar="DIAS",
@@ -3416,16 +4761,21 @@ def run() -> None:
         sys.exit("hogs precisa da biblioteca rich:  pip install rich")
 
     con = Console()
+    screen = not args.report and interactive()
     if args.worktrees:
         remember_worktrees_root(args.worktrees)
         with con.status("[bold]🌳 Conferindo worktrees, alterações e sinais de uso…[/]"):
             rows, warnings = gather_worktrees(args.worktrees, args.worktree_days)
         root = args.worktrees.expanduser().resolve()
+        if screen:
+            app = App(None, [], rows, root, args.worktree_days, tab=1, color_system=con.color_system)
+            app.status = " · ".join(warnings)
+            return run_tui(app, not args.no_mouse)
         for warning in warnings:
             con.print(Text(warning, style="yellow"))
         worktrees_report(con, rows, root, args.worktree_days, setting("stale_worktree_days"))
         if args.clean:
-            clean_worktrees(con, rows, args.worktree_days, root)
+            clean_refused(args.report)
         return
     if args.apps:
         with con.status("[bold]🐷 Vendo quais apps você não abre há tempo…[/]", spinner="dots"):
@@ -3436,10 +4786,12 @@ def run() -> None:
     snapshot = gather(con)
     records = history_load()
     record_snapshot(snapshot)
+    if screen:
+        return run_tui(App(snapshot, records, snapshot.worktrees, snapshot.worktrees_root,
+                           color_system=con.color_system), not args.no_mouse)
+    report(con, snapshot, records)
     if args.clean:
-        clean(con, snapshot)
-    else:
-        report(con, snapshot, records)
+        clean_refused(args.report)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
 
 ## Cleanup safety invariants
 
-`--clean` only offers what is reclaimable. These are guardrails: a change that weakens one breaks the tool's core promise, even if it simplifies the code.
+The interactive screen (`App`, opened by `hogs`/`hogs --clean` in a terminal) only offers what is reclaimable. These are guardrails: a change that weakens one breaks the tool's core promise, even if it simplifies the code.
 
 - Docker volumes, running containers and images used by any container are shown as information, never offered for deletion.
 - Any host folder bind-mounted by any container (running or stopped) — and anything inside or containing it — is never suggested by file-based blocks. A named volume backed by a host folder (`o` with `bind` + `device` in its options) protects that folder the same way; if those options can't be read, mounts are unknown.
@@ -17,9 +17,15 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
 - Paused, restarting and removing containers count as running (`ACTIVE_STATES`), also for their compose project.
 - `docker rmi` targets the exact reference (`img["ref"]`): an untagged `repo` pulled by digest is removed as
   `repo@sha256:…`, never as bare `repo` (= `repo:latest`).
-- Cleanup actions raise on failure (`require`/`run_all`), so `clean()` reports ↷ instead of ✔.
+- Cleanup actions raise on failure (`require`/`run_all`), so `apply_items` reports ↷ instead of ✔.
 - A stopped container whose compose project still has something running stays out of the 🟢 group.
-- Every deletion goes through the selection + `Confirm` flow.
+- Every deletion goes through mark → Enter → confirmation screen → `s` (`App`), with a per-item recheck at
+  execution time (`apply_items`: runs the item's guard again; any exception or guard reason → ↷ with the
+  reason, never ✔). Nothing is marked when the screen opens; `a` marks only 🟢 (`SAFE`); space on a group
+  marks/unmarks only its 🟢 items and its box reflects only them (no 🟢 → no box); 🟡/🔴 are marked one by
+  one. The confirmation scrolls and wraps labels: every marked item is readable before `s`, with the total and
+  warnings always visible. Enter on a ↻ row only shows how; Esc never quits from the list (only `q`/Ctrl-C).
+  There is no other deletion path (the old numbered `--clean` flow is gone; `--clean` opens the screen).
 - Personal files are only moved to the Trash (Finder, path via `argv`), never deleted; they are always 🟡 `EVAL`, never in `a`; size is allocated blocks (iCloud dataless files never count).
 - Worktree deletion uses `git worktree remove` without force and preserves branches. Recheck HEAD,
   branch, merge, activity, ignored/untracked files, process/container usage, pushed state and linked
@@ -43,12 +49,20 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
   "Dá pra liberar" totals, and the 🐳 group in "✨ Recomendado agora" shows no total (the space stays in
   `Docker.raw`); each place says so.
 - The main report's 🟢 worktrees are one `Item` (`worktree_item`); its action removes each one through
-  `remove_worktree` (full recheck) and raises if any was kept. `breakdown()` counts worktrees once (inside
+  `remove_worktree` (full recheck) and raises if any was kept. The screen uses one `Item` per worktree
+  (`worktree_items`), each removed by `remove_worktree`. `breakdown()` counts worktrees once (inside
   Projetos' measurement, capped by it).
 - App code-sign clones (`*.code_sign_clone`) are offered only for versions different from the installed app's,
   only while the app is closed, sized as one copy per old version; unknown installed version → nothing offered.
 - "App open" guards (`process_running`) never miss an open app: the name is regex-escaped and matches by full
   name, by the name cut at `MAXCOMLEN` (16) or by the `…/Contents/MacOS/<exe>` path; any match counts as open.
+- The screen never opens without a TTY (`interactive()`: stdin and stdout TTY, `TERM` not empty/`dumb`) or
+  with `--report`; then the static report prints, and `--clean` adds a message on stderr and exits 2. It always
+  restores the terminal on any exit, including exceptions, Ctrl-C and EOF (alt screen off, cursor visible,
+  mouse off, `termios` restored), also when the very first write to the terminal fails.
+- On the screen, ↻ (macOS advice) and ⚪ (information) rows never have a box. The Docker tab shows running
+  containers and volumes only as information; images match their `Item` only by `Item.refs` (never by
+  label), and removed items' images disappear by them.
 - hogs only reads `~/.claude`, or `CLAUDE_CONFIG_DIR` when set (`claude_dir()`: transcripts, sessions, settings);
   `cleanupPeriodDays` is a recommendation, never written.
 
@@ -59,7 +73,8 @@ New invariants get a test in `tests/test_hogs.py` (see `DockerCleanItemsTest`).
 - UI text in Portuguese (pt-BR), sizes with decimal comma via `fmt()`; CLI flags in English.
 - Python 3.9 compatible (`from __future__ import annotations`; no `match`, no 3.10+ stdlib APIs). CI runs 3.9 and 3.12.
 - New cache/app → one `PathDef` line in `PATH_DEFS`.
-- README screenshots come only from `docs/make_screenshots.py`, which uses fictitious data. Real terminal output contains the author's work image names; it stays out of the repo.
+- README screenshots come only from `docs/make_screenshots.py`, which uses fictitious data (the screen ones from
+  `App(...).frame(120, 40)`). Real terminal output contains the author's work image names; it stays out of the repo.
 
 ## Installation
 
