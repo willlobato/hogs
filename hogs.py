@@ -893,13 +893,18 @@ def pid_alive(pid: int) -> bool:
 
 
 def live_claude_sessions() -> tuple[list[dict], str]:
-    """Registros de ~/.claude/sessions/<pid>.json cujo processo está vivo."""
+    """Registros de ~/.claude/sessions/<pid>.json cujo processo está vivo. Registro que sumiu entre a listagem
+    e a leitura é de sessão que acabou de fechar: não conta."""
     registry = HOME / ".claude" / "sessions"
     found = []
     for entry in (registry.glob("*.json") if registry.is_dir() else []):
         try:
             data = json.loads(entry.read_text())
+        except FileNotFoundError:
+            continue
         except ValueError:
+            data = None
+        if not isinstance(data, dict):
             return [], f"registro de sessão do Claude Code ilegível: {entry.name}"
         if isinstance(data.get("pid"), int) and pid_alive(data["pid"]):
             data["name"] = str(data.get("name") or f"pid {data['pid']}")
@@ -983,17 +988,19 @@ class ConvLink:
 
 def mention_tails(work: bytes, scope: Path) -> set[str]:
     """Caminhos citados abaixo de `scope`, relativos a ele e cortados em MENTION_PARTS partes. Espaço não
-    termina o caminho (pastas com espaço); aspas, barra invertida, quebra de linha e operadores de shell sim."""
+    termina o caminho (pastas com espaço); aspas, barra invertida, quebra de linha, operadores de shell e a
+    próxima citação do escopo sim (`cp <escopo>/a <escopo>/b` cita os dois)."""
     needle = bytes(scope) + b"/"
     found: set[str] = set()
     at = work.find(needle)
     while at >= 0:
-        m = MENTION_END.match(work, at + len(needle))
+        begin = at + len(needle)
+        at = work.find(needle, begin)
+        m = MENTION_END.match(work, begin, at if at >= 0 else len(work))
         tail = m.group().decode("utf-8", errors="replace").rstrip(" .,:")
         tail = "/".join(tail.split("/")[:MENTION_PARTS])
         if tail:
             found.add(tail)
-        at = work.find(needle, m.end())
     return found
 
 
@@ -1083,7 +1090,8 @@ def claude_conversations(scope: Path, projects: Path | None = None,
         by: dict[str, list[tuple[str, dict]]] = {}
         for f, e in entries.items():
             by.setdefault(e["session"], []).append((f, e))
-        live = {s.get("sessionId") for s in live_claude_sessions()[0]}
+        sessions, live_error = live_claude_sessions()
+        live = {s.get("sessionId") for s in sessions}
         convs = []
         for session, files in by.items():
             mains = [(f, e) for f, e in files if e["main"]]
@@ -1113,7 +1121,8 @@ def claude_conversations(scope: Path, projects: Path | None = None,
         os.replace(tmp, cache)
     except OSError:
         pass
-    return sorted(convs, key=lambda c: c.last, reverse=True), ""
+    error = f"não foi possível verificar as sessões abertas do Claude Code: {live_error}" if live_error else ""
+    return sorted(convs, key=lambda c: c.last, reverse=True), error
 
 
 def resume_command(c: Conversation) -> str:

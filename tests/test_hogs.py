@@ -1154,6 +1154,44 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(convs, [])
         self.assertIn("conversas do Claude Code", err)
 
+    def test_every_mention_on_a_line_counts(self):
+        s = self.scope
+        self.assertEqual(hogs.mention_tails(f"ls {s}/a {s}/b".encode(), s), {"a", "b"})
+        self.assertEqual(hogs.mention_tails(f"cp {s}/shop/a.txt {s}/api/b.txt".encode(), s),
+                         {"shop/a.txt", "api/b.txt"})
+
+    def fake_sessions(self, *files):
+        home = self.projects.parent / "home"
+        sessions = home / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        for name, text in files:
+            (sessions / name).write_text(text)
+        p = mock.patch.object(hogs, "HOME", home)
+        p.start()
+        self.addCleanup(p.stop)
+        return sessions
+
+    def test_unreadable_session_record_is_reported_and_conversations_are_kept(self):
+        self.write("-dev/s1.jsonl", self.title("x"))
+        self.fake_sessions(("a.json", "[1]"))
+        self.assertIn("ilegível", hogs.live_claude_sessions()[1])
+        convs, err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual([c.session for c in convs], ["s1"])
+        self.assertIn("sessões abertas do Claude Code", err)
+        with mock.patch.object(hogs, "live_claude_sessions", return_value=([], "registro ilegível: b.json")):
+            convs, err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual(len(convs), 1)
+        self.assertIn("b.json", err)
+
+    def test_session_record_that_vanished_is_not_live(self):
+        sessions = self.fake_sessions(("ok.json", '{"pid": %d, "sessionId": "s1"}' % os.getpid()))
+        (sessions / "gone.json").symlink_to(sessions / "nao-existe.json")   # listado, some na leitura
+        found, err = hogs.live_claude_sessions()
+        self.assertEqual(([d["sessionId"] for d in found], err), (["s1"], ""))
+        self.write("-dev/s1.jsonl", self.title("x"))
+        [c], err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual((c.live, err), (True, ""))
+
     def test_resume_command_quotes_the_folder(self):
         c = hogs.Conversation("s1", start="/dev/feature with spaces")
         self.assertEqual(hogs.resume_command(c), "cd '/dev/feature with spaces' && claude --resume s1")
