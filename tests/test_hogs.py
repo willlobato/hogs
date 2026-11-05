@@ -45,6 +45,15 @@ class ParseSizeTest(unittest.TestCase):
         self.assertEqual(hogs.parse_size("-1.476e+09B"), 0)
 
 
+class ToolCacheTest(unittest.TestCase):
+    def test_only_big_cache_children_outside_mounts(self):
+        c = hogs.CACHES
+        sizes = {c / "ferramenta-x": 2_800_000_000, c / "pequeno": 10_000_000, hogs.HOME / "outra": 9e9,
+                 c / "montado": 3e9}
+        items = hogs.cache_items(sizes, [c / "montado"])
+        self.assertEqual([(i.label, i.risk) for i in items], [("Cache: ferramenta-x", hogs.REDOWN)])
+
+
 class FmtTest(unittest.TestCase):
     def test_uses_decimal_comma(self):
         self.assertEqual(hogs.fmt(12_340_000_000), "12,3 GB")
