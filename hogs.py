@@ -3171,6 +3171,163 @@ def clean(con: Console, s: Snapshot) -> None:
 # ---------------------------------------------------------------- tela: lista
 
 
+class Column(NamedTuple):
+    title: str
+    justify: str = "left"
+    ratio: int | None = None
+    width: int | None = None
+
+
+@dataclass
+class Row:
+    key: str
+    cells: list
+    item: Item | None = None
+    children: list[Row] = field(default_factory=list)
+    limit: int = 0
+    kind: str = "item"  # item | group | more | advice | info
+    detail: list = field(default_factory=list)
+    title: str = ""
+    path: Path | None = None
+    resume: Conversation | None = None
+    how: str = ""
+    group: str = ""
+
+
+def item_key(i: Item) -> str:
+    return f"{i.cat}|{i.label}"
+
+
+class Visible(NamedTuple):
+    row: Row
+    depth: int
+    parent: Row | None
+
+
+@dataclass
+class ListState:
+    cursor: int = 0
+    scroll: int = 0
+    expanded: set[str] = field(default_factory=set)
+    flt: str = ""
+
+
+def _hidden_size(hidden: list[Row]) -> int:
+    return sum(c.item.size for c in hidden if c.item is not None)
+
+
+def visible_rows(rows: list[Row], expanded: set[str]) -> list[Visible]:
+    out: list[Visible] = []
+
+    def walk(row: Row, depth: int, parent: Row | None) -> None:
+        out.append(Visible(row, depth, parent))
+        if row.key not in expanded:
+            return
+        kids = row.children
+        shown = kids
+        if row.limit > 0 and len(kids) > row.limit and f"{row.key}/+" not in expanded:
+            shown = kids[:row.limit]
+        for c in shown:
+            walk(c, depth + 1, row)
+        if len(shown) < len(kids):
+            hidden = kids[len(shown):]
+            more = Row(key=f"{row.key}/+",
+                       cells=[Text(f"… mais {len(hidden)}", style="dim"), fmt(_hidden_size(hidden))],
+                       kind="more")
+            out.append(Visible(more, depth + 1, row))
+
+    for r in rows:
+        walk(r, 0, None)
+    return out
+
+
+def checkable(row: Row) -> bool:
+    return row.item is not None and row.item.action is not None and row.kind == "item"
+
+
+def leaf_items(row: Row) -> list[Item]:
+    out: list[Item] = []
+    if checkable(row):
+        out.append(row.item)
+    for c in row.children:
+        out.extend(leaf_items(c))
+    return out
+
+
+def mark_box(row: Row, marked: set[str]) -> str:
+    leaves = leaf_items(row)
+    if not leaves:
+        return ""
+    n = sum(1 for i in leaves if item_key(i) in marked)
+    return "[x]" if n == len(leaves) else "[-]" if n else "[ ]"
+
+
+def toggle(row: Row, marked: set[str]) -> None:
+    keys = {item_key(i) for i in leaf_items(row)}
+    if not keys:
+        return
+    if keys <= marked:
+        marked -= keys
+    else:
+        marked |= keys
+
+
+def _all_rows(rows: list[Row]) -> Iterator[Row]:
+    for r in rows:
+        yield r
+        yield from _all_rows(r.children)
+
+
+def mark_all_safe(rows: list[Row], marked: set[str]) -> int:
+    n = 0
+    for r in _all_rows(rows):
+        if checkable(r) and r.item.risk is SAFE:
+            k = item_key(r.item)
+            if k not in marked:
+                marked.add(k)
+                n += 1
+    return n
+
+
+def collect_items(rows: list[Row]) -> dict[str, Item]:
+    return {item_key(r.item): r.item for r in _all_rows(rows) if checkable(r)}
+
+
+def move(state: ListState, total: int, delta: int, height: int) -> None:
+    state.cursor = max(0, min(state.cursor + delta, total - 1)) if total > 0 else 0
+    if state.cursor < state.scroll:
+        state.scroll = state.cursor
+    elif state.cursor >= state.scroll + height:
+        state.scroll = state.cursor - height + 1
+    state.scroll = max(0, min(state.scroll, max(0, total - height)))
+
+
+def open_row(state: ListState, vis: list[Visible]) -> None:
+    if not 0 <= state.cursor < len(vis):
+        return
+    v = vis[state.cursor]
+    if v.row.kind == "more" and v.parent is not None:
+        state.expanded.add(f"{v.parent.key}/+")
+    elif v.row.children:
+        if v.row.key not in state.expanded:
+            state.expanded.add(v.row.key)
+        elif state.cursor + 1 < len(vis):
+            state.cursor += 1
+
+
+def close_row(state: ListState, vis: list[Visible]) -> None:
+    if not 0 <= state.cursor < len(vis):
+        return
+    v = vis[state.cursor]
+    if v.row.children and v.row.key in state.expanded:
+        state.expanded.discard(v.row.key)
+    elif v.parent is not None:
+        for n, o in enumerate(vis):
+            if o.row is v.parent:
+                state.cursor = n
+                break
+
+
 # ---------------------------------------------------------------- tela: itens e ações
 
 
