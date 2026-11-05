@@ -18,6 +18,7 @@ import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -397,13 +398,20 @@ def known_mounts(d: Docker) -> tuple[list[Path], bool]:
     return [], not shutil.which("docker")
 
 
-def under_mount(path: Path, mounts: list[Path]) -> bool:
-    """`path` dentro de uma pasta montada, ou contendo uma."""
+def under_mount(path: Path, mounts: list[Path], containing: bool = True) -> bool:
+    """`path` dentro de uma pasta montada (ou igual a ela); com `containing`, também se contém uma."""
     try:
         path = path.resolve()
     except (OSError, RuntimeError):
         return True   # na dúvida, protege
-    return any(path == m or m in path.parents or path in m.parents for m in mounts)
+    for m in mounts:
+        try:
+            m = m.resolve()
+        except (OSError, RuntimeError):
+            pass
+        if path == m or m in path.parents or (containing and path in m.parents):
+            return True
+    return False
 
 
 def prune_builder(name: str, max_gb: float | None = None) -> subprocess.CompletedProcess | None:
@@ -1602,6 +1610,73 @@ def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
 
         hint = f"versões {', '.join(sorted(old))}; a instalada é {g.installed}"
         items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard))
+    return items
+
+
+# ---------------------------------------------------------------- arquivos pessoais
+
+PERSONAL_ROOTS = [HOME / "Desktop", HOME / "Documents", HOME / "Downloads", HOME / "Pictures"]
+STALE_PERSONAL_DAYS = 180
+BIG_FILE = 500e6
+SKIP_PACKAGES = (".photoslibrary", ".musiclibrary", ".app", ".tvlibrary", ".logicx", ".band", ".fcpbundle",
+                 ".imovielibrary", ".vmwarevm", ".pvm", ".utm", ".bundle", ".pkg")
+
+
+def spotlight_last_used(path: Path) -> float | None:
+    r = sh(["mdls", "-name", "kMDItemLastUsedDate", "-raw", str(path)], timeout=10)
+    if r is None or r.returncode != 0:
+        return None
+    out = r.stdout.strip()
+    if not out or out == "(null)":
+        return None
+    try:
+        return datetime.strptime(out, "%Y-%m-%d %H:%M:%S %z").timestamp()
+    except ValueError:
+        return None
+
+
+def stale_personal(roots: list[Path], mounts: list[Path], now: float) -> list[tuple[Path, int, float]]:
+    """Arquivos grandes (bytes alocados) sem uso há muito tempo. Não segue links; pasta sem permissão é ignorada."""
+    cutoff = now - STALE_PERSONAL_DAYS * 86400
+    found: list[tuple[Path, int, float]] = []
+    for root in roots:
+        for dp, dirs, names in os.walk(root, followlinks=False, onerror=lambda e: None):
+            here = Path(dp)
+            if (here.name.lower().endswith(SKIP_PACKAGES) or (here / ".git").exists()
+                    or under_mount(here, mounts, containing=False)):
+                dirs[:] = []
+                continue
+            for name in names:
+                p = here / name
+                try:
+                    st = p.lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                size = st.st_blocks * 512
+                recent = max(st.st_mtime, getattr(st, "st_birthtime", 0), st.st_ctime)
+                if size < BIG_FILE or recent >= cutoff or under_mount(p, mounts, containing=False):
+                    continue
+                last = max(recent, spotlight_last_used(p) or 0)
+                if last < cutoff:
+                    found.append((p, size, last))
+    return found
+
+
+def move_to_trash(path: Path) -> None:
+    """Move para a Lixeira pelo Finder; o caminho vai como argv, nunca dentro do script."""
+    require(sh(["osascript", "-e", "on run argv",
+                "-e", 'tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)',
+                "-e", "end run", str(path)]), "Finder")
+
+
+def personal_items(found: list[tuple[Path, int, float]], now: float) -> list[Item]:
+    items = []
+    for p, size, last in found:
+        meses = int((now - last) // (30 * 86400))
+        items.append(Item("apps", f"Parado: {short(p)}", size, EVAL, lambda p=p: move_to_trash(p),
+                          f"sem abrir há {meses} meses · vai para a Lixeira"))
     return items
 
 

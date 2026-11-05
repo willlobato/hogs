@@ -118,6 +118,7 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - 🛡️ Imagens construídas localmente aparecem uma por uma, nunca em grupo.
 - 🛡️ Pontos de volta de imagens (`antes-*`, `backup-*`…) só viram 🟢 depois de `rollback_days` dias (padrão 2, configurável), contados a partir do sinal mais recente; antes disso ficam 🟡 para avaliar.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
+- 🛡️ Arquivo pessoal só vai para a Lixeira, nunca é apagado direto.
 - Nada é apagado sem você confirmar.
 
 ## Worktrees Git

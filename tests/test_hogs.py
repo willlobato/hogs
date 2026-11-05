@@ -3,6 +3,7 @@ import sys
 import json
 import os
 import plistlib
+import stat
 import subprocess
 import tempfile
 import time
@@ -102,6 +103,124 @@ class ImageOriginTest(unittest.TestCase):
         self.assertEqual(hogs.image_origin("grafana/grafana"), "hub")
         self.assertEqual(hogs.image_origin("nginx"), "hub")
         self.assertEqual(hogs.image_origin("my-local-build"), "local")
+
+
+class PersonalTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.old = time.time() - 400 * 86400
+
+    def file(self, rel, blocks):
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+        os.utime(p, (self.old, self.old))
+        return p, blocks
+
+    def test_only_big_old_allocated_files_outside_packages_repos_and_mounts(self):
+        files = dict([self.file("video.mov", 2_000_000), self.file("nuvem.zip", 0),
+                      self.file("Fotos.photoslibrary/db", 2_000_000), self.file("proj/.git/HEAD", 1),
+                      self.file("proj/dump.bak", 2_000_000), self.file("db/data.mdf", 2_000_000),
+                      self.file("novo.iso", 2_000_000)])
+        os.utime(self.root / "novo.iso", None)
+        real_stat = Path.lstat
+        def lstat(p):
+            st = real_stat(p)
+            if p in files:
+                return mock.Mock(st_blocks=files[p], st_mtime=st.st_mtime, st_mode=st.st_mode,
+                                 st_birthtime=self.old, st_ctime=self.old)
+            return st
+        with mock.patch.object(hogs.Path, "lstat", lstat), \
+                mock.patch.object(hogs, "spotlight_last_used", return_value=None):
+            found = hogs.stale_personal([self.root], [self.root / "db"], time.time())
+        self.assertEqual([p.name for p, _, _ in found], ["video.mov"])
+        self.assertEqual(found[0][1], 2_000_000 * 512)
+
+    def walk(self, mounts=(), spotlight=None, over=None):
+        """Roda o walker no tempdir; arquivos regulares viram 2 GB alocados, com datas antigas salvo `over`."""
+        real = Path.lstat
+        def lstat(p):
+            st = real(p)
+            if not stat.S_ISREG(st.st_mode):
+                return st
+            f = dict(st_blocks=4_000_000, st_mtime=self.old, st_birthtime=self.old, st_ctime=self.old,
+                     st_mode=st.st_mode)
+            f.update((over or {}).get(p.name, {}))
+            return mock.Mock(**f)
+        with mock.patch.object(hogs.Path, "lstat", lstat), \
+                mock.patch.object(hogs, "spotlight_last_used", return_value=spotlight):
+            return [p.relative_to(self.root).as_posix()
+                    for p, _, _ in hogs.stale_personal([self.root], list(mounts), time.time())]
+
+    def test_recent_birthtime_or_ctime_excludes_copied_files(self):
+        self.file("copiado.mov", 0)
+        self.assertEqual(self.walk(over={"copiado.mov": {"st_birthtime": time.time()}}), [])
+        self.assertEqual(self.walk(over={"copiado.mov": {"st_ctime": time.time()}}), [])
+        self.assertEqual(self.walk(), ["copiado.mov"])
+
+    def test_recent_spotlight_use_excludes_file(self):
+        self.file("a.mov", 0)
+        self.assertEqual(self.walk(spotlight=time.time()), [])
+        self.assertEqual(self.walk(spotlight=self.old), ["a.mov"])
+
+    def test_spotlight_last_used_parsing(self):
+        def run(out, rc=0):
+            return lambda cmd, timeout=60: subprocess.CompletedProcess(cmd, rc, out, "")
+        p = Path("/tmp/x")
+        with mock.patch.object(hogs, "sh", run("(null)\n")):
+            self.assertIsNone(hogs.spotlight_last_used(p))
+        with mock.patch.object(hogs, "sh", run("2025-01-02 03:04:05 +0000")):
+            self.assertEqual(hogs.spotlight_last_used(p), 1735787045.0)
+        with mock.patch.object(hogs, "sh", run("2025-01-02 03:04:05 +0000", 1)):
+            self.assertIsNone(hogs.spotlight_last_used(p))
+        with mock.patch.object(hogs, "sh", lambda cmd, timeout=60: None):
+            self.assertIsNone(hogs.spotlight_last_used(p))
+
+    def test_bind_mounted_file_and_dir_containing_mount(self):
+        self.file("cont/db.img", 0)
+        self.file("cont/outro.mov", 0)
+        self.file("solto.mov", 0)
+        got = self.walk(mounts=[self.root / "cont" / "db.img"])
+        self.assertEqual(sorted(got), ["cont/outro.mov", "solto.mov"])
+        # pasta que apenas contém um mount continua sendo percorrida
+        got = self.walk(mounts=[self.root / "cont" / "sub"])
+        self.assertEqual(sorted(got), ["cont/db.img", "cont/outro.mov", "solto.mov"])
+
+    def test_symlinks_not_followed(self):
+        self.file("real/grande.mov", 0)
+        (self.root / "link.mov").symlink_to(self.root / "real" / "grande.mov")
+        (self.root / "linkdir").symlink_to(self.root / "real")
+        self.assertEqual(self.walk(), ["real/grande.mov"])
+
+    def test_unreadable_dir_skipped(self):
+        self.file("ok.mov", 0)
+        self.file("fechada/x.mov", 0)
+        d = self.root / "fechada"
+        d.chmod(0)
+        try:
+            self.assertEqual(self.walk(), ["ok.mov"])
+        finally:
+            d.chmod(0o755)
+
+    def test_packages_skipped_case_insensitive(self):
+        for pkg in ("A.app", "B.APP", "C.logicx", "D.Photoslibrary", "E.utm"):
+            self.file(pkg + "/Contents/big.bin", 0)
+        self.file("normal/x.mov", 0)
+        self.assertEqual(self.walk(), ["normal/x.mov"])
+
+    def test_trash_passes_path_as_argument_never_inside_script(self):
+        calls = []
+        ok = lambda cmd, timeout=60: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")
+        weird = Path('/tmp/a "b" ção.mov')
+        with mock.patch.object(hogs, "sh", ok):
+            hogs.move_to_trash(weird)
+        self.assertEqual(calls[0][-1], str(weird))
+        self.assertTrue(all(str(weird) not in part for part in calls[0][:-1]))
+
+    def test_personal_items_are_eval_never_safe(self):
+        items = hogs.personal_items([(Path("/tmp/x.mov"), 2e9, time.time() - 200 * 86400)], time.time())
+        self.assertIs(items[0].risk, hogs.EVAL)
+        self.assertIn("Lixeira", items[0].hint)
 
 
 class SelectionTest(unittest.TestCase):
