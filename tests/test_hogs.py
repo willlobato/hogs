@@ -66,7 +66,11 @@ class ToolCacheTest(unittest.TestCase):
                 mock.patch.object(hogs, "du", side_effect=lambda p: sizes.get(p, 0)), \
                 mock.patch.object(hogs, "gather_apps", return_value=[]), \
                 mock.patch.object(hogs, "known_mounts", return_value=(mounts, known)), \
-                mock.patch.object(hogs, "under_mount", return_value=False):
+                mock.patch.object(hogs, "under_mount", return_value=False), \
+                mock.patch.object(hogs, "gather_system", return_value=None), \
+                mock.patch.object(hogs, "sign_clone_root", return_value=None), \
+                mock.patch.object(hogs, "stale_personal", return_value=[]), \
+                mock.patch.object(hogs, "load_config", return_value={}):
             snap = hogs.gather(Console(file=io.StringIO()))
         return snap, hogs.short(big)
 
@@ -651,6 +655,107 @@ class SystemTest(unittest.TestCase):
         labels = [a[0] for a in hogs.system_advice(si)]
         self.assertEqual(labels, ["Reiniciar o Mac", "Aplicar a atualização do macOS"])
         self.assertEqual(hogs.system_advice(hogs.SystemInfo({"Preboot": 5e9}, 13_800_000_000, 3, False)), [])
+
+
+class BreakdownTest(unittest.TestCase):
+    def snap(self, raw, dev, others):
+        d = hogs.Docker(raw_real=raw)
+        items = [hogs.Item("dev", "npm", dev, hogs.SAFE)]
+        si = hogs.SystemInfo({"System": 18e9, "Preboot": 17e9, "VM": 15e9, "Data": 400e9}, 0, 1, False)
+        return hogs.Snapshot(494e9, 28e9, d, items, [("~/x", others)], system=si)
+
+    def test_parts_sum_to_used_and_unknown_is_never_negative(self):
+        for raw, dev, others in ((92e9, 18e9, 60e9), (300e9, 100e9, 200e9)):
+            parts = dict((k, v) for k, v, _ in hogs.breakdown(self.snap(raw, dev, others)))
+            self.assertGreaterEqual(parts["Não identificado"], 0)
+            self.assertAlmostEqual(sum(v for k, v in parts.items() if k != "Livre"), 466e9, delta=1e6)
+            self.assertEqual(parts["macOS e swap"], 50e9)
+            self.assertEqual(parts["Livre"], 28e9)
+
+    def test_advice_and_eval_never_count_as_recommended_space(self):
+        s = self.snap(92e9, 0, 0)
+        s.items.append(hogs.Item("apps", "Parado: ~/x.mov", 5e9, hogs.EVAL, lambda: None))
+        s.advice = [("Reiniciar o Mac", 13e9, "")]
+        con = hogs.Console(file=io.StringIO(), width=140)
+        con.print(hogs.header(s))
+        self.assertIn("com o recomendado: 28,0 GB livres", con.file.getvalue())
+
+    def render_report(self, s):
+        con = hogs.Console(file=io.StringIO(), width=160)
+        with mock.patch.object(hogs, "load_config", return_value={}):
+            hogs.report(con, s, [])
+        return con.file.getvalue()
+
+    def test_report_recommends_only_safe_and_lists_what_it_protects(self):
+        s = self.snap(92e9, 0, 0)
+        s.items += [hogs.Item("apps", "Lixeira", 2e9, hogs.SAFE, lambda: None),
+                    hogs.Item("apps", "Parado: ~/a.mov", 5e9, hogs.EVAL, lambda: None),
+                    hogs.Item("apps", "Parado: ~/b.iso", 1e9, hogs.EVAL, lambda: None)]
+        s.advice = [("Reiniciar o Mac", 13e9, "swap 13,0 GB · ligado há 20 dias")]
+        s.docker.live = ["shop-db"]
+        s.mounts = [Path("/u/dev/db/data")]
+        out = self.render_report(s)
+        self.assertIn("com o recomendado: 30,0 GB livres", out)
+        recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        self.assertIn("Lixeira", recommended)
+        self.assertIn("↻", recommended)
+        self.assertIn("Arquivos parados para avaliar (2)", recommended)
+        self.assertIn("2 arquivos (vão para a Lixeira)", " ".join(recommended.split()))
+        self.assertIn("6,0 GB", recommended)
+        self.assertNotIn("Docker não respondeu", out)
+        protected = out.split("🛡 Não mexo")[1]
+        self.assertIn("1 container rodando (shop-db)", protected)
+        self.assertIn("1 caminho montado em containers (/u/dev/db/data)", protected)
+
+    def test_report_says_why_files_are_not_suggested_without_docker(self):
+        s = self.snap(0, 0, 0)
+        s.mounts_known = False
+        self.assertIn("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.",
+                      " ".join(self.render_report(s).split()))
+
+    def test_history_keys_skip_counts_and_files_to_evaluate(self):
+        s = self.snap(0, 0, 0)
+        s.items = [hogs.Item("apps", "Cópias antigas do Navegador (3)", 2e9, hogs.SAFE),
+                   hogs.Item("apps", "Parado: ~/a.mov", 5e9, hogs.EVAL)]
+        s.projects = 7e9
+        sizes = hogs.snapshot_sizes(s)
+        self.assertIn("Cópias antigas do Navegador", sizes)
+        self.assertNotIn("Parado: ~/a.mov", sizes)
+        self.assertEqual(sizes["Projetos"], 7e9)
+
+    def _gather(self, root, known, candidates, sizes):
+        si = hogs.SystemInfo({"Preboot": 5e9}, 13e9, 30, False)
+        stale = mock.Mock(return_value=[])
+        with mock.patch.object(hogs, "gather_docker", return_value=hogs.Docker()), \
+                mock.patch.object(hogs, "scan_candidates", return_value=candidates), \
+                mock.patch.object(hogs, "du", side_effect=lambda p: sizes.get(p, 0)), \
+                mock.patch.object(hogs, "gather_apps", return_value=[]), \
+                mock.patch.object(hogs, "known_mounts", return_value=([], known)), \
+                mock.patch.object(hogs, "gather_system", return_value=si), \
+                mock.patch.object(hogs, "sign_clone_root", return_value=None), \
+                mock.patch.object(hogs, "stale_personal", stale), \
+                mock.patch.object(hogs, "load_config", return_value={"worktrees_root": str(root)}):
+            return hogs.gather(hogs.Console(file=io.StringIO())), stale
+
+    def test_gather_counts_projects_once_and_files_only_when_mounts_known(self):
+        tmp = Path(tempfile.mkdtemp())
+        dev, other = tmp / "dev", tmp / "outra"
+        (dev / "wt").mkdir(parents=True)
+        other.mkdir()
+        sizes = {dev: 50e9, dev / "wt": 20e9, other: 3e9}
+        snap, stale = self._gather(dev / "wt", True, [dev, other], sizes)
+        self.assertEqual(snap.projects, 20e9)
+        self.assertEqual(dict(snap.others)[hogs.short(dev)], 30e9)
+        self.assertEqual([a[0] for a in snap.advice], ["Reiniciar o Mac"])
+        stale.assert_called_once()
+        snap, stale = self._gather(dev, False, [dev, other], sizes)
+        self.assertEqual(snap.projects, 50e9)
+        self.assertNotIn(hogs.short(dev), dict(snap.others))
+        self.assertFalse(snap.mounts_known)
+        stale.assert_not_called()
+        snap, _ = self._gather(tmp / "nao-existe", True, [dev, other], sizes)
+        self.assertEqual(snap.projects, 0)
+        self.assertEqual(dict(snap.others)[hogs.short(dev)], 50e9)
 
 
 class HistoryTest(unittest.TestCase):

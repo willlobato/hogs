@@ -23,8 +23,8 @@ Quase sempre é o **Docker**. O Docker Desktop guarda tudo num único arquivo, o
 
 O `hogs` responde em uns 20 segundos:
 
-- **pra onde foi o espaço**, separado por categoria, numa barra parecida com a do macOS mas mostrando o Docker de verdade;
-- **o que dá pra apagar sem medo**, com uma etiqueta de risco em cada item;
+- **pra onde foi o espaço**, numa barra parecida com a do macOS mas separada em partes com nome: Docker, caches de dev, apps, projetos, macOS e swap, outras pastas e o que sobra sem identificar;
+- **o que dá pra apagar sem medo**, com uma etiqueta de risco em cada item e um resumo do que é recomendado agora;
 - **e apaga pra você**, só o que você escolher, nunca o que está em uso;
 - **o que está crescendo**, comparando com os dias anteriores;
 - **e impede que o Docker volte a inchar**, limitando o cache de build sozinho.
@@ -61,7 +61,7 @@ Confira com `hogs --version`.
 
 | Comando | O que faz |
 |---|---|
-| `hogs` | Relatório completo: disco, Docker, caches de dev, apps e o que mais estiver grande |
+| `hogs` | Relatório completo: disco por partes, o que é recomendado agora, o que o hogs não mexe, Docker, caches de dev, apps e o que mais estiver grande |
 | `hogs --clean` | Lista o que dá pra apagar e apaga só o que você escolher |
 | `hogs --worktrees PASTA` | Quadro por projeto: quem usa cada worktree, quando mudou, merge e se é seguro apagar |
 | `hogs --worktrees PASTA --clean` | Escolhe worktrees candidatos e confirma a remoção, preservando branches |
@@ -76,11 +76,15 @@ Confira com `hogs --version`.
 
 ### O que o relatório mostra
 
+- **🐷 Barra do disco:** o usado em partes (Docker, caches de dev, apps e dados, projetos, macOS e swap, outras pastas, não identificado) e o livre, sem contar nada duas vezes: a soma das partes é o usado. **macOS e swap** são os volumes do sistema (System, Preboot, VM com o swap…), lidos do `diskutil`. Ao lado do livre, quanto ficaria livre **com o recomendado**.
+- **✨ Recomendado agora:** só os itens 🟢, agrupados por bloco; as ações do macOS que liberam espaço (↻ reiniciar quando o swap está alto e o Mac ligado há muitos dias, ↻ aplicar uma atualização já baixada), que o hogs só recomenda; e uma linha com os arquivos parados para você avaliar.
+- **🛡 Não mexo:** o que fica protegido: containers rodando e as imagens deles, volumes do Docker e pastas montadas por containers.
 - **📈 O que mais cresceu:** comparado com o relatório de ontem, mais a variação das últimas 24h e uma minicurva dos últimos 7 dias do espaço livre e do Docker.
 - **🐳 Docker:** tamanho real do `Docker.raw` e o limite configurado. Também imagens em uso, imagens sem uso (separando as que voltam com `docker pull` das que foram construídas na sua máquina), imagens sem tag, cache de build (inclusive o de builders `buildx` que rodam em container), containers parados, volumes, e o espaço que a VM do Docker ocupa sem contabilizar.
 - **🛡 Prevenção:** se o cache de build tem limite, se a limpeza automática do Docker vale pro builder que você usa de verdade, se o TRIM está ligado e o teto do disco do Docker.
 - **🧰 Caches de dev:** npm, Yarn, pnpm, pip, Homebrew, Maven, Gradle, Go, Cargo, JetBrains, VS Code, Xcode, Playwright, Ollama, nvm, pyenv, SDKMAN e simuladores iOS.
-- **📦 Apps e dados:** WhatsApp, Chrome, Teams, a VM do Claude (Cowork), backups do iPhone, Downloads, Lixeira e `/Applications`.
+- **📦 Apps e dados:** WhatsApp, Chrome, Teams, a VM do Claude (Cowork), backups do iPhone, Downloads, Lixeira e `/Applications`. Também as cópias antigas que alguns apps (como o Chrome) deixam em pastas `*.code_sign_clone` depois de atualizar, e arquivos grandes (500 MB+) na Mesa, Documentos, Downloads e Imagens sem abrir há mais de 6 meses (🟡 para avaliar: vão para a Lixeira).
+- **🧰 Caches grandes:** pastas de `~/Library/Caches` acima de 500 MB que não estão na lista entram como 🟡 (o app recria).
 - **🔎 Outros grandes:** qualquer pasta acima de 1 GB na sua home ou em `~/Library` que não esteja nas listas acima. É aqui que aparecem as surpresas.
 - **🗂 Apps menos usados:** o top 10, com tamanho do app e dos dados dele.
 
@@ -119,6 +123,10 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - 🛡️ Pontos de volta de imagens (`antes-*`, `backup-*`…) só viram 🟢 depois de `rollback_days` dias (padrão 2, configurável), contados a partir do sinal mais recente; antes disso ficam 🟡 para avaliar.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
 - 🛡️ Arquivo pessoal só vai para a Lixeira, nunca é apagado direto.
+- 🛡️ Nenhuma pasta montada por um container (rodando ou parado) é sugerida, nem nada dentro dela. Se o Docker está instalado mas não responde e não há uma lista salva, o hogs não sugere arquivos nem caches.
+- 🛡️ Cópias antigas de apps só saem com o app fechado, e só as de versões diferentes da instalada.
+- 🛡️ Reiniciar o Mac e aplicar atualizações do macOS são só recomendações: o hogs nunca executa essas ações e elas nunca entram na limpeza nem no “com o recomendado”.
+- O “com o recomendado” soma só os itens 🟢; os 🟡 para avaliar ficam de fora.
 - Nada é apagado sem você confirmar.
 
 ## Worktrees Git
@@ -233,6 +241,19 @@ Cada `hogs` também grava um retrato completo (todos os itens), que é o que ali
 | `~/Library/Application Support/hogs/config.json` | o que está ligado |
 | `~/Library/Application Support/hogs/history.jsonl` | o histórico |
 | `~/Library/Logs/hogs.log` | o log do agente (o que ele limpou, avisos enviados) |
+
+### Configuração (`config.json`)
+
+Além do que o `--alert` e o `--docker-gc` gravam, dá para ajustar à mão:
+
+| Chave | Padrão | O que faz |
+|---|---|---|
+| `rollback_tags` | `["antes", "backup", "bkp", "before", "rollback"]` | palavras que marcam uma tag como ponto de volta (`antes-*`, `v2-backup-*`…); só conta se a imagem atual do mesmo repositório existe |
+| `rollback_days` | `2` | dias até um ponto de volta virar 🟢 |
+| `stale_worktree_days` | `30` | prazo dos worktrees parados sem merge (reservado; ainda não usado nesta versão) |
+| `worktrees_root` | nenhum | pasta dos seus projetos; se existir, aparece medida como **Projetos** na barra |
+
+Valor inválido (tipo errado, zero ou negativo) volta ao padrão.
 
 ## Apps menos usados
 

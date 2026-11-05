@@ -30,6 +30,7 @@ from typing import Callable
 
 try:
     from rich import box
+    from rich.columns import Columns
     from rich.console import Console, Group
     from rich.padding import Padding
     from rich.panel import Panel
@@ -40,7 +41,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -242,6 +243,7 @@ class Docker:
     current_builder: str = ""
     mounts: list[Path] = field(default_factory=list)   # origens de bind mount de qualquer container
     mounts_ok: bool = False                            # True só se o inspect respondeu
+    live: list[str] = field(default_factory=list)      # containers rodando (nomes)
 
 
 def list_builders() -> list[dict]:
@@ -351,6 +353,7 @@ def gather_docker() -> Docker:
         _labels(c.get("Labels", "")).get("com.docker.compose.project")
         for c in containers if c.get("State") in ACTIVE_STATES
     } - {None}
+    d.live = sorted(c.get("Names", c["ID"][:12]) for c in containers if c.get("State") in ACTIVE_STATES)
     stopped = [c for c in containers if c.get("State") not in ACTIVE_STATES]
     ages: dict[str, int | None] = {}
     if stopped:
@@ -1690,18 +1693,41 @@ class Snapshot:
     items: list[Item]               # dev + apps
     others: list[tuple[str, int]]
     apps: list[AppInfo] = field(default_factory=list)
+    system: SystemInfo | None = None
+    advice: list[tuple[str, int, str]] = field(default_factory=list)   # só texto, nunca um Item
+    mounts_known: bool = True
+    projects: int = 0
+    mounts: list[Path] = field(default_factory=list)
+
+
+def projects_root() -> Path | None:
+    """A pasta dos projetos (`worktrees_root` no config.json), se for uma pasta que existe."""
+    root = load_config().get("worktrees_root")
+    if not isinstance(root, str) or not root:
+        return None
+    path = Path(root).expanduser()
+    return path if path.is_dir() else None
+
+
+def clone_items() -> list[Item]:
+    root = sign_clone_root()
+    return sign_clone_items(gather_sign_clones(root)) if root else []
 
 
 def gather(con: Console) -> Snapshot:
     known = {str(p) for pd in PATH_DEFS for p in pd.paths} | {str(DOCKER_CONTAINER)}
     def_paths = [p for pd in PATH_DEFS for p in pd.paths]
     candidates = scan_candidates(known)
-    paths = def_paths + candidates
+    root = projects_root()
+    paths = def_paths + candidates + ([root] if root and root not in candidates else [])
+    now = time.time()
 
     sizes: dict[Path, int] = {}
     with con.status("[bold]🐷 Farejando o disco…[/]", spinner="dots") as status:
         with ThreadPoolExecutor(max_workers=8) as ex:
             fut_docker = ex.submit(gather_docker)
+            fut_system = ex.submit(gather_system, now)
+            fut_clones = ex.submit(clone_items)
             futs = {ex.submit(du, p): p for p in paths}
             for n, f in enumerate(as_completed(futs), 1):
                 sizes[futs[f]] = f.result()
@@ -1710,20 +1736,35 @@ def gather(con: Console) -> Snapshot:
             apps = gather_apps()
             status.update("[bold]🐷 Perguntando pro Docker…[/]")
             docker = fut_docker.result()
+            mounts, mounts_known = known_mounts(docker)
+            personal: list[Item] = []
+            if mounts_known:
+                status.update("[bold]🐷 Procurando arquivos grandes parados…[/]")
+                personal = personal_items(stale_personal(PERSONAL_ROOTS, mounts, now), now)
+            system = fut_system.result()
+            clones = fut_clones.result()
 
     items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
                   make_action(pd), pd.hint, make_guard(pd)) for pd in PATH_DEFS]
-    mounts, mounts_known = known_mounts(docker)
     shown: set[Path] = set()
     if mounts_known:
         cand_sizes = {p: sizes.get(p, 0) for p in candidates}
         shown = set(big_cache_paths(cand_sizes, mounts))
         items += cache_items(cand_sizes, mounts)
+    items += clones + personal
+    projects = sizes.get(root, 0) if root else 0
+
+    def rest(p: Path) -> int:
+        """Tamanho de `p` fora da pasta dos projetos, para não contar duas vezes na barra."""
+        if root and inside(p, root):
+            return 0
+        return sizes.get(p, 0) - (projects if root and inside(root, p) else 0)
     # guarda a partir de 100 MB pro histórico; o relatório só mostra os de 1 GB+
-    others = sorted(((short(p), sizes[p]) for p in candidates if sizes.get(p, 0) >= 100e6 and p not in shown),
+    others = sorted(((short(p), rest(p)) for p in candidates if rest(p) >= 100e6 and p not in shown),
                     key=lambda x: -x[1])
     usage = shutil.disk_usage(DATA_VOLUME)
-    return Snapshot(usage.total, usage.free, docker, items, others, apps)
+    return Snapshot(usage.total, usage.free, docker, items, others, apps, system,
+                    system_advice(system) if system else [], mounts_known, projects, mounts)
 
 
 # ---------------------------------------------------------------- sistema
@@ -1871,7 +1912,10 @@ def snapshot_sizes(s: Snapshot) -> dict[str, int]:
         sizes["Docker: imagens"] = sum(i["size"] for i in d.images)
         sizes["Docker: cache de build"] = d.build_cache + sum(b["size"] for b in d.builder_caches)
         sizes["Docker: volumes"] = sum(v["size"] for v in d.volumes)
-    sizes.update({i.label: i.size for i in s.items})
+    # Sem a contagem "(n)" no nome, pro histórico seguir o mesmo item; os parados para avaliar não são crescimento.
+    sizes.update({re.sub(r" \(\d+\)$", "", i.label): i.size for i in s.items if i.risk is not EVAL})
+    if s.projects:
+        sizes["Projetos"] = s.projects
     sizes.update(dict(s.others))
     return {k: v for k, v in sizes.items() if v >= 10e6}
 
@@ -2049,14 +2093,29 @@ def trend(s: Snapshot, records: list[dict], now: float) -> Text | None:
     return t
 
 
+def breakdown(s: Snapshot) -> list[tuple[str, int, str]]:
+    """O disco usado em partes (rótulo, bytes, cor), sem contar nada duas vezes: a soma menos "Livre" é o usado."""
+    used = s.total - s.free
+    volumes = s.system.volumes if s.system else {}
+    macos = min(used, sum(v for k, v in volumes.items() if k != "Data"))
+    # Os 🟡 para avaliar (arquivos parados) já estão dentro de pastas medidas: Downloads ou "Outras pastas".
+    data = [("Docker", s.docker.raw_real, "dodger_blue1"),
+            ("Caches de dev", sum(i.size for i in s.items if i.cat == "dev"), "magenta"),
+            ("Apps e dados", sum(i.size for i in s.items if i.cat == "apps" and i.risk is not EVAL), "yellow"),
+            ("Projetos", s.projects, "cyan"),
+            ("Outras pastas", sum(size for _, size in s.others), "dark_orange")]
+    room, known = used - macos, sum(v for _, v, _ in data)
+    if known > room:   # medidas que se sobrepõem (clones APFS, pastas aninhadas): encolhe só as do volume Data
+        data = [(label, int(v * room / known), color) for label, v, color in data]
+    unknown = max(0, room - sum(v for _, v, _ in data))
+    return data[:4] + [("macOS e swap", macos, "steel_blue1"), data[4],
+                       ("Não identificado", unknown, "grey50"), ("Livre", s.free, "green")]
+
+
 def header(s: Snapshot, records: list[dict] | None = None) -> Panel:
     used = s.total - s.free
-    dev = sum(i.size for i in s.items if i.cat == "dev")
-    apps = sum(i.size for i in s.items if i.cat == "apps")
-    docker = s.docker.raw_real
-    rest = max(0, used - dev - apps - docker)
-    segs = [("Docker", docker, "dodger_blue1"), ("Caches de dev", dev, "magenta"),
-            ("Apps e dados", apps, "yellow"), ("Sistema e outros", rest, "grey50"), ("Livre", s.free, "green")]
+    segs = breakdown(s)
+    recommended = s.free + sum(i.size for i in clean_items(s) if i.risk is SAFE)
 
     width = 64
     bar, cum, pos = Text(), 0, 0
@@ -2065,13 +2124,13 @@ def header(s: Snapshot, records: list[dict] | None = None) -> Panel:
         end = round(cum / s.total * width)
         bar.append("█" * (end - pos), style=color)
         pos = end
-    legend = Text()
-    for label, size, color in segs:
-        legend.append("■ ", style=color).append(f"{label} ").append(fmt(size), style="bold").append("  ")
+    legend = Columns([Text.assemble(("■ ", color), f"{label} ", (fmt(size), "bold"))
+                      for label, size, color in segs if size or label == "Livre"], padding=(0, 2))
 
     free_color = "red" if s.free < 30 * GB else "yellow" if s.free < 60 * GB else "green"
     line = Text.assemble(("Macintosh HD", "bold"), f"  ·  {fmt(used)} de {fmt(s.total)} usados  ·  ",
-                         (f"{fmt(s.free)} livres", f"bold {free_color}"))
+                         (f"{fmt(s.free)} livres", f"bold {free_color}"), "  ·  com o recomendado: ",
+                         (f"{fmt(recommended)} livres", "bold green"))
     body = [line, Text(), bar, legend]
     if records and (t := trend(s, records, time.time())) is not None:
         body += [Text(), t]
@@ -2145,9 +2204,75 @@ def prevention_panel(s: Snapshot) -> Panel | None:
     return Panel(grid, title="[bold]🛡  Prevenção[/]", title_align="left", border_style="grey50", padding=(0, 2))
 
 
+CAT_TITLES = {"docker": "🐳 Docker", "dev": "🧰 Caches de dev", "apps": "📦 Apps e dados", "worktree": "🌳 Worktrees"}
+
+
+def plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def preview(names: list[str], n: int = 3) -> str:
+    return ", ".join(names[:n]) + ("…" if len(names) > n else "")
+
+
+def recommended_panel(s: Snapshot, cleanable: list[Item]) -> Panel:
+    """Só os 🟢 contam como recomendado; as ações do macOS (↻) e os 🟡 para avaliar aparecem à parte."""
+    t = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
+    t.add_column("O quê", ratio=4, overflow="fold")
+    t.add_column("Libera", justify="right", no_wrap=True)
+    t.add_column("Risco", no_wrap=True)
+    t.add_column("Por quê", style="dim", ratio=3, overflow="fold")
+    groups: dict[str, list[Item]] = {}
+    for i in cleanable:
+        if i.risk is SAFE:
+            groups.setdefault(i.cat, []).append(i)
+    for cat, items in sorted(groups.items(), key=lambda kv: -sum(i.size for i in kv[1])):
+        t.add_row(Text(CAT_TITLES.get(cat, cat), style="bold"), Text(fmt(sum(i.size for i in items)), style="bold"),
+                  "", "")
+        for i in sorted(items, key=lambda i: -i.size):
+            t.add_row(f"   {i.label}", fmt(i.size), Text(SAFE.icon), i.hint)
+    for label, size, how in s.advice:
+        t.add_row(f"💻 {label}", f"~{fmt(size)}" if size else "", Text("↻", style="cyan"), how)
+    evals = [i for i in cleanable if i.risk is EVAL]
+    if evals:
+        files = sum(1 for i in evals if i.cat != "docker")
+        kinds = [plural(files, "arquivo (vai para a Lixeira)", "arquivos (vão para a Lixeira)") if files else "",
+                 plural(len(evals) - files, "ponto de volta recente", "pontos de volta recentes")
+                 if len(evals) > files else ""]
+        t.add_row(f"🗂  Arquivos parados para avaliar ({len(evals)})", fmt(sum(i.size for i in evals)),
+                  Text(EVAL.icon), " e ".join(k for k in kinds if k) + " · um por um no hogs --clean")
+    body: list = [t] if t.row_count else [Text("Nada recomendado agora. 🎉", style="green")]
+    if not s.mounts_known:
+        body.append(Text("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.",
+                         style="yellow"))
+    if s.advice:
+        body.append(Text("↻ é só recomendação: o hogs nunca reinicia nem atualiza o Mac.", style="dim"))
+    return Panel(Group(*body), title="[bold]✨ Recomendado agora[/]", title_align="left", border_style="green",
+                 padding=(0, 2))
+
+
+def protected_panel(s: Snapshot) -> Panel:
+    d = s.docker
+    lines = []
+    if d.live:
+        lines.append(f"{plural(len(d.live), 'container rodando', 'containers rodando')} ({preview(d.live)}) "
+                     "e as imagens deles")
+    if d.volumes:
+        lines.append(f"{plural(len(d.volumes), 'volume', 'volumes')} do Docker "
+                     f"({fmt(sum(v['size'] for v in d.volumes))}): dados de bancos, só você decide")
+    if s.mounts:
+        lines.append(f"{plural(len(s.mounts), 'caminho montado', 'caminhos montados')} em containers "
+                     f"({preview([short(m) for m in s.mounts])}): nada ali dentro é sugerido")
+    text = Text("\n".join(lines) if lines else "Nada em uso pelo Docker agora.")
+    return Panel(text, title="[bold]🛡 Não mexo[/]", title_align="left", border_style="grey50", padding=(0, 2))
+
+
 def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None:
     records = records or []
+    cleanable = clean_items(s)
     con.print(header(s, records))
+    con.print(recommended_panel(s, cleanable))
+    con.print(protected_panel(s))
     con.print(growth_table(s, records))
     con.print()
     for t in (category_table("🐳 Docker", docker_rows(s.docker)), prevention_panel(s), unused_images_table(s.docker),
@@ -2163,7 +2288,6 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
         con.print(Text("Lista maior: hogs --apps 20", style="dim"))
         con.print()
 
-    cleanable = clean_items(s)
     safe = sum(i.size for i in cleanable if i.risk is SAFE)
     redown = sum(i.size for i in cleanable if i.risk is REDOWN)
     con.print(Panel(Text.assemble(

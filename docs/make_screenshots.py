@@ -30,6 +30,8 @@ docker = h.Docker(
     build_cache=int(21.7 * GB),
     images=[
         image("api:latest", 1.4 * GB, used=True, created="10 hours ago"),
+        image("shop-api:latest", 1.1 * GB, used=True, created="2 days ago"),
+        image("shop-api:antes-20260101-0900", 1.2 * GB, created="10 months ago"),
         image("postgres:16-alpine", 0.38 * GB, used=True),
         image("registry.gitlab.com/acme/browser-runner:latest", 6.8 * GB, created="4 years ago"),
         image("ollama/ollama:latest", 5.6 * GB, created="15 months ago"),
@@ -46,6 +48,7 @@ docker = h.Docker(
     builders=[{"name": "multiarch", "driver": "docker-container", "nodes": ["multiarch0"], "running": True}],
     builder_caches=[{"builder": "multiarch", "volume": "buildx_buildkit_multiarch0_state", "size": int(15.8 * GB)}],
     current_builder="multiarch",
+    live=["api", "postgres", "shop-api"],
 )
 
 
@@ -64,6 +67,8 @@ items = [
     item("apps", "WhatsApp", 31.7 * GB, h.INFO, "WhatsApp › Ajustes › Armazenamento › Gerenciar"),
     item("apps", "Chrome", 9.8 * GB, h.INFO, "perfis e cache do navegador"),
     item("apps", "Lixeira", 2.1 * GB, h.SAFE),
+    item("apps", "Cópias antigas do Navegador (3)", 6.4 * GB, h.SAFE, "versões 120.0, 121.0; a instalada é 122.0"),
+    item("apps", "Parado: ~/Downloads/curso-gravado.mov", 4.1 * GB, h.EVAL, "sem abrir há 14 meses · vai para a Lixeira"),
 ]
 
 now = datetime.now(timezone.utc)
@@ -78,8 +83,13 @@ apps = [h.AppInfo(name, Path(where) / f"{name}.app", int(size), int(data), now -
             ("WebStorm", "~/Applications", 2.7 * GB, 0, 270),
         ]]
 
+system = h.SystemInfo({"System": int(12.4 * GB), "Preboot": int(8.1 * GB), "VM": int(15 * GB), "Data": int(430 * GB)},
+                      swap_used=int(13.8 * GB), uptime_days=23, update_pending=False)
 snapshot = h.Snapshot(total=int(494.4 * GB), free=int(18.2 * GB), docker=docker, items=items,
-                      others=[("~/Development", int(15.4 * GB)), ("~/.vscode", int(6.1 * GB))], apps=apps)
+                      others=[("~/Pictures", int(52.3 * GB)), ("~/Music", int(30.1 * GB)), ("~/Movies", int(15.4 * GB)),
+                              ("~/.vscode", int(6.1 * GB))], apps=apps,
+                      system=system, advice=h.system_advice(system), projects=int(78.4 * GB),
+                      mounts=[Path("~/Development/shop-api/.data/postgres")])
 
 
 # Uma semana de histórico: Docker estável e um dia ruim de builds (+0,7 GB por hora nas últimas 26h).
@@ -94,7 +104,7 @@ records = [{"t": NOW - hours * 3600, "free": int((18.2 + grew(hours)) * GB),
             "docker_raw": int((112.7 - grew(hours)) * GB)} for hours in range(168, 0, -1)]
 base_sizes = h.snapshot_sizes(snapshot)
 base_sizes.update({"Docker.raw": int(94.5 * GB), "Docker: imagens": int(28 * GB), "Docker: cache de build": int(29 * GB),
-                   "WhatsApp": int(30.1 * GB), "npm": int(3.1 * GB), "~/Development": int(14.6 * GB)})
+                   "WhatsApp": int(30.1 * GB), "npm": int(3.1 * GB), "~/Movies": int(14.6 * GB)})
 records.append({"t": NOW - 26 * 3600, "full": True, "free": int(36.4 * GB), "docker_raw": int(94.5 * GB),
                 "sizes": base_sizes})
 records.sort(key=lambda r: r["t"])
@@ -111,8 +121,10 @@ def save(name, render):
     print("ok", name)
 
 
+# Pontos de volta "vistos" há tempo, sem gravar no seen_tags.json da sua máquina.
 with mock.patch.object(h, "load_config", return_value={}), \
-        mock.patch.object(h, "read_json", side_effect=lambda path: FAKE_JSON.get(path, {})):
+        mock.patch.object(h, "read_json", side_effect=lambda path: FAKE_JSON.get(path, {})), \
+        mock.patch.object(h, "first_seen", side_effect=lambda refs, now: {r: now - 300 * 86400 for r in refs}):
     save("report.svg", lambda con: h.report(con, snapshot, records))
 save("apps.svg", lambda con: (con.print(h.apps_table(apps, 7)), con.print(h.apps_footer())))
 D, H = 86400, 3600
