@@ -1,3 +1,4 @@
+import dataclasses
 import io
 import sys
 import json
@@ -2251,6 +2252,82 @@ class WorktreeTest(unittest.TestCase):
             item.action()
         rm.assert_called_once_with(row, 0, self.root)
 
+    def test_unmerged_unpushed_with_files_outside_git_goes_by_hand_and_branch_keeps_commits(self):
+        self.commit_and_push(push=False)
+        self.leftovers()
+        row = self.inspect()
+        self.assertEqual(row.verdict, "manter", "a recomendação não muda")
+        self.assertFalse(row.eligible or row.trashable)
+        self.assertTrue(row.by_hand, row.hard)
+        self.assertEqual(sorted(row.leftovers), [".env", "rascunho.md", "tmp/"])
+        [item] = hogs.worktree_items([row], self.root, 0)
+        self.assertIs(item.risk, hogs.EVAL)
+        self.assertEqual(item.kind, "worktree_manual")
+        self.assertIn("não recomendado", item.hint)
+        rows = [hogs.Row(hogs.item_key(item), [item.label], item)]
+        self.assertEqual(hogs.mark_all_safe(rows, set()), 0, "a nunca marca")
+        self.quiet()
+        trash, moved = self.fake_trash()
+        with self.assertRaisesRegex(RuntimeError, "commits não enviados", msg="sem by_hand recusa"):
+            hogs.trash_and_remove_worktree(row, 0)
+        self.assertEqual(moved, [])
+        with mock.patch.object(hogs, "trash_and_remove_worktree") as rm:
+            item.action()
+        rm.assert_called_once_with(row, 0, self.root, by_hand=True)
+        hogs.trash_and_remove_worktree(row, 0, by_hand=True)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(sorted(p.name for p in trash.iterdir()), [".env", "rascunho.md", "tmp"])
+        self.assertEqual(self.git(self.repo, "rev-parse", "feature"), row.head, "a branch fica com o commit")
+        self.assertEqual(self.git(self.repo, "show", "feature:file.txt"), "trabalho sem merge")
+
+    def test_recent_merged_worktree_goes_by_hand(self):
+        self.age(days=0)
+        row = self.inspect(days=30)
+        self.assertEqual(row.verdict, "depois")
+        self.assertTrue(row.by_hand, row.hard)
+        self.quiet()
+        hogs.trash_and_remove_worktree(row, 30, by_hand=True)
+        self.assertFalse(self.path.exists())
+
+    def test_uncommitted_change_is_never_markable_by_hand(self):
+        (self.path / "file.txt").write_text("editado sem commit\n")
+        self.age()
+        row = self.inspect()
+        self.assertEqual(row.verdict, "manter")
+        self.assertIn("sem commit", row.hard[0])
+        self.assertFalse(row.by_hand)
+        self.assertEqual(hogs.worktree_items([row], self.root, 0), [])
+        self.assertIn("não dá para marcar", " ".join(str(t) for t in hogs.worktree_detail(row, self.root)))
+        self.quiet()
+        _, moved = self.fake_trash()
+        forged = dataclasses.replace(row, hard=[])        # nem um item forjado passa: a reconferência trava
+        with self.assertRaisesRegex(RuntimeError, "sem commit"):
+            hogs.trash_and_remove_worktree(forged, 0, by_hand=True)
+        self.assertEqual(moved, [])
+        self.assertEqual((self.path / "file.txt").read_text(), "editado sem commit\n")
+
+    def test_running_inside_or_docker_unknown_is_never_markable_by_hand(self):
+        self.commit_and_push(push=False)
+        busy = ([(self.path / "file.txt", "vim (pid 1)")], "", [])
+        self.assertFalse(self.inspect(usage=busy).by_hand, "algo rodando dentro trava")
+        self.leftovers()
+        with mock.patch.object(hogs, "all_container_mounts", return_value=([], False)):
+            self.assertFalse(self.inspect().by_hand, "Docker mudo com arquivo fora do Git trava")
+        with mock.patch.object(hogs, "all_container_mounts", return_value=([self.path / "tmp"], True)):
+            self.assertFalse(self.inspect().by_hand, "pasta de container trava")
+        row = self.inspect()
+        self.assertTrue(row.by_hand)
+        self.quiet()
+        _, moved = self.fake_trash()
+        with mock.patch.object(hogs, "worktree_usage", return_value=busy):
+            with self.assertRaisesRegex(RuntimeError, "em uso agora"):
+                hogs.trash_and_remove_worktree(row, 0, by_hand=True)
+        (self.path / "tmp" / "novo.txt").write_text("novo\n")
+        with self.assertRaisesRegex(RuntimeError, "apareceu arquivo fora do Git"):
+            hogs.trash_and_remove_worktree(row, 0, by_hand=True)
+        self.assertEqual(moved, [])
+        self.assertTrue(self.path.exists())
+
     def commit_and_push(self, push=True):
         (self.path / "file.txt").write_text("trabalho sem merge\n")
         self.git(self.path, "commit", "-am", "work")
@@ -2921,7 +2998,8 @@ class WorktreesTreeTest(unittest.TestCase):
         self.assertEqual([r.key for r in rows], ["wt//dev/acme", "wt//dev/shop-api"])
         self.assertEqual(rows[0].limit, 8)
         shop = rows[1].children
-        self.assertEqual([hogs.checkable(r) for r in shop], [True, False, False])
+        # 🟢, e os não recomendados que não perdem nada (marcados à mão)
+        self.assertEqual([hogs.checkable(r) for r in shop], [True, True, True])
         self.assertEqual(shop[0].key, hogs.item_key(hogs.worktree_items(self.rows()[:1], self.ROOT)[0]))
         self.assertIn("● Checkout", str(shop[1].cells[5]))
         self.assertEqual(shop[1].resume.session, "s-9")
@@ -3139,6 +3217,41 @@ class AppTest(unittest.TestCase):
             app.handle(hogs.Key("s"))
         rm.assert_called_once_with(w, 0, self.ROOT)
         self.assertEqual(app.log, ["✔ shop-api / shop-api/sobras"])
+        self.assertIn(hogs.TRASH_NOTE, " ".join(self.text(app).split()))
+
+    def test_not_recommended_worktree_is_marked_by_hand_only_in_worktrees_tab(self):
+        w = hogs.Worktree(self.ROOT / "shop-api" / "wip", Path("/dev/shop-api"), "abc", "refs/heads/feat/wip",
+                          700_000_000, time.time() - 2 * 86400, blockers=["merge não comprovado em origin/main "
+                                                                           "e há commits não enviados"],
+                          leftovers=[".env"])
+        stuck = hogs.Worktree(self.ROOT / "shop-api" / "sujo", Path("/dev/shop-api"), "abd",
+                              "refs/heads/feat/sujo", 800_000_000, time.time() - 2 * 86400,
+                              blockers=["1 alterações locais sem commit"], hard=["1 alterações locais sem commit"])
+        self.assertTrue(w.by_hand)
+        self.assertFalse(stuck.by_hand)
+        app = self.app(rows=[w, stuck])
+        key = "worktree|shop-api / shop-api/wip"
+        rec = {r.key for r in hogs._all_rows(app.trees()[0][1])} | {r.key for r in hogs._all_rows(app.trees()[3][1])}
+        self.assertNotIn(key, rec, "fora do Recomendado e do Disco")
+        wt = {r.key: r for r in hogs._all_rows(app.trees()[1][1])}
+        self.assertTrue(hogs.checkable(wt[key]))
+        self.assertFalse(hogs.checkable(wt[f"wt/{stuck.path}"]), "alteração sem commit: sem caixa")
+        app.tab = 1
+        app.states[1].cursor = [v.row.key for v in self.vis(app)].index(f"wt/{stuck.path}")
+        self.press(app, "space")
+        self.assertEqual(app.marked, set())
+        self.assertEqual(app.status, "não dá para marcar: 1 alterações locais sem commit")
+        self.press(app, "a")
+        self.assertNotIn(key, app.marked, "a só marca 🟢")
+        app.marked = {key}
+        app.mode = "confirm"
+        text = " ".join(self.text(app).split())
+        for part in ("⚠ não recomendado: merge não comprovado", "a branch feat/wip fica com os commits",
+                     "→ Lixeira: .env", "confira os avisos", "Arquivos vão para a Lixeira."):
+            self.assertIn(part, text)
+        with mock.patch.object(hogs, "trash_and_remove_worktree") as rm:
+            app.handle(hogs.Key("s"))
+        rm.assert_called_once_with(w, 0, self.ROOT, by_hand=True)
         self.assertIn(hogs.TRASH_NOTE, " ".join(self.text(app).split()))
 
     def test_space_on_group_marks_only_its_safe_items(self):
@@ -3547,10 +3660,10 @@ class CliTest(unittest.TestCase):
         self.assertIn(hogs.NEEDS_TTY, self.err.getvalue())
         self.assertNotIn(hogs.NEEDS_TTY, self.out.getvalue())
 
-    def test_version_is_0_7_0_in_both_places(self):
-        self.assertEqual(hogs.__version__, "0.7.0")
+    def test_version_is_0_8_0_in_both_places(self):
+        self.assertEqual(hogs.__version__, "0.8.0")
         toml = (Path(hogs.__file__).parent / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "0.7.0"', toml)
+        self.assertIn('version = "0.8.0"', toml)
 
 
 # ---- Revisão final da fase 3 (H1–H16)

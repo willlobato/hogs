@@ -79,11 +79,11 @@ DEV, T0 = Path("~/Development"), time.time()
 
 
 def wt(repo, name, branch, gb, age, merged="", users=(), sessions=(), blockers=(), waits=(), ok=False,
-       pushed="", conversations=(), leftovers=()):
+       pushed="", conversations=(), leftovers=(), hard=()):
     w = h.Worktree(DEV / name, DEV / repo, branch=f"refs/heads/{branch}", size=int(gb * GB),
                    last_activity=T0 - age, eligible=ok, merged=merged, pushed=pushed, users=list(users),
                    sessions=list(sessions), blockers=list(blockers), waits=list(waits),
-                   conversations=list(conversations), leftovers=list(leftovers))
+                   conversations=list(conversations), leftovers=list(leftovers), hard=list(hard))
     w.reason = (f"{merged} · mexido {h.elapsed(w.last_activity)}" if ok and merged
                 else f"enviado a {pushed} · mexido {h.elapsed(w.last_activity)} · a branch fica" if ok
                 else f"{merged} · {len(w.leftovers)} fora do Git vão para a Lixeira: {h.leftover_text(w.leftovers)}"
@@ -102,11 +102,13 @@ WORKTREES = [
     wt("app", "app-preview", "feat/preview", 0.8, 5 * H, "squash em origin/main", ["Claude Code app-12"],
        ["app-12"], ok=True),
     wt("app", "app-dashboard", "feat/dashboard", 1.4, 2 * H, users=["Claude Code app-7", "node ×3"],
-       sessions=["app-7"], blockers=["merge não comprovado em origin/main"]),
+       sessions=["app-7"], blockers=["merge não comprovado em origin/main"],
+       waits=["em uso agora: Claude Code app-7 aberta dentro da pasta, node ×3"],
+       hard=["em uso agora: Claude Code app-7 aberta dentro da pasta, node ×3"]),
     wt("api", "api-infra", "feat/infra", 0.6, 9 * D, "merge em origin/main",
        leftovers=[".terraform/", ".env"]),
     wt("api", "api-cache", "feat/cache", 0.3, 3 * D, "rebase em origin/main", ["node ×2"],
-       waits=["em uso agora: node ×2"]),
+       waits=["em uso agora: node ×2"], hard=["em uso agora: node ×2"]),
     # Caminho absoluto fictício: resume_command não expande "~".
     wt("shop-api", "shop-api-relatorio", "feat/relatorio", 1.2, 41 * D, pushed="origin/feat/relatorio", ok=True,
        conversations=[conv("3f2a9c1e", "Relatório mensal por cliente", "/Users/ana/Development/shop-api-relatorio",
