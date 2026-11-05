@@ -92,7 +92,7 @@ EVAL = Risk("🟡", "para avaliar", "yellow", 1)
 
 @dataclass
 class Item:
-    cat: str                     # docker | dev | apps
+    cat: str                     # docker | dev | apps | worktree
     label: str
     size: int = 0
     risk: Risk = INFO
@@ -1805,6 +1805,59 @@ def selection_numbers(raw: str, total: int, everything: set[int] | None = None) 
     return {n for n in chosen if 1 <= n <= total}
 
 
+def verdict_counts(rows: list[Worktree]) -> dict[str, tuple[int, int]]:
+    """Quantos worktrees e quantos bytes em cada veredito, sempre com as três chaves."""
+    counts = {v: (0, 0) for v in VERDICTS}
+    for w in rows:
+        n, size = counts[w.verdict]
+        counts[w.verdict] = (n + 1, size + w.size)
+    return counts
+
+
+def worktrees_line(rows: list[Worktree], root: Path | None) -> Text:
+    """O totalizador 🌳 do relatório principal."""
+    if root is None:
+        return Text("🌳 Worktrees: escolha a pasta dos seus projetos com hogs --worktrees PASTA (ela fica lembrada)",
+                    style="dim")
+    if not rows:
+        return Text(f"🌳 Worktrees: nenhum em {short(root)}")
+    c = verdict_counts(rows)
+    (a, sa), (b, _), (k, _) = c["seguro"], c["depois"], c["manter"]
+    return Text.assemble(f"🌳 Worktrees: {len(rows)} · {fmt(sum(w.size for w in rows))} · {a} podem sair ({fmt(sa)})"
+                         f" · {b} em andamento · {k} com trabalho só aqui",
+                         (f"  detalhes: hogs --worktrees {short(root)}", "dim"))
+
+
+def remove_worktrees(rows: list[Worktree], scope: Path) -> None:
+    """Remove cada um reconferindo tudo; tenta todos e, se algum ficou, levanta com o primeiro motivo."""
+    errors = []
+    for w in rows:
+        try:
+            remove_worktree(w, 0, scope)
+        except Exception as exc:   # o motivo vai para a mensagem; os outros ainda são tentados
+            errors.append(str(exc))
+    if errors:
+        raise RuntimeError(f"{len(errors)} de {len(rows)} mantidos: {errors[0]}")
+
+
+def worktree_item(rows: list[Worktree], root: Path) -> Item | None:
+    """Os 🟢 viram um Item só no relatório principal e no --clean."""
+    safe = safe_worktrees(rows)
+    if not safe:
+        return None
+    merged = sum(1 for w in safe if w.merged)
+    parts = ["a branch fica"]
+    if merged:
+        parts.append(f"{merged} na main")
+    if len(safe) - merged:
+        parts.append(f"{len(safe) - merged} enviados e parados")
+    reopen = len({link.conv.session for w in safe for link in w.conversations if link.reopen})
+    if reopen:
+        parts.append(f"reabra {plural(reopen, 'conversa', 'conversas')} antes")
+    return Item("worktree", f"Worktrees que podem sair ({len(safe)})", sum(w.size for w in safe), SAFE,
+                lambda: remove_worktrees(safe, root), " · ".join(parts))
+
+
 # ---------------------------------------------------------------- pastas conhecidas
 
 @dataclass
@@ -2151,6 +2204,8 @@ class Snapshot:
     mounts_known: bool = True
     projects: int = 0
     mounts: list[Path] = field(default_factory=list)
+    worktrees: list[Worktree] = field(default_factory=list)     # todas as linhas, não só os 🟢
+    worktrees_root: Path | None = None
 
 
 def projects_root() -> Path | None:
@@ -2178,6 +2233,7 @@ def gather(con: Console) -> Snapshot:
     sizes: dict[Path, int] = {}
     with con.status("[bold]🐷 Farejando o disco…[/]", spinner="dots") as status:
         with ThreadPoolExecutor(max_workers=8) as ex:
+            fut_worktrees = ex.submit(gather_worktrees, root, 0) if root else None   # o mais demorado: primeiro
             fut_docker = ex.submit(gather_docker)
             fut_system = ex.submit(gather_system, now)
             fut_clones = ex.submit(clone_items)
@@ -2196,6 +2252,13 @@ def gather(con: Console) -> Snapshot:
                 personal = personal_items(stale_personal(PERSONAL_ROOTS, mounts, now), now)
             system = fut_system.result()
             clones = fut_clones.result()
+            worktrees: list[Worktree] = []
+            if fut_worktrees is not None:
+                status.update("[bold]🌳 Conferindo worktrees…[/]")
+                try:
+                    worktrees = fut_worktrees.result()[0]
+                except Exception:   # o relatório nunca cai por causa dos worktrees: só ficam de fora
+                    pass
 
     items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
                   make_action(pd), pd.hint, make_guard(pd)) for pd in PATH_DEFS]
@@ -2205,6 +2268,8 @@ def gather(con: Console) -> Snapshot:
         shown = set(big_cache_paths(cand_sizes, mounts))
         items += cache_items(cand_sizes, mounts)
     items += clones + personal
+    if root and (wt_item := worktree_item(worktrees, root)) is not None:
+        items.append(wt_item)
     projects = sizes.get(root, 0) if root else 0
 
     def rest(p: Path) -> int:
@@ -2217,7 +2282,7 @@ def gather(con: Console) -> Snapshot:
                     key=lambda x: -x[1])
     usage = shutil.disk_usage(DATA_VOLUME)
     return Snapshot(usage.total, usage.free, docker, items, others, apps, system,
-                    system_advice(system) if system else [], mounts_known, projects, mounts)
+                    system_advice(system) if system else [], mounts_known, projects, mounts, worktrees, root)
 
 
 # ---------------------------------------------------------------- sistema
@@ -2352,9 +2417,14 @@ def snapshot_sizes(s: Snapshot) -> dict[str, int]:
         sizes["Docker: cache de build"] = d.build_cache + sum(b["size"] for b in d.builder_caches)
         sizes["Docker: volumes"] = sum(v["size"] for v in d.volumes)
     # Sem a contagem "(n)" no nome, pro histórico seguir o mesmo item; os parados para avaliar não são crescimento.
-    sizes.update({re.sub(r" \(\d+\)$", "", i.label): i.size for i in s.items if i.risk is not EVAL})
-    if s.projects:
-        sizes["Projetos"] = s.projects
+    # Os worktrees 🟢 já estão em "Worktrees", que é parte de "Projetos".
+    sizes.update({re.sub(r" \(\d+\)$", "", i.label): i.size for i in s.items
+                  if i.risk is not EVAL and i.cat != "worktree"})
+    worktrees = worktrees_size(s)
+    if worktrees:
+        sizes["Worktrees"] = worktrees
+    if s.projects - worktrees:
+        sizes["Projetos"] = s.projects - worktrees
     sizes.update(dict(s.others))
     return {k: v for k, v in sizes.items() if v >= 10e6}
 
@@ -2544,23 +2614,33 @@ def trend(s: Snapshot, records: list[dict], now: float) -> Text | None:
     return t
 
 
+def worktrees_size(s: Snapshot) -> int:
+    """Os worktrees moram dentro da pasta dos projetos: nunca contam mais do que ela."""
+    return min(sum(w.size for w in s.worktrees), s.projects)
+
+
 def breakdown(s: Snapshot) -> list[tuple[str, int, str]]:
     """O disco usado em partes (rótulo, bytes, cor), sem contar nada duas vezes: a soma menos "Livre" é o usado."""
     used = s.total - s.free
     volumes = s.system.volumes if s.system else {}
     macos = min(used, sum(v for k, v in volumes.items() if k != "Data"))
     # Os 🟡 para avaliar (arquivos parados) já estão dentro de pastas medidas: Downloads ou "Outras pastas".
+    worktrees = worktrees_size(s)
     data = [("Docker", s.docker.raw_real, "dodger_blue1"),
+            ("Worktrees", worktrees, "medium_purple1"),
             ("Caches de dev", sum(i.size for i in s.items if i.cat == "dev"), "magenta"),
             ("Apps e dados", sum(i.size for i in s.items if i.cat == "apps" and i.risk is not EVAL), "yellow"),
-            ("Projetos", s.projects, "cyan"),
+            ("Projetos", s.projects - worktrees, "cyan"),
             ("Outras pastas", sum(size for _, size in s.others), "dark_orange")]
     room, known = used - macos, sum(v for _, v, _ in data)
     if known > room:   # medidas que se sobrepõem (clones APFS, pastas aninhadas): encolhe só as do volume Data
         data = [(label, int(v * room / known), color) for label, v, color in data]
     unknown = max(0, room - sum(v for _, v, _ in data))
-    return data[:4] + [("macOS e swap", macos, "steel_blue1"), data[4],
+    return data[:5] + [("macOS e swap", macos, "steel_blue1"), data[5],
                        ("Não identificado", unknown, "grey50"), ("Livre", s.free, "green")]
+
+
+TRIM_OFF_NOTE = "Docker não devolve espaço: TRIM desligado"
 
 
 def docker_trim_off() -> bool:
@@ -2592,7 +2672,7 @@ def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item]
                          (f"{fmt(s.free)} livres", f"bold {free_color}"), "  ·  com o recomendado: ",
                          (f"{fmt(recommended)} livres", "bold green"))
     if trim_off:
-        line.append(" (Docker não devolve espaço: TRIM desligado)", style="yellow")
+        line.append(f" ({TRIM_OFF_NOTE})", style="yellow")
     body = [line, Text(), bar, legend]
     if records and (t := trend(s, records, time.time())) is not None:
         body += [Text(), t]
@@ -2701,12 +2781,21 @@ def recommended_panel(s: Snapshot, cleanable: list[Item]) -> Panel:
     for i in cleanable:
         if i.risk is SAFE:
             groups.setdefault(i.cat, []).append(i)
-    for cat, items in sorted(groups.items(), key=lambda kv: -sum(i.size for i in kv[1])):
-        t.add_row(Text(CAT_TITLES.get(cat, cat), style="bold"), Text(fmt(sum(i.size for i in items)), style="bold"),
-                  "", "")
+    # Com o TRIM desligado, o que se apaga no Docker fica preso no Docker.raw: o grupo não libera nada pro macOS.
+    trapped = {"docker"} if docker_trim_off() else set()
+
+    def freed(cat: str, items: list[Item]) -> int:
+        return 0 if cat in trapped else sum(i.size for i in items)
+    for cat, items in sorted(groups.items(), key=lambda kv: -freed(*kv)):
+        if cat in trapped:
+            t.add_row(Text(CAT_TITLES.get(cat, cat), style="bold"), Text("—", style="dim"), "",
+                      Text(TRIM_OFF_NOTE, style="yellow"))
+        else:
+            t.add_row(Text(CAT_TITLES.get(cat, cat), style="bold"), Text(fmt(freed(cat, items)), style="bold"), "", "")
         for i in sorted(items, key=lambda i: -i.size):
             why = i.guard() if i.guard else None   # ex.: app aberto; a guarda vale de novo na hora de apagar
-            t.add_row(f"   {i.label}", fmt(i.size), Text(SAFE.icon), Text(why, style="yellow") if why else i.hint)
+            t.add_row(f"   {i.label}", Text(fmt(i.size), style="dim" if cat in trapped else ""), Text(SAFE.icon),
+                      Text(why, style="yellow") if why else i.hint)
     for label, size, how in s.advice:
         t.add_row(f"💻 {label}", f"~{fmt(size)}" if size else "", Text("↻", style="cyan"), how)
     evals = [i for i in cleanable if i.risk is EVAL]
@@ -2743,6 +2832,11 @@ def protected_panel(s: Snapshot) -> Panel:
                      f"({preview([short(m) for m in s.mounts])}): nada ali dentro é sugerido")
     if not s.mounts_known:
         lines.append("Docker não respondeu: não sei o que está em uso.")
+    counts = verdict_counts(s.worktrees)
+    (b, _), (c, _) = counts["depois"], counts["manter"]
+    if b or c:
+        lines.append(f"{plural(b, 'worktree em andamento', 'worktrees em andamento')} e {c} com trabalho só aqui: "
+                     "não mexo")
     text = Text("\n".join(lines) if lines else "Nada em uso pelo Docker agora.")
     return Panel(text, title="[bold]🛡 Não mexo[/]", title_align="left", border_style="grey50", padding=(0, 2))
 
@@ -2751,6 +2845,7 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
     records = records or []
     cleanable = clean_items(s)
     con.print(header(s, records, cleanable))
+    con.print(worktrees_line(s.worktrees, s.worktrees_root))
     con.print(recommended_panel(s, cleanable))
     con.print(protected_panel(s))
     con.print(growth_table(s, records))
@@ -2770,13 +2865,17 @@ def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None
         con.print(Text("Lista maior: hogs --apps 20", style="dim"))
         con.print()
 
-    safe = sum(i.size for i in cleanable if i.risk is SAFE)
-    redown = sum(i.size for i in cleanable if i.risk is REDOWN)
-    con.print(Panel(Text.assemble(
-        "Dá pra liberar  ", (f"🟢 {fmt(safe)} sem risco", "bold green"), "  ·  ",
-        (f"🟡 {fmt(redown)} que baixam de novo", "bold yellow"), "\n",
-        ("Rode ", "dim"), ("hogs --clean", "bold cyan"), (" pra escolher o que apagar.", "dim")),
-        border_style="green", padding=(0, 2)))
+    trim_off = docker_trim_off()   # o mesmo critério do cabeçalho: o Docker não devolve o espaço ao macOS
+    freed = [i for i in cleanable if not (trim_off and i.cat == "docker")]
+    safe = sum(i.size for i in freed if i.risk is SAFE)
+    redown = sum(i.size for i in freed if i.risk is REDOWN)
+    line = Text.assemble("Dá pra liberar  ", (f"🟢 {fmt(safe)} sem risco", "bold green"), "  ·  ",
+                         (f"🟡 {fmt(redown)} que baixam de novo", "bold yellow"))
+    if trim_off:
+        line.append(f"  ({TRIM_OFF_NOTE})", style="yellow")
+    line.append_text(Text.assemble("\n", ("Rode ", "dim"), ("hogs --clean", "bold cyan"),
+                                   (" pra escolher o que apagar.", "dim")))
+    con.print(Panel(line, border_style="green", padding=(0, 2)))
 
 
 # ---------------------------------------------------------------- limpeza
