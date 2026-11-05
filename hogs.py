@@ -319,6 +319,7 @@ def gather_docker() -> Docker:
             "repo": repo, "tag": tag, "id": image_id, "name": name, "ref": ref,
             "size": parse_size(img.get("UniqueSize", "")), "used": used,
             "origin": image_origin(repo), "created": img.get("CreatedSince", ""),
+            "created_at": parse_created_at(img.get("CreatedAt", "")),
         })
     # Com o containerd, a soma dos UniqueSize passa do total real (camadas contadas em dobro).
     # Escala cada grupo pra bater com os totais do `docker system df`.
@@ -439,6 +440,63 @@ def trim_builders(max_gb: float) -> list[tuple[str, int, str]]:
     return done
 
 
+def parse_created_at(text: str) -> float | None:
+    """`CreatedAt` do docker ("2026-11-04 20:04:12 -0300 -03") em epoch; ilegível vira None."""
+    try:
+        return datetime.strptime(" ".join(text.split()[:3]), "%Y-%m-%d %H:%M:%S %z").timestamp()
+    except ValueError:
+        return None
+
+
+def rollback_base(tag: str, words: list[str]) -> str | None:
+    """Tag de ponto de volta: "<w>-..." volta para "latest"; "<base>-<w>-..." volta para "<base>"."""
+    parts = tag.lower().split("-")
+    ws = {w.lower() for w in words}
+    if len(parts) > 1 and parts[0] in ws:
+        return "latest"
+    for i in range(1, len(parts) - 1):
+        if parts[i] in ws:
+            return tag[:len("-".join(parts[:i]))]
+    return None
+
+
+def tag_date(tag: str) -> float | None:
+    """Data embutida no nome da tag (AAAAMMDD-HHMM ou AAAAMMDD), em hora local."""
+    m = re.search(r"(?<!\d)(\d{8})(?:-(\d{4}))?(?!\d)", tag)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1) + (m.group(2) or "0000"), "%Y%m%d%H%M")
+        return time.mktime(dt.timetuple())
+    except (ValueError, OverflowError):
+        return None
+
+
+SEEN_TAGS = DATA_DIR / "seen_tags.json"
+
+
+def first_seen(refs: list[str], now: float) -> dict[str, float]:
+    """Quando o hogs viu cada tag pela primeira vez (o Docker não guarda a data da tag)."""
+    old = read_json(SEEN_TAGS)
+    seen: dict[str, float] = {}
+    for ref in refs:
+        t = old.get(ref)
+        ok = isinstance(t, (int, float)) and not isinstance(t, bool) and t <= now
+        seen[ref] = float(t) if ok else now
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SEEN_TAGS.write_text(json.dumps(seen, indent=2))
+    except OSError:
+        pass
+    return seen
+
+
+def rollback_age_days(img: dict, current: dict, seen: float, now: float) -> float:
+    """Idade pelo sinal mais recente: data no nome da tag, criação da imagem atual ou primeira vez vista."""
+    signals = [t for t in (tag_date(img["tag"]), current.get("created_at"), seen) if t is not None]
+    return (now - max(signals)) / 86400
+
+
 def is_old_stopped(c: dict) -> bool:
     """Parado há +30 dias, idade conhecida e sem projeto rodando: vai para o grupo 🟢."""
     return c["age"] is not None and c["age"] >= OLD_CONTAINER_DAYS and not c["project_running"]
@@ -488,9 +546,36 @@ def docker_clean_items(d: Docker) -> list[Item]:
         items.append(Item("docker", f"Docker: container {c['name']}", c["size"], stopped_risk(c),
                           lambda n=c["name"]: run_all([["docker", "rm", n]]), why))
 
+    words = setting("rollback_tags")
+    by_ref = {i["name"]: i for i in d.images}
+    rollbacks: list[tuple[dict, dict]] = []
+    for img in d.images:
+        if img["used"] or img["origin"] == "none" or img.get("tag", "<none>") == "<none>":
+            continue
+        base = rollback_base(img["tag"], words)
+        current = by_ref.get(f"{img['repo']}:{base}") if base else None
+        if current is not None and current is not img:
+            rollbacks.append((img, current))
+    rollback_ids = {id(i) for i, _ in rollbacks}
+    if rollbacks:
+        now = time.time()
+        seen = first_seen([i["name"] for i, _ in rollbacks], now)
+        days = setting("rollback_days")
+        for img, current in sorted(rollbacks, key=lambda p: -p[0]["size"]):
+            age = rollback_age_days(img, current, seen[img["name"]], now)
+            old = age > days
+            hint = (f"ponto de volta há {int(age)} dias" if old
+                    else "ponto de volta recente: o QA pode estar em andamento")
+            same = bool(img["id"]) and img["id"] == current["id"]
+            if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
+                hint = "mesma imagem da atual: só remove a tag"
+            items.append(Item("docker", f"Ponto de volta {img['name']}", 0 if same else img["size"],
+                              SAFE if old else EVAL,
+                              lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]), hint))
+
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):
-        if img["used"] or img["origin"] == "none":
+        if img["used"] or img["origin"] == "none" or id(img) in rollback_ids:
             continue
         local = img["origin"] == "local"
         if not local and img["size"] < 500e6:
