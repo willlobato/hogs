@@ -68,6 +68,51 @@ class ImageOriginTest(unittest.TestCase):
         self.assertEqual(hogs.image_origin("my-local-build"), "local")
 
 
+class PersonalTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.old = time.time() - 400 * 86400
+
+    def file(self, rel, blocks):
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+        os.utime(p, (self.old, self.old))
+        return p, blocks
+
+    def test_only_big_old_allocated_files_outside_packages_repos_and_mounts(self):
+        files = dict([self.file("video.mov", 2_000_000), self.file("nuvem.zip", 0),
+                      self.file("Fotos.photoslibrary/db", 2_000_000), self.file("proj/.git/HEAD", 1),
+                      self.file("proj/dump.bak", 2_000_000), self.file("db/data.mdf", 2_000_000),
+                      self.file("novo.iso", 2_000_000)])
+        os.utime(self.root / "novo.iso", None)
+        real_stat = Path.lstat
+        def lstat(p):
+            st = real_stat(p)
+            if p in files:
+                return mock.Mock(st_blocks=files[p], st_mtime=st.st_mtime, st_mode=st.st_mode)
+            return st
+        with mock.patch.object(hogs.Path, "lstat", lstat), \
+                mock.patch.object(hogs, "spotlight_last_used", return_value=None):
+            found = hogs.stale_personal([self.root], [self.root / "db"], time.time())
+        self.assertEqual([p.name for p, _, _ in found], ["video.mov"])
+        self.assertEqual(found[0][1], 2_000_000 * 512)
+
+    def test_trash_passes_path_as_argument_never_inside_script(self):
+        calls = []
+        ok = lambda cmd, timeout=60: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")
+        weird = Path('/tmp/a "b" ção.mov')
+        with mock.patch.object(hogs, "sh", ok):
+            hogs.move_to_trash(weird)
+        self.assertEqual(calls[0][-1], str(weird))
+        self.assertTrue(all(str(weird) not in part for part in calls[0][:-1]))
+
+    def test_personal_items_are_eval_never_safe(self):
+        items = hogs.personal_items([(Path("/tmp/x.mov"), 2e9, time.time() - 200 * 86400)], time.time())
+        self.assertIs(items[0].risk, hogs.EVAL)
+        self.assertIn("Lixeira", items[0].hint)
+
+
 class SelectionTest(unittest.TestCase):
     def setUp(self):
         risks = [hogs.SAFE, hogs.SAFE, hogs.REDOWN, hogs.LOSS, hogs.REDOWN]

@@ -117,6 +117,7 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - Se um comando de limpeza falha, o item aparece como mantido, com a mensagem de erro, e não como apagado.
 - 🛡️ Imagens construídas localmente aparecem uma por uma, nunca em grupo.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
+- 🛡️ Arquivo pessoal só vai para a Lixeira, nunca é apagado direto.
 - Nada é apagado sem você confirmar.
 
 ## Worktrees Git

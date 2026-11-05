@@ -19,6 +19,7 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
 - Cleanup actions raise on failure (`require`/`run_all`), so `clean()` reports ↷ instead of ✔.
 - A stopped container whose compose project still has something running stays out of the 🟢 group.
 - Every deletion goes through the selection + `Confirm` flow.
+- Personal files are only moved to the Trash (Finder, path via `argv`), never deleted; they are always 🟡 `EVAL`, never in `a`; size is allocated blocks (iCloud dataless files never count).
 - Worktree deletion uses `git worktree remove` without force and preserves branches. Recheck HEAD,
   branch, merge, activity, ignored/untracked files, process/container usage immediately
   before removal. Unknown checks, non-regenerable ignored files (anything outside `REGENERABLE`), main
