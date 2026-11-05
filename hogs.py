@@ -295,6 +295,7 @@ class Docker:
     mounts: list[Path] = field(default_factory=list)   # origens de bind mount de qualquer container
     mounts_ok: bool = False                            # True só se o inspect respondeu
     live: list[str] = field(default_factory=list)      # containers rodando (nomes)
+    released: set[str] = field(default_factory=set)    # imagens atuais cujo commit já está na main de um clone local
 
 
 def list_builders() -> list[dict]:
@@ -347,6 +348,26 @@ def bind_volume_folders(names: list[str]) -> list[Path]:
     return folders
 
 
+def image_labels(ids: list[str]) -> dict[str, dict[str, str]]:
+    """Etiquetas de cada imagem pelo ID curto, numa só chamada de leitura; qualquer falha devolve {}."""
+    if not ids:
+        return {}
+    r = sh(["docker", "image", "inspect", "--format", "{{.Id}}\t{{json .Config.Labels}}"] + sorted(set(ids)))
+    out: dict[str, dict[str, str]] = {}
+    if not r or r.returncode != 0:
+        return out
+    for line in r.stdout.splitlines():
+        image_id, _, raw = line.partition("\t")
+        try:
+            found = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(found, dict):
+            out[image_id.removeprefix("sha256:")[:12]] = {
+                k: v for k, v in found.items() if isinstance(k, str) and isinstance(v, str)}
+    return out
+
+
 def gather_docker() -> Docker:
     d = Docker()
     try:
@@ -394,6 +415,9 @@ def gather_docker() -> Docker:
             "origin": image_origin(repo), "created": img.get("CreatedSince", ""),
             "created_at": parse_epoch(img.get("CreatedAt", "")),
         })
+    labels = image_labels([i["id"] for i in d.images if i["tag"] != "<none>" and i["id"]])
+    for i in d.images:
+        i["labels"] = labels.get(i["id"], {})
     # Com o containerd, a soma dos UniqueSize passa do total real (camadas contadas em dobro).
     # Escala cada grupo pra bater com os totais do `docker system df`.
     for used, target in ((False, images_reclaimable), (True, images_total - images_reclaimable)):
@@ -596,6 +620,56 @@ def image_ref(img: dict) -> str:
     return img.get("ref") or img["name"]
 
 
+OCI_REVISION = "org.opencontainers.image.revision"
+OCI_SOURCE = "org.opencontainers.image.source"
+
+
+def normalize_remote(url: str) -> str:
+    """'git@host:Org/Repo.git', 'https://host/org/repo/' e 'ssh://git@host:22/org/repo.git' -> 'host/org/repo'."""
+    u = url.strip()
+    if "://" in u:
+        host, _, rest = u.split("://", 1)[1].partition("/")
+        host = host.rsplit("@", 1)[-1].split(":", 1)[0]
+    else:   # forma scp: [user@]host:org/repo
+        host, _, rest = u.rsplit("@", 1)[-1].partition(":")
+    rest = rest.strip("/")
+    if rest.endswith(".git"):
+        rest = rest[:-4]
+    return f"{host}/{rest}".lower().rstrip("/")
+
+
+def repo_remotes(path: Path) -> set[str]:
+    r = git_at(path, "config", "--get-regexp", r"^remote\..*\.url$")
+    if r is None or r.returncode != 0:
+        return set()
+    return {normalize_remote(line.split(None, 1)[1]) for line in r.stdout.splitlines() if " " in line}
+
+
+def released_images(d: Docker, repos: list[Path]) -> set[str]:
+    """Imagens atuais cujo commit (etiqueta OCI) já está na branch padrão de um clone local cujo remoto bate
+    com a etiqueta de origem. Só leitura e sem rede; qualquer dúvida deixa a imagem de fora."""
+    candidates: dict[str, tuple[str, str]] = {}
+    for _, current in rollback_pairs(d):
+        labels = current.get("labels") or {}
+        rev, source = labels.get(OCI_REVISION, ""), labels.get(OCI_SOURCE, "")
+        if source and re.fullmatch(r"[0-9a-f]{7,64}", rev):
+            candidates[current["name"]] = (rev, normalize_remote(source))
+    if not candidates or not repos:
+        return set()
+    remotes = {repo: repo_remotes(repo) for repo in repos}
+    out: set[str] = set()
+    for name, (rev, source) in candidates.items():
+        for repo, urls in remotes.items():
+            if source not in urls:
+                continue
+            branch = default_branch(repo)
+            r = git_at(repo, "merge-base", "--is-ancestor", rev, branch) if branch else None
+            if r is not None and r.returncode == 0:
+                out.add(name)
+                break
+    return out
+
+
 def rollback_pairs(d: Docker) -> list[tuple[dict, dict]]:
     """(ponto de volta, imagem atual da mesma origem); sem a imagem atual, não é ponto de volta."""
     words = setting("rollback_tags")
@@ -638,7 +712,12 @@ def rollback_info(d: Docker) -> dict[int, Rollback]:
         same = bool(img["id"]) and img["id"] == current["id"]
         if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
             hint = "mesma imagem da atual: só remove a tag"
-        out[id(img)] = Rollback(img, 0 if same else img["size"], SAFE if old else EVAL, hint)
+        risk = SAFE if old else EVAL
+        if current["name"] in d.released:   # o commit da imagem atual já está na main: voltar não perde nada
+            risk, hint = SAFE, f"o commit da {current['name']} já está na main"
+            if same:
+                hint = "mesma imagem da atual: só remove a tag"
+        out[id(img)] = Rollback(img, 0 if same else img["size"], risk, hint)
     return out
 
 
