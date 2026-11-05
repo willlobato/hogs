@@ -22,13 +22,13 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
 - Every deletion goes through the selection + `Confirm` flow.
 - Personal files are only moved to the Trash (Finder, path via `argv`), never deleted; they are always 🟡 `EVAL`, never in `a`; size is allocated blocks (iCloud dataless files never count).
 - Worktree deletion uses `git worktree remove` without force and preserves branches. Recheck HEAD,
-  branch, merge, activity, ignored/untracked files, process/container usage immediately
-  before removal. Unknown checks, non-regenerable ignored files (anything outside `REGENERABLE`), main
-  checkouts, detached/locked worktrees and submodules block deletion.
+  branch, merge, activity, ignored/untracked files, process/container usage, pushed state and linked
+  Claude Code conversations immediately before removal. Unknown checks, non-regenerable ignored files
+  (anything outside `REGENERABLE`), main checkouts, detached/locked worktrees and submodules block deletion.
 - An unmerged worktree is 🟢 only when untouched for `stale_worktree_days`, HEAD contained in a local
   remote-tracking ref (never fetched), clean, no protected ignored files, nothing running, no live Claude
   Code session citing it and no linked Claude Code conversation within the window. Unpushed commits keep
-  it ⚪ at any age; conversations unreadable → ⚪. Merged worktrees ignore conversations.
+  it ⚪ at any age; conversations unreadable or not checked → ⚪. Merged worktrees ignore conversations.
 - Anything running inside a worktree right now (lsof process or cwd, container mount, a Claude Code
   session opened inside it) blocks deletion. Agent sessions that only worked on it (live Claude Code
   transcripts, recent Codex) are shown by name but do not block: the author decided merged + clean is
