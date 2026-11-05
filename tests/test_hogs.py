@@ -16,6 +16,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import hogs  # noqa: E402
 
 
+def setUpModule():
+    tmp = Path(tempfile.mkdtemp())
+    for name, value in (("DATA_DIR", tmp), ("CONFIG", tmp / "config.json"), ("SEEN_TAGS", tmp / "seen_tags.json"),
+                        ("MOUNTS_FILE", tmp / "mounts.json"), ("CONVERSATIONS_CACHE", tmp / "conversations.json"),
+                        ("STATE", tmp / "state.json"), ("HISTORY", tmp / "history.jsonl"), ("HOME", tmp / "home")):
+        if hasattr(hogs, name):
+            p = mock.patch.object(hogs, name, value)
+            p.start()
+            unittest.addModuleCleanup(p.stop)
+
+
 class SettingTest(unittest.TestCase):
     def test_defaults_and_valid_overrides(self):
         with mock.patch.object(hogs, "load_config", return_value={}):
@@ -1157,6 +1168,142 @@ class ProcessRunningTest(unittest.TestCase):
     def test_closed_app_is_not_running(self):
         procs = [("Navegador2", "/Applications/N2.app/Contents/MacOS/Navegador2"), ("bash", "bash -c Navegador")]
         self.assertFalse(self.running("Navegador", procs))
+
+
+class ConversationTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name).resolve()
+        self.scope, self.projects, self.cache = base / "dev", base / "projects", base / "conv.json"
+        self.wt = self.scope / "shop-api" / "feature with spaces"
+
+    def rec(self, kind, cwd="/x", branch="", ts="2026-10-01T10:00:00.000Z", content="oi"):
+        return json.dumps({"type": kind, "cwd": cwd, "gitBranch": branch, "timestamp": ts,
+                           "message": {"content": content}}, ensure_ascii=False)
+
+    def title(self, text):
+        return json.dumps({"type": "ai-title", "aiTitle": text})
+
+    def write(self, rel, *lines, end="\n"):
+        p = self.projects / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + end)
+        return p
+
+    def scan(self, scope=None, live=()):
+        with mock.patch.object(hogs, "live_claude_sessions", return_value=([{"sessionId": s} for s in live], "")):
+            return hogs.claude_conversations(scope or self.scope, self.projects, self.cache)
+
+    def test_title_last_start_branches_and_subagents(self):
+        self.write("-dev/s1.jsonl", self.rec("user", str(self.wt), "feat/checkout"), self.title("Primeiro"),
+                   self.rec("assistant", str(self.scope / "shop-api"), "main", "2026-10-02T09:00:00.000Z", []),
+                   self.title("Checkout em duas etapas"))
+        self.write("-dev/s1/subagents/a.jsonl", self.rec("assistant", str(self.scope / "api"), "x",
+                                                          "2026-10-03T08:00:00.000Z", []))
+        convs, err = self.scan(live=["s1"])
+        self.assertEqual(err, "")
+        [c] = convs
+        self.assertEqual((c.session, c.title, c.start, c.live), ("s1", "Checkout em duas etapas", str(self.wt), True))
+        self.assertEqual(c.last, datetime(2026, 10, 3, 8, tzinfo=timezone.utc).timestamp())
+        self.assertIn((str(self.wt), "feat/checkout"), c.branches)
+        self.assertIn(str(self.scope / "api"), c.cwds)
+
+    def test_mentions_only_from_work_under_scope_keep_spaces_and_accents(self):
+        cmd = [{"type": "tool_use", "input": {"command": f"git -C '{self.wt}' status && ls {self.scope}/api/src"}}]
+        out = [{"type": "tool_result", "content": f"{self.scope}/saida-de-comando"}]
+        self.write("-dev/s1.jsonl", self.rec("assistant", content=cmd), self.rec("user", content=out),
+                   self.rec("user", content=f"veja {self.scope}/shop-api/ção/nota.txt."))
+        [c] = self.scan()[0]
+        self.assertIn("shop-api/feature with spaces", c.mentions)
+        self.assertIn("api/src", c.mentions)
+        self.assertIn("shop-api/ção/nota.txt", c.mentions)
+        self.assertFalse([m for m in c.mentions if m.startswith("saida")])
+
+    def test_reads_only_appended_complete_lines(self):
+        p = self.write("-dev/s1.jsonl", self.title("Antigo"))
+        self.scan()
+        first = p.read_bytes()
+        p.write_bytes(b"x" * (len(first) - 32) + first[-32:])   # mesmo inode, tamanho e fim: não deve ser relido
+        late = self.rec("user", ts="2026-10-05T10:00:00.000Z")
+        with p.open("a") as f:
+            f.write(late[:30])                                  # meia linha
+        self.assertEqual(self.scan()[0][0].title, "Antigo")
+        with p.open("a") as f:
+            f.write(late[30:] + "\n")
+        [c] = self.scan()[0]
+        self.assertEqual(c.title, "Antigo")
+        self.assertEqual(c.last, datetime(2026, 10, 5, 10, tzinfo=timezone.utc).timestamp())
+        p.write_bytes(b"x" * (p.stat().st_size - 1) + b"\n")   # mesmo inode e tamanho, fim diferente: relido
+        self.assertEqual(self.scan()[0][0].title, "")
+
+    def test_corrupt_cache_other_scope_or_rewritten_file_rescans(self):
+        p = self.write("-dev/s1.jsonl", self.title("A" * 50))
+        self.scan()
+        self.cache.write_text("{lixo")
+        self.assertEqual(self.scan()[0][0].title, "A" * 50)
+        data = json.loads(self.cache.read_text())
+        data["files"][str(p)]["cwds"] = 5                          # JSON válido, entrada fora do formato
+        self.cache.write_text(json.dumps(data))
+        self.assertEqual(self.scan()[0][0].title, "A" * 50)
+        p.write_text(self.title("B") + "\n")                       # menor, mesmo inode
+        self.assertEqual(self.scan()[0][0].title, "B")
+        p.write_text(self.rec("user", content=f"{self.wt}/a") + "\n" + self.title("C" * 80) + "\n")  # maior, mesmo inode
+        self.assertEqual(self.scan()[0][0].title, "C" * 80)
+        self.assertIn("feature with spaces/a", self.scan(self.scope / "shop-api")[0][0].mentions)
+
+    def test_missing_dir_is_empty_and_unreadable_file_is_an_error(self):
+        self.assertEqual(self.scan(), ([], ""))
+        p = self.write("-dev/s1.jsonl", self.title("x"))
+        p.chmod(0)
+        self.addCleanup(p.chmod, 0o644)
+        convs, err = self.scan()
+        self.assertEqual(convs, [])
+        self.assertIn("conversas do Claude Code", err)
+
+    def test_every_mention_on_a_line_counts(self):
+        s = self.scope
+        self.assertEqual(hogs.mention_tails(f"ls {s}/a {s}/b".encode(), s), {"a", "b"})
+        self.assertEqual(hogs.mention_tails(f"cp {s}/shop/a.txt {s}/api/b.txt".encode(), s),
+                         {"shop/a.txt", "api/b.txt"})
+
+    def fake_sessions(self, *files):
+        home = self.projects.parent / "home"
+        sessions = home / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        for name, text in files:
+            (sessions / name).write_text(text)
+        p = mock.patch.object(hogs, "HOME", home)
+        p.start()
+        self.addCleanup(p.stop)
+        return sessions
+
+    def test_unreadable_session_record_is_reported_and_conversations_are_kept(self):
+        self.write("-dev/s1.jsonl", self.title("x"))
+        self.fake_sessions(("a.json", "[1]"))
+        self.assertIn("ilegível", hogs.live_claude_sessions()[1])
+        convs, err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual([c.session for c in convs], ["s1"])
+        self.assertIn("sessões abertas do Claude Code", err)
+        with mock.patch.object(hogs, "live_claude_sessions", return_value=([], "registro ilegível: b.json")):
+            convs, err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual(len(convs), 1)
+        self.assertIn("b.json", err)
+
+    def test_session_record_that_vanished_is_not_live(self):
+        sessions = self.fake_sessions(("ok.json", '{"pid": %d, "sessionId": "s1"}' % os.getpid()))
+        (sessions / "gone.json").symlink_to(sessions / "nao-existe.json")   # listado, some na leitura
+        found, err = hogs.live_claude_sessions()
+        self.assertEqual(([d["sessionId"] for d in found], err), (["s1"], ""))
+        self.write("-dev/s1.jsonl", self.title("x"))
+        [c], err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual((c.live, err), (True, ""))
+
+    def test_resume_command_quotes_the_folder(self):
+        c = hogs.Conversation("s1", start="/dev/feature with spaces")
+        self.assertEqual(hogs.resume_command(c), "cd '/dev/feature with spaces' && claude --resume s1")
+        self.assertEqual(hogs.resume_command(hogs.Conversation("s2")), "claude --resume s2")
 
 
 class WorktreeTest(unittest.TestCase):
