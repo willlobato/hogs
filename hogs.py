@@ -2862,7 +2862,7 @@ def trim_trapped(cat: str, trim_off: bool) -> bool:
 
 
 def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item] | None = None,
-           trim_off: bool | None = None) -> Panel:
+           trim_off: bool | None = None, compact: bool = False) -> Panel:
     used = s.total - s.free
     segs = breakdown(s)
     if cleanable is None:
@@ -2887,11 +2887,11 @@ def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item]
                          (f"{fmt(recommended)} livres", "bold green"))
     if trim_off:
         line.append(f" ({TRIM_OFF_NOTE})", style="yellow")
-    body = [line, Text(), bar, legend]
+    body = [line, bar, legend] if compact else [line, Text(), bar, legend]
     if records and (t := trend(s, records, time.time())) is not None:
         body += [Text(), t]
     return Panel(Group(*body), title="[bold]🐷 hogs[/]  [dim]quem está comendo seu disco[/]",
-                 title_align="left", border_style="grey50", padding=(1, 2))
+                 title_align="left", border_style="grey50", padding=(0, 1) if compact else (1, 2))
 
 
 def growth_table(s: Snapshot, records: list[dict]) -> Table | Text:
@@ -3699,6 +3699,123 @@ def stack(width: int, height: int, parts: list, color_system: str | None = None,
 
 
 # ---------------------------------------------------------------- tela: abas Recomendado e Disco
+
+REC_COLUMNS = [Column("O quê", ratio=4), Column("Libera", "right"), Column("Risco"), Column("Por quê", ratio=3)]
+DISK_COLUMNS = [Column("O quê", ratio=4), Column("Tamanho", "right"), Column("Risco"), Column("Detalhe", ratio=3)]
+
+
+def run_guards(items: list[Item]) -> dict[str, str | None]:
+    """Roda a guarda de cada item que tem uma, uma vez só (ela pode chamar pgrep)."""
+    return {item_key(i): i.guard() for i in items if i.guard}
+
+
+def item_row(i: Item, guards: dict[str, str | None]) -> Row:
+    guard = guards.get(item_key(i))
+    resume = None
+    if i.worktree and i.worktree.conversations:
+        resume = max(i.worktree.conversations, key=lambda link: link.conv.last).conv
+    return Row(item_key(i), [i.label, fmt(i.size), i.risk.icon, Text(guard, style="yellow") if guard else i.hint],
+               i, detail=item_detail(i, guard), title=i.label, path=i.path, resume=resume, group=f"disk/{i.cat}")
+
+
+def _group_row(key: str, title: str, total_cell: str, risk: str, note: str, kids: list[Row], detail: list,
+               limit: int = 0) -> Row:
+    return Row(key, [title, total_cell, risk, note], children=kids, limit=limit, kind="group", title=title,
+               detail=detail)
+
+
+def recommended_tree(s: Snapshot, items: list[Item], trim_off: bool,
+                     guards: dict[str, str | None]) -> tuple[list[Column], list[Row]]:
+    safe: dict[str, list[Item]] = {}
+    for i in items:
+        if i.risk is SAFE and i.action is not None:
+            safe.setdefault(i.cat, []).append(i)
+    groups: list[tuple[int, Row]] = []
+    for cat, group in safe.items():
+        group = sorted(group, key=lambda i: -i.size)
+        total = sum(i.size for i in group)
+        trapped = trim_trapped(cat, trim_off)
+        title = f"🌳 Worktrees que podem sair ({len(group)})" if cat == "worktree" else CAT_TITLES[cat]
+        detail = [Text(title, style="bold"),
+                  Text(f"{plural(len(group), 'item', 'itens')} · {fmt(total)}")]
+        if cat == "worktree":
+            detail.append(Text("a pasta sai, a branch fica"))
+        if trapped:
+            detail.append(Text(TRIM_OFF_NOTE, style="yellow"))
+        groups.append((total, _group_row(f"rec/{cat}", title, "—" if trapped else fmt(total), "🟢",
+                                         TRIM_OFF_NOTE if trapped else "",
+                                         [item_row(i, guards) for i in group], detail,
+                                         limit=5 if cat == "worktree" else 0)))
+    rows = [r for _, r in sorted(groups, key=lambda g: -g[0])]
+    for n, (label, size, how) in enumerate(s.advice):
+        rows.append(Row(f"rec/advice/{n}", [f"💻 {label}", f"~{fmt(size)}" if size else "",
+                                            Text("↻", style="cyan"), how],
+                        kind="advice", how=how, title=label,
+                        detail=[label, how, "o hogs nunca reinicia nem atualiza o Mac"]))
+    for kind, key, title, note in (("pessoal", "rec/eval/pessoal", "🗂  Arquivos parados para avaliar", "vão para a Lixeira"),
+                                   ("ponto_de_volta", "rec/eval/ponto_de_volta", "🐳 Pontos de volta recentes",
+                                    RECENT_ROLLBACK)):
+        group = sorted((i for i in items if i.risk is EVAL and i.kind == kind), key=lambda i: -i.size)
+        if group:
+            total = sum(i.size for i in group)
+            label = f"{title} ({len(group)})"
+            rows.append(_group_row(key, label, fmt(total), "🟡", note, [item_row(i, guards) for i in group],
+                                   [Text(label, style="bold"),
+                                    Text(f"{plural(len(group), 'item', 'itens')} · {fmt(total)}"), Text(note)]))
+    if not s.mounts_known:
+        rows.append(Row("rec/note/mounts",
+                        [Text("Docker não respondeu: não sei quais pastas os containers usam, "
+                              "então não sugiro arquivos.", style="yellow")], kind="info"))
+    return REC_COLUMNS, rows
+
+
+def _info_row(key: str, cells: list) -> Row:
+    return Row(key, cells, kind="info", title=str(cells[0]), detail=[str(c) for c in cells if str(c)])
+
+
+def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
+              guards: dict[str, str | None]) -> tuple[list[Column], list[Row]]:
+    blocks = [("docker", CAT_TITLES["docker"]), ("dev", CAT_TITLES["dev"]), ("apps", CAT_TITLES["apps"]),
+              ("worktree", CAT_TITLES["worktree"]), ("system", "💻 macOS e swap"), ("others", "🔎 Outros grandes")]
+    rows: list[Row] = []
+    for cat, title in blocks:
+        kids = [item_row(i, guards) for i in sorted(items, key=lambda i: -i.size) if i.cat == cat]
+        total = sum(c.item.size for c in kids)
+        infos = [i for i in s.items if i.cat == cat and i.action is None and i.size >= MIN_SHOW]
+        for i in sorted(infos, key=lambda i: -i.size):
+            kids.append(_info_row(f"disk/info/{cat}/{i.label}", [i.label, fmt(i.size), "⚪", i.hint]))
+            total += i.size
+        if cat == "system":
+            si = s.system
+            if si:
+                if si.swap_used:
+                    kids.append(_info_row("disk/system/swap", ["Swap em uso", fmt(si.swap_used), "⚪", ""]))
+                for role, size in sorted(si.volumes.items(), key=lambda kv: -kv[1]):
+                    kids.append(_info_row(f"disk/system/apfs/{role}", [f"Volume APFS: {role}", fmt(size), "⚪", ""]))
+                if si.uptime_days is not None:
+                    kids.append(_info_row("disk/system/uptime", ["Tempo ligado", "", "⚪",
+                                                                  f"{int(si.uptime_days)} dias"]))
+            for n, (label, size, how) in enumerate(s.advice):
+                kids.append(Row(f"disk/advice/{n}", [f"💻 {label}", f"~{fmt(size)}" if size else "",
+                                                     Text("↻", style="cyan"), how],
+                                kind="advice", how=how, title=label,
+                                detail=[label, how, "o hogs nunca reinicia nem atualiza o Mac"]))
+        if cat == "others":
+            for label, size in s.others:
+                if size >= GB:
+                    kids.append(_info_row(f"disk/others/{label}", [label, fmt(size), "⚪", ""]))
+                    total += size
+        if kids:
+            count = plural(len(kids), "item", "itens")
+            if cat == "system":      # swap e volumes se sobrepõem: não há soma honesta
+                size_cell, note = Text("—", style="dim"), count
+                head = Text(count)
+            else:
+                size_cell, note = fmt(total), Text(TRIM_OFF_NOTE, style="yellow") if trim_trapped(cat, trim_off) else count
+                head = Text(f"{fmt(total)} · {count}")
+            rows.append(_group_row(f"disk/{cat}", title, size_cell, "", note, kids, [Text(title, style="bold"), head]))
+    return DISK_COLUMNS, rows
+
 
 
 # ---------------------------------------------------------------- tela: aba Worktrees

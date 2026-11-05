@@ -2660,6 +2660,96 @@ class RenderTest(unittest.TestCase):
 
 # ---- Task 5
 
+class RecommendedTreeTest(unittest.TestCase):
+    def snap(self, items, advice=(), mounts_known=True):
+        return hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(running=True), [], [], advice=list(advice),
+                             mounts_known=mounts_known)
+
+    def items(self):
+        act = lambda: None
+        return [hogs.Item("docker", "Docker: cache de build", 40e9, hogs.SAFE, act, "próximo build fica mais lento"),
+                hogs.Item("apps", "Cópias antigas do Chrome (3)", 8e9, hogs.SAFE, act, "versões 1, 2",
+                          guard=lambda: "feche o Chrome antes"),
+                hogs.Item("worktree", "shop-api / shop-api/a", 1e9, hogs.SAFE, act, "já na main"),
+                hogs.Item("apps", "Parado: ~/Downloads/video.mov", 16e9, hogs.EVAL, act, "vai para a Lixeira",
+                          kind="pessoal"),
+                hogs.Item("docker", "Imagem acme/api:dev", 3e9, hogs.LOSS, act, "construída aqui"),
+                hogs.Item("dev", "Maven (~/.m2)", 2e9, hogs.REDOWN, act, "baixa no próximo build")]
+
+    def test_order_groups_advice_and_eval(self):
+        items = self.items()
+        cols, rows = hogs.recommended_tree(self.snap(items, [("Reiniciar o Mac", 20e9, "Menu  › Reiniciar")]),
+                                           items, False, hogs.run_guards(items))
+        self.assertEqual(cols, hogs.REC_COLUMNS)
+        self.assertEqual([r.key for r in rows], ["rec/docker", "rec/apps", "rec/worktree", "rec/advice/0",
+                                                 "rec/eval/pessoal"])
+        flat = {r.key for r in rows} | {c.key for r in rows for c in r.children}
+        self.assertNotIn("docker|Imagem acme/api:dev", flat, "🔴 nunca no Recomendado")
+        self.assertNotIn("dev|Maven (~/.m2)", flat, "🟡 baixa de novo só na aba Disco")
+        chrome = rows[1].children[0]
+        self.assertEqual(str(chrome.cells[3]), "feche o Chrome antes")
+        self.assertEqual(rows[3].kind, "advice")
+        self.assertFalse(hogs.checkable(rows[3]))
+        self.assertEqual(rows[2].limit, 5)
+
+    def test_trim_off_shows_dash_and_note(self):
+        items = self.items()
+        _, rows = hogs.recommended_tree(self.snap(items), items, True, {})
+        docker = rows[[r.key for r in rows].index("rec/docker")]
+        self.assertEqual((str(docker.cells[1]), str(docker.cells[3])), ("—", hogs.TRIM_OFF_NOTE))
+
+    def test_empty_and_mounts_unknown(self):
+        self.assertEqual(hogs.recommended_tree(self.snap([]), [], False, {})[1], [])
+        _, rows = hogs.recommended_tree(self.snap([], mounts_known=False), [], False, {})
+        self.assertEqual([r.key for r in rows], ["rec/note/mounts"])
+
+
+class DiskTreeTest(unittest.TestCase):
+    def test_every_risk_by_block_plus_info(self):
+        items = RecommendedTreeTest.items(None)
+        s = hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(running=True),
+                          [hogs.Item("apps", "WhatsApp", 3e9, hogs.INFO, None, "Ajustes › Armazenamento")],
+                          [("~/Projetos-antigos", 5 * hogs.GB), ("~/pequeno", 1e8)])
+        cols, rows = hogs.disk_tree(s, items, False, {})
+        self.assertEqual(cols, hogs.DISK_COLUMNS)
+        by = {r.key: r for r in rows}
+        self.assertEqual(set(by), {"disk/docker", "disk/dev", "disk/apps", "disk/worktree", "disk/others"})
+        self.assertIn("docker|Imagem acme/api:dev", {c.key for c in by["disk/docker"].children})
+        whats = [c for c in by["disk/apps"].children if c.kind == "info"]
+        self.assertEqual([str(c.cells[0]) for c in whats], ["WhatsApp"])
+        self.assertEqual([str(c.cells[0]) for c in by["disk/others"].children], ["~/Projetos-antigos"])
+        self.assertTrue(all(c.group == "disk/docker" for c in by["disk/docker"].children if c.item))
+
+    def test_system_group_and_compact_header(self):
+        si = hogs.SystemInfo({"Data": 100 * hogs.GB}, 6 * hogs.GB, 40.0, False)
+        s = hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(running=True), [], [], system=si,
+                          advice=[("Reiniciar o Mac", 6e9, "Menu  › Reiniciar")])
+        _, rows = hogs.disk_tree(s, [], False, {})
+        self.assertEqual([r.key for r in rows], ["disk/system"])
+        kinds = [c.kind for c in rows[0].children]
+        self.assertEqual(kinds, ["info", "info", "info", "advice"])
+        self.assertEqual(str(rows[0].cells[1]), "—")
+        si.uptime_days = None
+        _, rows2 = hogs.disk_tree(s, [], False, {})
+        self.assertNotIn("disk/system/uptime", [c.key for c in rows2[0].children])
+
+    def test_redown_in_dev_and_trim_note(self):
+        items = RecommendedTreeTest.items(None)
+        s = hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, hogs.Docker(running=True), [], [])
+        _, rows = hogs.disk_tree(s, items, True, {})
+        by = {r.key: r for r in rows}
+        maven = by["disk/dev"].children[0]
+        self.assertEqual((maven.item.risk, maven.group), (hogs.REDOWN, "disk/dev"))
+        self.assertEqual(str(by["disk/docker"].cells[3]), hogs.TRIM_OFF_NOTE)
+        self.assertNotEqual(str(by["disk/dev"].cells[3]), hogs.TRIM_OFF_NOTE)
+        self.assertEqual(hogs.disk_tree(hogs.Snapshot(1, 1, hogs.Docker(), [], []), [], False, {})[1], [])
+        def height(c):
+            con = hogs.Console(width=100, file=io.StringIO())
+            with con.capture() as cap:
+                con.print(hogs.header(s, trim_off=False, compact=c))
+            return len(cap.get().splitlines())
+        self.assertLess(height(True), height(False))
+
 
 # ---- Task 6
 
