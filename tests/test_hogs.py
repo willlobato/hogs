@@ -2506,6 +2506,67 @@ class ListModelTest(unittest.TestCase):
 
 # ---- Task 3
 
+class TuiItemsTest(unittest.TestCase):
+    ROOT = Path("/dev")
+
+    def wt(self, name, merged="", pushed="origin/x", reopen=False, eligible=True):
+        conv = hogs.Conversation("s-1", "Relatório mensal", f"/dev/shop-api/{name}", time.time() - 86400)
+        w = hogs.Worktree(self.ROOT / "shop-api" / name, Path("/dev/shop-api"), "abc", f"refs/heads/feat/{name}",
+                          1_500_000_000, time.time() - 40 * 86400, eligible=eligible, merged=merged, pushed=pushed)
+        w.conversations = [hogs.ConvLink(conv, "dentro", reopen)]
+        w.checks = [(True, "tudo commitado e enviado"), (False, "sem conferir processos")]
+        return w
+
+    def test_one_item_per_safe_worktree(self):
+        rows = [self.wt("a", merged="squash em origin/main"), self.wt("b", reopen=True),
+                self.wt("c", eligible=False)]
+        items = hogs.worktree_items(rows, self.ROOT)
+        self.assertEqual([i.label for i in items], ["shop-api / shop-api/a", "shop-api / shop-api/b"])
+        self.assertTrue(all(i.risk is hogs.SAFE and i.cat == "worktree" for i in items))
+        self.assertEqual(items[0].hint, "já na main (squash em origin/main)")
+        self.assertTrue(items[1].hint.startswith("enviado (origin/x), parado há 40 d"))
+        self.assertTrue(items[1].hint.endswith("⚠ reabra antes de apagar"))
+        with mock.patch.object(hogs, "remove_worktree") as rm:
+            items[1].action()
+        rm.assert_called_once_with(rows[1], 0, self.ROOT)
+
+    def test_tui_items_replace_the_grouped_worktree_item(self):
+        rows = [self.wt("a", merged="squash em origin/main"), self.wt("b")]
+        s = hogs.Snapshot(1, 1, hogs.Docker(), [hogs.worktree_item(rows, self.ROOT)], [], worktrees=rows,
+                          worktrees_root=self.ROOT)
+        labels = [i.label for i in hogs.tui_items(s)]
+        self.assertEqual(labels, ["shop-api / shop-api/a", "shop-api / shop-api/b"])
+
+    def test_apply_items_reports_guard_failure_and_success(self):
+        done, seen = [], []
+        ok = hogs.Item("dev", "npm", 10, hogs.SAFE, lambda: done.append("npm"))
+        guarded = hogs.Item("apps", "Cópias antigas do Chrome (2)", 10, hogs.SAFE, lambda: done.append("x"),
+                            guard=lambda: "feche o Chrome antes")
+        failing = hogs.Item("docker", "Imagem old:t1", 10, hogs.LOSS,
+                            lambda: (_ for _ in ()).throw(RuntimeError("Error: conflict: image is in use")))
+        freed = hogs.apply_items([ok, guarded, failing], lambda i, good, msg: seen.append((i.label, good, msg)))
+        self.assertEqual(done, ["npm"])
+        self.assertEqual(seen, [("npm", True, ""), ("Cópias antigas do Chrome (2)", False, "pulei, feche o Chrome antes"),
+                                ("Imagem old:t1", False, "Error: conflict: image is in use")])
+        self.assertGreaterEqual(freed, 0)
+
+    def test_detail_has_full_text_checks_and_every_conversation(self):
+        w = self.wt("relatorio", reopen=True)
+        w.conversations.append(hogs.ConvLink(hogs.Conversation("s-2", "Antiga", "/x", time.time() - 9 * 86400),
+                                             "citou", False))
+        text = "\n".join(str(t) for t in hogs.worktree_detail(w, self.ROOT))
+        for expected in ("shop-api/relatorio · feat/relatorio", "✓ tudo commitado e enviado",
+                         "✗ sem conferir processos", "a pasta sai, a branch fica", "“Relatório mensal”",
+                         "cd /dev/shop-api/relatorio && claude --resume s-1", "⚠ reabra antes de apagar",
+                         "“Antiga”", "claude --resume s-2"):
+            self.assertIn(expected, text)
+        self.assertLess(text.index("Relatório mensal"), text.index("Antiga"))
+        long = hogs.Item("apps", "Parado: ~/Documents/" + "x" * 200, 10, hogs.EVAL, path=Path("/tmp/x"))
+        lines = "\n".join(str(t) for t in hogs.item_detail(long, "feche o app antes"))
+        self.assertIn("x" * 200, lines)
+        self.assertIn("para avaliar: não volta sozinho", lines)
+        self.assertIn("✗ feche o app antes", lines)
+
 
 # ---- Task 4
 
