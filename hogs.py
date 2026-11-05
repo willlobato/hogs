@@ -1425,8 +1425,12 @@ def gather_sign_clones(root: Path) -> list[CloneGroup]:
             continue
         group = groups.get(app)
         if group is None:
-            installed = str(_plist(APPLICATIONS / f"{app}.app" / "Contents" / "Info.plist")
-                            .get("CFBundleShortVersionString") or "")
+            installed = ""
+            for base in (APPLICATIONS, HOME / "Applications"):
+                installed = str(_plist(base / f"{app}.app" / "Contents" / "Info.plist")
+                                .get("CFBundleShortVersionString") or "")
+                if installed:
+                    break
             group = groups[app] = CloneGroup(app, str(info.get("CFBundleExecutable") or app), installed, {})
         group.by_version.setdefault(version, []).append(clone)
     return list(groups.values())
@@ -1435,6 +1439,8 @@ def gather_sign_clones(root: Path) -> list[CloneGroup]:
 def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
     items = []
     for g in groups:
+        if not g.installed:      # versão instalada desconhecida: na dúvida, não oferece nada
+            continue
         old = {v: paths for v, paths in g.by_version.items() if v != g.installed}
         if not old:
             continue
@@ -1448,7 +1454,7 @@ def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
         def guard(g=g):
             return f"feche o {g.app} antes" if process_running(g.executable) else None
 
-        hint = f"versões {', '.join(sorted(old))}; a instalada é {g.installed or 'nenhuma'}"
+        hint = f"versões {', '.join(sorted(old))}; a instalada é {g.installed}"
         items.append(Item("apps", f"Cópias antigas do {g.app} ({len(copies)})", size, SAFE, action, hint, guard))
     return items
 
