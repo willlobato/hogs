@@ -397,13 +397,20 @@ def known_mounts(d: Docker) -> tuple[list[Path], bool]:
     return [], not shutil.which("docker")
 
 
-def under_mount(path: Path, mounts: list[Path]) -> bool:
-    """`path` dentro de uma pasta montada, ou contendo uma."""
+def under_mount(path: Path, mounts: list[Path], containing: bool = True) -> bool:
+    """`path` dentro de uma pasta montada (ou igual a ela); com `containing`, também se contém uma."""
     try:
         path = path.resolve()
     except (OSError, RuntimeError):
         return True   # na dúvida, protege
-    return any(path == m or m in path.parents or path in m.parents for m in mounts)
+    for m in mounts:
+        try:
+            m = m.resolve()
+        except (OSError, RuntimeError):
+            pass
+        if path == m or m in path.parents or (containing and path in m.parents):
+            return True
+    return False
 
 
 def prune_builder(name: str, max_gb: float | None = None) -> subprocess.CompletedProcess | None:
@@ -1510,7 +1517,8 @@ def sign_clone_items(groups: list[CloneGroup]) -> list[Item]:
 PERSONAL_ROOTS = [HOME / "Desktop", HOME / "Documents", HOME / "Downloads", HOME / "Pictures"]
 STALE_PERSONAL_DAYS = 180
 BIG_FILE = 500e6
-SKIP_PACKAGES = (".photoslibrary", ".musiclibrary", ".app", ".tvlibrary")
+SKIP_PACKAGES = (".photoslibrary", ".musiclibrary", ".app", ".tvlibrary", ".logicx", ".band", ".fcpbundle",
+                 ".imovielibrary", ".vmwarevm", ".pvm", ".utm", ".bundle", ".pkg")
 
 
 def spotlight_last_used(path: Path) -> float | None:
@@ -1530,26 +1538,11 @@ def stale_personal(roots: list[Path], mounts: list[Path], now: float) -> list[tu
     """Arquivos grandes (bytes alocados) sem uso há muito tempo. Não segue links; pasta sem permissão é ignorada."""
     cutoff = now - STALE_PERSONAL_DAYS * 86400
     found: list[tuple[Path, int, float]] = []
-    rmounts = []
-    for m in mounts:
-        try:
-            rmounts.append(m.resolve())
-        except (OSError, RuntimeError):
-            rmounts.append(m)
-
-    def inside_mount(d: Path) -> bool:
-        # só "dentro de": under_mount também casa ancestrais, o que podaria a própria raiz
-        try:
-            d = d.resolve()
-        except (OSError, RuntimeError):
-            return True   # na dúvida, protege
-        return any(d == m or m in d.parents for m in rmounts)
-
     for root in roots:
         for dp, dirs, names in os.walk(root, followlinks=False, onerror=lambda e: None):
             here = Path(dp)
-            if (here.name.endswith(SKIP_PACKAGES) or (here / ".git").exists()
-                    or inside_mount(here)):
+            if (here.name.lower().endswith(SKIP_PACKAGES) or (here / ".git").exists()
+                    or under_mount(here, mounts, containing=False)):
                 dirs[:] = []
                 continue
             for name in names:
@@ -1561,9 +1554,10 @@ def stale_personal(roots: list[Path], mounts: list[Path], now: float) -> list[tu
                 if not stat.S_ISREG(st.st_mode):
                     continue
                 size = st.st_blocks * 512
-                if size < BIG_FILE or st.st_mtime >= cutoff:
+                recent = max(st.st_mtime, getattr(st, "st_birthtime", 0), st.st_ctime)
+                if size < BIG_FILE or recent >= cutoff or under_mount(p, mounts, containing=False):
                     continue
-                last = max(st.st_mtime, spotlight_last_used(p) or 0)
+                last = max(recent, spotlight_last_used(p) or 0)
                 if last < cutoff:
                     found.append((p, size, last))
     return found
