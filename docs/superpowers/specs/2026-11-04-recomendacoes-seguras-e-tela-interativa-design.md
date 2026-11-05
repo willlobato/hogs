@@ -101,7 +101,7 @@ Como a matriz convive com os riscos que já existem (decisão do construtor, con
 ### 🌳 Worktrees
 - **Totalizador no relatório principal**, por exemplo
   `🌳 Worktrees: 122 · 41,0 GB · 84 podem sair (23,5 GB) · 40 em andamento · 12 com alterações`.
-  Os worktrees são procurados em `~/Development` por padrão; o caminho pode ser configurado.
+  Os worktrees são procurados na pasta lembrada do último `--worktrees PASTA` (ver "Genérico por padrão").
 - Vereditos:
 
 | Situação | Veredito |
@@ -260,9 +260,24 @@ Interação híbrida:
 - `hogs --report` força o relatório estático mesmo no terminal.
 - `hogs --clean` continua existindo e abre a tela (é o mesmo que `hogs`); o fluxo numerado de hoje sai.
 - `hogs --worktrees PASTA` abre a tela na aba Worktrees, limitada a PASTA; com `--report`, imprime o quadro.
-  A pasta padrão dos worktrees é `~/Development`, configurável pela chave `worktrees_root` do `config.json`.
+  A pasta fica lembrada em `worktrees_root` no `config.json` para as próximas aberturas.
 - `--alert`, `--docker-gc`, `--apps`, `--version` não mudam.
 - `--no-mouse` desliga o mouse na tela.
+
+## Genérico por padrão (decidido)
+
+O hogs é público. As regras nasceram do fluxo do autor, mas nada pode depender dele:
+
+- **Padrões de tag de ponto de volta** configuráveis (`rollback_tags` no `config.json`). O padrão já cobre nomes
+  comuns em português e inglês, como `antes-*`, `*-antes-*`, `backup-*`, `*-backup-*`, `before-*`, `*-before-*`,
+  `rollback-*` (a lista exata fica ao construtor). Uma tag só conta como ponto de volta se a imagem atual da mesma
+  origem existe.
+- **Prazos configuráveis:** `rollback_days` (padrão 2) e `stale_worktree_days` (padrão 30).
+- **Pasta dos worktrees:** a última passada em `hogs --worktrees PASTA`, lembrada no `config.json`
+  (`worktrees_root`). Sem nenhuma, a aba Worktrees explica como escolher a pasta; não há caminho fixo.
+- **Agentes:** colunas e sinais do Claude Code e do Codex só aparecem se a ferramenta existir na máquina.
+- **Terminal:** mouse, links e cores degradam sem quebrar em terminais que não suportam (o autor usa iTerm2).
+- Exemplos, testes e screenshots usam nomes fictícios.
 
 ## Metas
 
