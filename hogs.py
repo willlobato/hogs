@@ -12,6 +12,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
@@ -3577,6 +3578,124 @@ def item_detail(i: Item, guard_text: str | None = None) -> list[Text]:
 
 
 # ---------------------------------------------------------------- tela: desenho
+
+MIN_W, MIN_H = 60, 20
+LIST_TOP = 3  # borda, cabeçalho e régua: o primeiro item fica 3 linhas abaixo do topo do painel
+MARK_X = 6
+TOO_SMALL = "Janela pequena demais: aumente para pelo menos 60×20."
+
+
+def render_lines(renderable: RenderableType, width: int, color_system: str | None = None) -> list[str]:
+    buf = io.StringIO()
+    console = Console(file=buf, width=width, force_terminal=color_system is not None,
+                      color_system=color_system, legacy_windows=False)
+    console.print(renderable)
+    out = buf.getvalue()
+    if out.endswith("\n"):
+        out = out[:-1]
+    return out.split("\n")
+
+
+def list_panel(title: str, columns: list[Column], vis: list[Visible], state: ListState, marked: set[str],
+               height: int, border: str = "green", empty: str = "") -> Panel:
+    table = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
+    table.add_column("", width=3, no_wrap=True, overflow="ellipsis")
+    for c in columns:
+        table.add_column(c.title, justify=c.justify, ratio=c.ratio, width=c.width,
+                         no_wrap=True, overflow="ellipsis")
+    shown = vis[state.scroll:state.scroll + max(height - 4, 0)]
+    for k, v in enumerate(shown):
+        row = v.row
+        cells = []
+        for j in range(len(columns)):
+            cell = row.cells[j] if j < len(row.cells) else ""
+            if j == 0:
+                arrow = ("▾ " if row.key in state.expanded else "▸ ") if row.kind == "group" else ""
+                prefix = "  " * v.depth + arrow
+                cell = prefix + cell if isinstance(cell, str) else Text(prefix) + cell
+            cells.append(Text(cell) if isinstance(cell, str) else cell)
+        table.add_row(Text(mark_box(row, marked)), *cells,
+                      style="reverse" if state.scroll + k == state.cursor else "")
+    if not vis:
+        table.add_row("", Text(empty, style="grey62"), *[""] * (len(columns) - 1))
+    return Panel(table, title=title, title_align="left", border_style=border, padding=(0, 1), height=height)
+
+
+def detail_panel(title: str, lines: list, width: int, max_height: int) -> Panel:
+    body = Group(*lines)
+    panel = Panel(body, title=title, title_align="left", padding=(0, 1))
+    if len(render_lines(panel, width)) <= max_height:
+        return panel
+    console = Console(file=io.StringIO(), width=width, legacy_windows=False)
+    segs = console.render_lines(body, console.options.update_width(max(width - 4, 1)), pad=False)
+    keep = max(max_height - 3, 0)
+    text = Text()
+    for line in segs[:keep]:
+        for seg in line:
+            text.append(seg.text, seg.style)
+        text.append("\n")
+    text.append(f"… mais {len(segs) - keep} linhas: aumente a janela", style="grey62")
+    return Panel(text, title=title, title_align="left", padding=(0, 1))
+
+
+def tab_bar(names: list[str], active: int) -> tuple[Text, list[tuple[int, int, int]]]:
+    text = Text(" ")
+    ranges: list[tuple[int, int, int]] = []
+    for i, name in enumerate(names):
+        if i:
+            text.append(" │ ")
+        label = f"{i + 1} {name}"
+        x0 = cell_len(text.plain)
+        text.append(label, style="bold reverse" if i == active else "")
+        ranges.append((x0, x0 + cell_len(label), i))
+    return text, ranges
+
+
+class Flex(NamedTuple):
+    name: str
+    build: Callable[[int], RenderableType]
+    first: int
+    count: int
+
+
+class Frame(NamedTuple):
+    lines: list[str]
+    rows: dict[int, tuple[str, int]]
+    tabs: list[tuple[int, int, int]]
+
+
+def _too_small(width: int, height: int) -> Frame:
+    msg = TOO_SMALL
+    while cell_len(msg) > width and msg:
+        msg = msg[:-1]
+    pad = max((width - cell_len(msg)) // 2, 0)
+    lines = [""] * height
+    lines[height // 2] = " " * pad + msg
+    return Frame(lines, {}, [])
+
+
+def stack(width: int, height: int, parts: list, color_system: str | None = None,
+          tabs: list[tuple[int, int, int]] | None = None) -> Frame:
+    rendered: list = []
+    for p in parts:
+        rendered.append(p if isinstance(p, Flex) else render_lines(p, max(width, 1), color_system))
+    others = sum(len(r) for r in rendered if not isinstance(r, Flex))
+    h = height - others
+    if width < MIN_W or height < MIN_H or h < 6:
+        return _too_small(width, height)
+    lines: list[str] = []
+    rows: dict[int, tuple[str, int]] = {}
+    for r in rendered:
+        if isinstance(r, Flex):
+            top = len(lines)
+            lines.extend(render_lines(r.build(h), width, color_system))
+            for k in range(max(min(r.count - r.first, h - 4), 0)):
+                rows[top + LIST_TOP + k] = (r.name, r.first + k)
+        else:
+            lines.extend(r)
+    lines = lines[:height] + [""] * (height - len(lines))
+    return Frame(lines, {y: v for y, v in rows.items() if y < height}, list(tabs or []))
+
 
 
 # ---------------------------------------------------------------- tela: abas Recomendado e Disco
