@@ -1319,6 +1319,22 @@ def scan_candidates(known: set[str]) -> list[Path]:
     return out
 
 
+BIG_CACHE = 500e6
+
+
+def big_cache_paths(sizes: dict[Path, int], mounts: list[Path]) -> list[Path]:
+    """Filhos grandes de ~/Library/Caches fora de pastas montadas, do maior para o menor."""
+    return [p for p, size in sorted(sizes.items(), key=lambda kv: -kv[1])
+            if p.parent == CACHES and size >= BIG_CACHE and not under_mount(p, mounts)]
+
+
+def cache_items(sizes: dict[Path, int], mounts: list[Path]) -> list[Item]:
+    """Caches grandes em ~/Library/Caches que a lista não cobre; o app recria quando precisar."""
+    return [Item("dev", f"Cache: {p.name}", int(sizes[p]), REDOWN, lambda p=p: shutil.rmtree(p),
+                 "cache do app; ele recria quando precisar")
+            for p in big_cache_paths(sizes, mounts)]
+
+
 # ---------------------------------------------------------------- apps menos usados
 
 APP_GLOBS = [Path("/Applications"), HOME / "Applications"]
@@ -1537,8 +1553,15 @@ def gather(con: Console) -> Snapshot:
 
     items = [Item(pd.cat, pd.label, sum(sizes.get(p, 0) for p in pd.paths), pd.risk,
                   make_action(pd), pd.hint, make_guard(pd)) for pd in PATH_DEFS]
+    mounts, mounts_known = known_mounts(docker)
+    shown: set[Path] = set()
+    if mounts_known:
+        cand_sizes = {p: sizes.get(p, 0) for p in candidates}
+        shown = set(big_cache_paths(cand_sizes, mounts))
+        items += cache_items(cand_sizes, mounts)
     # guarda a partir de 100 MB pro histórico; o relatório só mostra os de 1 GB+
-    others = sorted(((short(p), sizes[p]) for p in candidates if sizes.get(p, 0) >= 100e6), key=lambda x: -x[1])
+    others = sorted(((short(p), sizes[p]) for p in candidates if sizes.get(p, 0) >= 100e6 and p not in shown),
+                    key=lambda x: -x[1])
     usage = shutil.disk_usage(DATA_VOLUME)
     return Snapshot(usage.total, usage.free, docker, items, others, apps)
 

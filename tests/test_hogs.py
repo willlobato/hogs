@@ -45,6 +45,42 @@ class ParseSizeTest(unittest.TestCase):
         self.assertEqual(hogs.parse_size("-1.476e+09B"), 0)
 
 
+class ToolCacheTest(unittest.TestCase):
+    def test_only_big_cache_children_outside_mounts(self):
+        c = hogs.CACHES
+        sizes = {c / "ferramenta-x": 2_800_000_000, c / "pequeno": 10_000_000, hogs.HOME / "outra": 9e9,
+                 c / "montado": 3e9}
+        items = hogs.cache_items(sizes, [c / "montado"])
+        self.assertEqual([(i.label, i.risk) for i in items], [("Cache: ferramenta-x", hogs.REDOWN)])
+
+    def _gather(self, mounts, known):
+        import io
+        from unittest import mock
+        from rich.console import Console
+        big = hogs.CACHES / "ferramenta-x"
+        other = hogs.HOME / "pasta-grande"
+        sizes = {big: 2_800_000_000, other: 900_000_000}
+        with mock.patch.object(hogs, "gather_docker", return_value=hogs.Docker()), \
+                mock.patch.object(hogs, "scan_candidates", return_value=[big, other]), \
+                mock.patch.object(hogs, "du", side_effect=lambda p: sizes.get(p, 0)), \
+                mock.patch.object(hogs, "gather_apps", return_value=[]), \
+                mock.patch.object(hogs, "known_mounts", return_value=(mounts, known)), \
+                mock.patch.object(hogs, "under_mount", return_value=False):
+            snap = hogs.gather(Console(file=io.StringIO()))
+        return snap, hogs.short(big)
+
+    def test_gather_mounts_unknown_offers_nothing(self):
+        snap, big = self._gather([], False)
+        self.assertFalse([i for i in snap.items if i.label.startswith("Cache: ")])
+        self.assertIn(big, [n for n, _ in snap.others])
+
+    def test_gather_mounts_known_moves_cache_out_of_others(self):
+        snap, big = self._gather([], True)
+        self.assertEqual([i.label for i in snap.items if i.label.startswith("Cache: ")], ["Cache: ferramenta-x"])
+        self.assertNotIn(big, [n for n, _ in snap.others])
+        self.assertEqual(len(snap.others), 1)
+
+
 class FmtTest(unittest.TestCase):
     def test_uses_decimal_comma(self):
         self.assertEqual(hogs.fmt(12_340_000_000), "12,3 GB")
