@@ -253,6 +253,32 @@ class BuilderTest(unittest.TestCase):
             self.assertEqual(hogs.trim_builders(20), [("multiarch", 0, "ERROR: boom")])
 
 
+class SystemTest(unittest.TestCase):
+    APFS = plistlib.dumps({"Containers": [{"ContainerReference": "disk3", "Volumes": [
+        {"Roles": ["System"], "CapacityInUse": 18_000_000_000}, {"Roles": ["Preboot"], "CapacityInUse": 17_300_000_000},
+        {"Roles": ["Data"], "CapacityInUse": 411_000_000_000}, {"Roles": ["VM"], "CapacityInUse": 15_000_000_000},
+        {"Roles": [], "CapacityInUse": 1}]}, {"ContainerReference": "disk6", "Volumes": [
+        {"Roles": ["Data"], "CapacityInUse": 43_000_000}]}]})
+
+    def test_parse_apfs_only_our_container(self):
+        v = hogs.parse_apfs(self.APFS, "disk3")
+        self.assertEqual(v["Preboot"], 17_300_000_000)
+        self.assertEqual(v["Data"], 411_000_000_000)
+        self.assertNotIn("", v)
+
+    def test_parse_swap_and_boot(self):
+        self.assertEqual(hogs.parse_swap("total = 15360,00M  used = 13799,12M  free = 1560,88M  (encrypted)"),
+                         int(13799.12 * 2**20))
+        self.assertEqual(hogs.parse_swap("total = 2048.00M  used = 0.00M  free = 2048.00M"), 0)
+        self.assertAlmostEqual(hogs.parse_boottime("{ sec = 1000, usec = 0 } Mon", 1000 + 86 * 86400), 86)
+
+    def test_advice_only_when_it_pays_and_never_an_item(self):
+        si = hogs.SystemInfo({"Preboot": 17_300_000_000}, 13_800_000_000, 86, True)
+        labels = [a[0] for a in hogs.system_advice(si)]
+        self.assertEqual(labels, ["Reiniciar o Mac", "Aplicar a atualização do macOS"])
+        self.assertEqual(hogs.system_advice(hogs.SystemInfo({"Preboot": 5e9}, 13_800_000_000, 3, False)), [])
+
+
 class HistoryTest(unittest.TestCase):
     def setUp(self):
         tmp = Path(tempfile.mkdtemp())

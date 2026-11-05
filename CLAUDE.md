@@ -26,6 +26,7 @@ Single-file CLI (`hogs.py`) for macOS; `rich` is the only dependency. Keep it th
   session opened inside it) blocks deletion. Agent sessions that only worked on it (live Claude Code
   transcripts, recent Codex) are shown by name but do not block: the author decided merged + clean is
   enough, since nothing is lost.
+- macOS advice (restart, apply update) is text only: never executed, never an `Item`.
 
 New invariants get a test in `tests/test_hogs.py` (see `DockerCleanItemsTest`).
 
