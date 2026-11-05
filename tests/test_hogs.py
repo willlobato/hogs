@@ -16,6 +16,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import hogs  # noqa: E402
 
 
+def setUpModule():
+    tmp = Path(tempfile.mkdtemp())
+    for name, value in (("DATA_DIR", tmp), ("CONFIG", tmp / "config.json"), ("SEEN_TAGS", tmp / "seen_tags.json"),
+                        ("MOUNTS_FILE", tmp / "mounts.json"), ("CONVERSATIONS_CACHE", tmp / "conversations.json"),
+                        ("STATE", tmp / "state.json"), ("HISTORY", tmp / "history.jsonl"), ("HOME", tmp / "home")):
+        if hasattr(hogs, name):
+            p = mock.patch.object(hogs, name, value)
+            p.start()
+            unittest.addModuleCleanup(p.stop)
+    env = mock.patch.dict(os.environ)          # CLAUDE_CONFIG_DIR real nunca vaza para os testes
+    env.start()
+    unittest.addModuleCleanup(env.stop)
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+
 class SettingTest(unittest.TestCase):
     def test_defaults_and_valid_overrides(self):
         with mock.patch.object(hogs, "load_config", return_value={}):
@@ -70,6 +85,7 @@ class ToolCacheTest(unittest.TestCase):
                 mock.patch.object(hogs, "gather_system", return_value=None), \
                 mock.patch.object(hogs, "sign_clone_root", return_value=None), \
                 mock.patch.object(hogs, "stale_personal", return_value=[]), \
+                mock.patch.object(hogs, "projects_root", return_value=None), \
                 mock.patch.object(hogs, "load_config", return_value={}):
             snap = hogs.gather(Console(file=io.StringIO()))
         return snap, hogs.short(big)
@@ -638,6 +654,114 @@ class MountsTest(unittest.TestCase):
             self.assertEqual(hogs.known_mounts(hogs.Docker()), ([], True))
 
 
+class OciRollbackTest(unittest.TestCase):
+    SRC = "https://github.com/acme/shop-api"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.repo = self.root / "shop-api"
+        self.repo.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(self.repo), *a], check=True, capture_output=True,
+                                      text=True).stdout.strip()
+        self.g = g
+        for args in (("init", "-b", "main"), ("config", "user.name", "T"), ("config", "user.email", "t@example.invalid"),
+                     ("config", "commit.gpgsign", "false"), ("remote", "add", "origin", "git@github.com:Acme/shop-api.git"),
+                     ("commit", "--allow-empty", "-m", "a")):
+            g(*args)
+        self.on_main = g("rev-parse", "HEAD")
+        g("update-ref", "refs/remotes/origin/main", "HEAD")
+        g("commit", "--allow-empty", "-m", "b")
+        self.off_main = g("rev-parse", "HEAD")
+
+    def docker(self, labels):
+        now = time.time()
+        d = hogs.Docker(running=True)
+        d.images = [{"name": "shop-api:antes-x", "repo": "shop-api", "tag": "antes-x", "ref": "shop-api:antes-x",
+                     "size": 7e8, "used": False, "origin": "local", "created": "", "id": "1", "created_at": now},
+                    {"name": "shop-api:latest", "repo": "shop-api", "tag": "latest", "ref": "shop-api:latest",
+                     "size": 7e8, "used": True, "origin": "local", "created": "", "id": "2", "created_at": now,
+                     "labels": labels}]
+        return d
+
+    def released(self, d, repos="default"):
+        with mock.patch.object(hogs, "load_config", return_value={}):
+            return hogs.released_images(d, [self.repo] if repos == "default" else repos)
+
+    def test_normalize_remote(self):
+        for url in ("git@github.com:Acme/shop-api.git", "https://github.com/acme/shop-api",
+                    "https://github.com/acme/shop-api.git/", "ssh://git@github.com:22/acme/shop-api.git"):
+            self.assertEqual(hogs.normalize_remote(url), "github.com/acme/shop-api")
+
+    def test_commit_on_main_makes_recent_rollback_safe(self):
+        d = self.docker({hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: self.SRC})
+        self.assertEqual(self.released(d), {"shop-api:latest": "main"})
+        d.released = {"shop-api:latest": "main"}
+        with mock.patch.object(hogs, "first_seen", return_value={"shop-api:antes-x": time.time()}), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            item = {i.label: i for i in hogs.docker_clean_items(d)}["Ponto de volta shop-api:antes-x"]
+        self.assertIs(item.risk, hogs.SAFE)
+        self.assertIn("já está na main", item.hint)
+
+    def test_off_main_unknown_bad_or_other_source_falls_back(self):
+        for rev in (self.off_main, "f" * 40, "--output=/tmp/x", ""):
+            self.assertEqual(self.released(self.docker({hogs.OCI_REVISION: rev, hogs.OCI_SOURCE: self.SRC})), {}, rev)
+        other = {hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: "https://github.com/acme/outro"}
+        self.assertEqual(self.released(self.docker(other)), {})
+
+    def test_without_labels_or_repos_no_git_call(self):
+        with mock.patch.object(hogs, "git_at") as git:
+            self.assertEqual(self.released(self.docker({})), {})
+            ok = {hogs.OCI_REVISION: self.on_main, hogs.OCI_SOURCE: self.SRC}
+            self.assertEqual(self.released(self.docker(ok), repos=[]), {})
+        git.assert_not_called()
+
+    def test_matching_remote_other_than_origin_uses_its_own_default_branch(self):
+        # G3: o clone casa pelo `upstream`; `origin` é outro repositório e a main dele não tem o commit
+        self.g("remote", "set-url", "origin", "git@github.com:acme/outro.git")
+        self.g("remote", "add", "upstream", self.SRC)
+        self.g("update-ref", "refs/remotes/upstream/main", self.off_main)
+        d = self.docker({hogs.OCI_REVISION: self.off_main, hogs.OCI_SOURCE: self.SRC})
+        self.assertEqual(self.released(d), {"shop-api:latest": "main"})
+        self.g("update-ref", "refs/remotes/upstream/develop", self.off_main)
+        self.g("update-ref", "-d", "refs/remotes/upstream/main")
+        self.g("symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/develop")
+        self.assertEqual(self.released(d), {"shop-api:latest": "develop"})
+        # G9: a dica diz a branch padrão de verdade, não "main" fixo
+        d.released = self.released(d)
+        with mock.patch.object(hogs, "first_seen", return_value={"shop-api:antes-x": time.time()}), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            item = {i.label: i for i in hogs.docker_clean_items(d)}["Ponto de volta shop-api:antes-x"]
+        self.assertEqual(item.hint, "o commit da shop-api:latest já está na develop")
+        self.g("update-ref", "-d", "refs/remotes/upstream/develop")
+        self.assertEqual(self.released(d), {}, "HEAD do remoto apontando para o nada: não libera")
+
+    def test_hex_named_ref_is_not_taken_for_a_commit(self):
+        # G4: uma tag ou branch local com nome hexadecimal não pode se passar pelo commit da etiqueta
+        for kind, name in (("tag", "deadbee"), ("branch", "cafe1234")):
+            with self.subTest(kind=kind):
+                self.assertNotEqual(self.g("rev-parse", "HEAD")[:len(name)], name)
+                self.g(kind, name, self.on_main)
+                d = self.docker({hogs.OCI_REVISION: name, hogs.OCI_SOURCE: self.SRC})
+                self.assertEqual(self.released(d), {})
+        d = self.docker({hogs.OCI_REVISION: self.on_main[:7], hogs.OCI_SOURCE: self.SRC})
+        self.assertEqual(self.released(d), {"shop-api:latest": "main"}, "SHA curto de verdade continua valendo")
+
+    def test_gather_docker_reads_labels(self):
+        img = {"Repository": "shop-api", "Tag": "latest", "ID": "sha256:" + "a" * 64, "UniqueSize": "1GB",
+               "Containers": "0", "CreatedSince": "1 hour ago", "CreatedAt": ""}
+        labels = {hogs.OCI_REVISION: "abc1234", hogs.OCI_SOURCE: self.SRC}
+        base, _ = DockerCleanItemsTest.fake_docker(images=[img])
+        for reply, expected in ((f"sha256:{'a' * 64}\t{json.dumps(labels)}\n", labels), (None, {})):
+            def sh(cmd, timeout=60, reply=reply):
+                if cmd[:3] == ["docker", "image", "inspect"]:
+                    return reply and subprocess.CompletedProcess(cmd, 0, reply, "")
+                return base(cmd, timeout)
+            with mock.patch.object(hogs, "sh", sh):
+                self.assertEqual(hogs.gather_docker().images[0]["labels"], expected)
+
+
 class BuilderTest(unittest.TestCase):
     builders = [{"name": "multiarch", "driver": "docker-container", "nodes": ["multiarch0"], "running": True},
                 {"name": "default", "driver": "docker", "nodes": ["default"], "running": True},
@@ -725,6 +849,136 @@ class BreakdownTest(unittest.TestCase):
         con = hogs.Console(file=io.StringIO(), width=140)
         con.print(hogs.header(s))
         self.assertIn("com o recomendado: 28,0 GB livres", con.file.getvalue())
+
+    def wt(self, size, verdict):
+        w = hogs.Worktree(Path(f"/dev/wt-{size}-{verdict}"), Path("/dev/shop-api"), size=int(size))
+        w.eligible = verdict == "seguro"
+        w.waits = ["em uso agora: node"] if verdict == "depois" else []
+        w.blockers = ["1 alterações locais ou arquivos não versionados"] if verdict == "manter" else []
+        w.merged = "merge em origin/main" if w.eligible else ""
+        return w
+
+    def test_worktrees_split_from_projects_without_double_counting(self):
+        for wts, expect in (((20e9, 5e9), (25e9, 35e9)), ((50e9, 30e9), (60e9, 0))):
+            s = self.snap(92e9, 18e9, 60e9)
+            s.projects, s.worktrees = int(60e9), [self.wt(x, "seguro") for x in wts]
+            parts = dict((k, v) for k, v, _ in hogs.breakdown(s))
+            self.assertEqual((parts["Worktrees"], parts["Projetos"]), expect)
+            self.assertAlmostEqual(sum(v for k, v in parts.items() if k != "Livre"), 466e9, delta=1e6)
+            self.assertGreaterEqual(parts["Não identificado"], 0)
+        self.assertEqual([k for k, _, _ in hogs.breakdown(s)],
+                         ["Docker", "Worktrees", "Caches de dev", "Apps e dados", "Projetos", "macOS e swap",
+                          "Outras pastas", "Não identificado", "Livre"])
+
+    def test_worktrees_shrink_with_the_data_volume_parts(self):
+        s = self.snap(300e9, 100e9, 200e9)
+        s.projects, s.worktrees = int(60e9), [self.wt(40e9, "seguro")]
+        parts = dict((k, v) for k, v, _ in hogs.breakdown(s))
+        self.assertLess(parts["Worktrees"], 40e9)
+        self.assertAlmostEqual(sum(v for k, v in parts.items() if k != "Livre"), 466e9, delta=1e6)
+        self.assertGreaterEqual(parts["Não identificado"], 0)
+
+    def test_worktrees_line_and_group_item(self):
+        rows = [self.wt(1e9, "seguro"), self.wt(2e9, "seguro"), self.wt(4e9, "depois"), self.wt(8e9, "manter")]
+        self.assertEqual(hogs.verdict_counts(rows),
+                         {"seguro": (2, int(3e9)), "depois": (1, int(4e9)), "manter": (1, int(8e9))})
+        self.assertEqual(hogs.verdict_counts([]), {"seguro": (0, 0), "depois": (0, 0), "manter": (0, 0)})
+        self.assertEqual(hogs.worktrees_line(rows, Path("/dev")).plain.split("  detalhes")[0],
+                         "🌳 Worktrees: 4 · 15,0 GB · 2 podem sair (3,0 GB) · 1 em andamento · 1 com trabalho só aqui")
+        self.assertIn("  detalhes: hogs --worktrees /dev", hogs.worktrees_line(rows, Path("/dev")).plain)
+        self.assertIn("· 1 pode sair (1,0 GB) ·", hogs.worktrees_line(rows[:1], Path("/dev")).plain)
+        self.assertEqual(hogs.worktrees_line([], Path("/dev"), "git sumiu").plain,
+                         "🌳 Worktrees: não consegui conferir (git sumiu)")
+        self.assertIn("hogs --worktrees PASTA", hogs.worktrees_line([], None).plain)
+        self.assertEqual(hogs.worktrees_line([], Path("/dev")).plain, "🌳 Worktrees: nenhum em /dev")
+        item = hogs.worktree_item(rows, Path("/dev"))
+        self.assertEqual((item.label, item.size, item.risk), ("Worktrees que podem sair (2)", int(3e9), hogs.SAFE))
+        self.assertIn("a branch fica", item.hint)
+        calls = []
+        def remove(w, days, scope):
+            calls.append((w.size, days, scope))
+            if w.size == int(1e9):
+                raise RuntimeError("HEAD ou branch mudou desde a análise")
+        with mock.patch.object(hogs, "remove_worktree", remove):
+            with self.assertRaisesRegex(RuntimeError, "1 de 2 mantidos: wt-1000000000.0-seguro: HEAD ou branch"):
+                item.action()
+        self.assertEqual(sorted(calls), [(int(1e9), 0, Path("/dev")), (int(2e9), 0, Path("/dev"))])
+        self.assertIsNone(hogs.worktree_item([self.wt(4e9, "depois")], Path("/dev")))
+
+    def test_worktree_item_hint_counts_merged_pushed_and_conversations_to_reopen(self):
+        merged, pushed, other = self.wt(1e9, "seguro"), self.wt(2e9, "seguro"), self.wt(3e9, "seguro")
+        pushed.merged, other.merged = "", ""
+        conv = hogs.Conversation("3f2a9c1e", "Relatório mensal", "/dev/wt-x")
+        pushed.conversations = [hogs.ConvLink(conv, "dentro", True)]
+        other.conversations = [hogs.ConvLink(hogs.Conversation("aa"), "citou", False)]
+        item = hogs.worktree_item([merged, pushed, other], Path("/dev"))
+        self.assertEqual(item.hint, "a branch fica · 1 na main · 2 enviados e parados · reabra 1 conversa antes")
+        self.assertEqual(hogs.worktree_item([merged], Path("/dev")).hint, "a branch fica · 1 na main")
+        self.assertEqual(hogs.worktree_item([merged, pushed], Path("/dev")).hint,
+                         "a branch fica · 1 na main · 1 enviado e parado · reabra 1 conversa antes")
+
+    def test_group_counts_as_recommended(self):
+        s = self.snap(92e9, 0, 0)
+        s.items.append(hogs.worktree_item([self.wt(5e9, "seguro")], Path("/dev")))
+        con = hogs.Console(file=io.StringIO(), width=140)
+        con.print(hogs.header(s))
+        self.assertIn("com o recomendado: 33,0 GB livres", con.file.getvalue())
+
+    def test_report_shows_worktrees_line_group_and_what_it_keeps(self):
+        s = self.snap(92e9, 0, 0)
+        rows = [self.wt(1e9, "seguro"), self.wt(4e9, "depois"), self.wt(8e9, "manter"), self.wt(9e9, "manter")]
+        s.worktrees, s.worktrees_root, s.projects = rows, Path("/dev"), int(30e9)
+        s.items.append(hogs.worktree_item(rows, Path("/dev")))
+        out = self.render_report(s)
+        self.assertIn("🌳 Worktrees: 4 · 22,0 GB · 1 pode sair (1,0 GB)", out.split("✨ Recomendado agora")[0])
+        recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        self.assertIn("🌳 Worktrees", recommended)
+        self.assertIn("Worktrees que podem sair (1)", recommended)
+        protected = " ".join(out.split("🛡 Não mexo")[1].split())
+        self.assertIn("1 worktree em andamento e 2 com trabalho só aqui: não mexo", protected)
+        for rows, expect in (([self.wt(8e9, "manter"), self.wt(9e9, "manter")], "2 worktrees com trabalho só aqui"),
+                             ([self.wt(4e9, "depois")], "1 worktree em andamento")):
+            s = self.snap(92e9, 0, 0)
+            s.worktrees = rows
+            con = hogs.Console(file=io.StringIO(), width=160)
+            con.print(hogs.protected_panel(s))
+            protected = " ".join(con.file.getvalue().split())
+            self.assertIn(f"{expect}: não mexo", protected)
+            self.assertNotIn("0 ", protected.split("Não mexo")[1])
+        s = self.snap(92e9, 0, 0)
+        out = self.render_report(s)
+        self.assertIn("escolha a pasta dos seus projetos com hogs --worktrees PASTA", " ".join(out.split()))
+        self.assertNotIn("não mexo", out.split("🛡 Não mexo")[1])
+
+    def test_trim_off_docker_is_not_reclaimable_in_panels(self):
+        tmp = Path(tempfile.mkdtemp())
+
+        def render(trim):
+            s = self.snap(92e9, 0, 0)
+            s.items += [hogs.Item("docker", "Docker: cache de build", 10e9, hogs.SAFE, lambda: None),
+                        hogs.Item("docker", "Imagem do Docker Hub", 4e9, hogs.REDOWN, lambda: None),
+                        hogs.Item("apps", "Lixeira", 2e9, hogs.SAFE, lambda: None)]
+            (tmp / "settings.json").write_text(json.dumps({"DiskTRIM": trim}))
+            with mock.patch.object(hogs, "DOCKER_SETTINGS", tmp / "settings.json"):
+                return self.render_report(s)
+        note = "Docker não devolve espaço: TRIM desligado"
+        out = render(True)
+        recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        group = next(line for line in recommended.splitlines() if "🐳 Docker" in line)
+        self.assertIn("10,0 GB", group)
+        last = " ".join(out.split("Dá pra liberar")[-1].split())
+        self.assertIn("🟢 12,0 GB sem risco", last)
+        self.assertIn("🟡 4,0 GB que baixam de novo", last)
+        self.assertNotIn(note, last)
+        out = render(False)
+        recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        group = next(line for line in recommended.splitlines() if "🐳 Docker" in line)
+        self.assertNotIn("10,0 GB", group)
+        self.assertIn(note, group)
+        last = " ".join(out.split("Dá pra liberar")[-1].split())
+        self.assertIn("🟢 2,0 GB sem risco", last)
+        self.assertIn("🟡 0 kB que baixam de novo", last)
+        self.assertIn(f"({note})", last)
 
     def test_trim_off_docker_space_is_not_recommended_space(self):
         s = self.snap(92e9, 0, 0)
@@ -872,11 +1126,19 @@ class BreakdownTest(unittest.TestCase):
         self.assertIn("Cópias antigas do Navegador", sizes)
         self.assertNotIn("Parado: ~/a.mov", sizes)
         self.assertEqual(sizes["Projetos"], 7e9)
+        self.assertNotIn("Worktrees", sizes)
+        s.worktrees = [self.wt(2e9, "seguro"), self.wt(1e9, "manter")]
+        s.items.append(hogs.worktree_item(s.worktrees, Path("/dev")))
+        sizes = hogs.snapshot_sizes(s)
+        self.assertEqual((sizes["Worktrees"], sizes["Projetos"]), (3e9, 4e9))
+        self.assertNotIn("Worktrees que podem sair", sizes)
 
-    def _gather(self, root, known, candidates, sizes):
+    def _gather(self, root, known, candidates, sizes, worktrees=None):
         si = hogs.SystemInfo({"Preboot": 5e9}, 13e9, 30, False)
         stale = mock.Mock(return_value=[])
+        worktrees = worktrees or mock.Mock(return_value=([], []))
         with mock.patch.object(hogs, "gather_docker", return_value=hogs.Docker()), \
+                mock.patch.object(hogs, "gather_worktrees", worktrees), \
                 mock.patch.object(hogs, "scan_candidates", return_value=candidates), \
                 mock.patch.object(hogs, "du", side_effect=lambda p: sizes.get(p, 0)), \
                 mock.patch.object(hogs, "gather_apps", return_value=[]), \
@@ -906,6 +1168,105 @@ class BreakdownTest(unittest.TestCase):
         snap, _ = self._gather(tmp / "nao-existe", True, [dev, other], sizes)
         self.assertEqual(snap.projects, 0)
         self.assertEqual(dict(snap.others)[hogs.short(dev)], 50e9)
+
+    def test_gather_brings_worktrees_only_with_a_projects_folder(self):
+        tmp = Path(tempfile.mkdtemp())
+        rows = [self.wt(1e9, "seguro"), self.wt(2e9, "seguro"), self.wt(4e9, "depois")]
+        found = mock.Mock(return_value=(rows, []))
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, found)
+        found.assert_called_once_with(tmp, 0)
+        self.assertEqual((snap.worktrees, snap.worktrees_root), (rows, tmp))
+        self.assertIn("Worktrees que podem sair (2)", [i.label for i in snap.items])
+        found = mock.Mock(return_value=(rows, []))
+        snap, _ = self._gather(tmp / "nao-existe", True, [], {}, found)
+        found.assert_not_called()
+        self.assertEqual((snap.worktrees, snap.worktrees_root), ([], None))
+        self.assertFalse([i for i in snap.items if i.cat == "worktree"])
+        self.assertEqual(snap.worktrees_error, "")
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(side_effect=RuntimeError("git sumiu")))
+        self.assertEqual((snap.worktrees, snap.worktrees_error), ([], "git sumiu"))
+        self.assertFalse([i for i in snap.items if i.cat == "worktree"])
+        line = hogs.worktrees_line(snap.worktrees, snap.worktrees_root, snap.worktrees_error).plain
+        self.assertEqual(line, "🌳 Worktrees: não consegui conferir (git sumiu)")
+        self.assertNotIn("nenhum", line)
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(return_value=([], ["não consegui inspecionar x"])))
+        self.assertEqual(snap.worktrees_error, "não consegui inspecionar x")
+        snap, _ = self._gather(tmp, True, [], {tmp: 20e9}, mock.Mock(return_value=(rows, ["aviso qualquer"])))
+        self.assertEqual(snap.worktrees_error, "")
+
+    def test_gather_marks_released_images_with_the_repos_under_the_projects_folder(self):
+        # a regra OCI (Task 7) roda no gather, com os clones de `worktrees_root`, antes de rollback_info usar
+        tmp = Path(tempfile.mkdtemp())
+        repos = [tmp / "shop-api", tmp / "loja-web"]
+        found = mock.Mock(return_value=(repos, []))
+        released = mock.Mock(return_value={"shop-api:latest": "main"})
+        candidate = mock.patch.object(hogs, "oci_candidates", return_value={"shop-api:latest": ("abc1234", "x/y")})
+        with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released), \
+                candidate:
+            snap, _ = self._gather(tmp, True, [], {tmp: 20e9})
+        found.assert_called_once_with(tmp)
+        released.assert_called_once_with(snap.docker, repos)
+        self.assertEqual(snap.docker.released, {"shop-api:latest": "main"})
+        for boom in (mock.Mock(side_effect=RuntimeError("git sumiu")), found):
+            with mock.patch.object(hogs, "find_repos", boom), candidate, \
+                    mock.patch.object(hogs, "released_images", mock.Mock(side_effect=OSError("sem git"))):
+                snap, _ = self._gather(tmp, True, [], {tmp: 20e9})
+            self.assertEqual(snap.docker.released, {})   # o relatório nunca cai: só fica sem a regra
+
+    def test_gather_looks_for_repos_only_when_an_image_has_both_oci_labels(self):
+        # G16: sem imagem candidata, nem procura os clones (find_repos varre a pasta dos projetos)
+        tmp = Path(tempfile.mkdtemp())
+        found, released = mock.Mock(return_value=([tmp / "shop-api"], [])), mock.Mock(return_value={})
+        with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released):
+            snap, _ = self._gather(tmp, True, [], {tmp: 20e9})
+        found.assert_not_called()
+        released.assert_not_called()
+        self.assertEqual(snap.docker.released, {})
+
+    def test_gather_without_projects_folder_runs_no_git_for_released_images(self):
+        tmp = Path(tempfile.mkdtemp())
+        found, released, git = mock.Mock(return_value=([], [])), mock.Mock(return_value={"x": "main"}), mock.Mock()
+        sh = mock.Mock(side_effect=hogs.sh)
+        with mock.patch.object(hogs, "find_repos", found), mock.patch.object(hogs, "released_images", released), \
+                mock.patch.object(hogs, "git_at", git), mock.patch.object(hogs, "sh", sh):
+            snap, _ = self._gather(tmp / "nao-existe", True, [], {})
+        found.assert_not_called()
+        released.assert_not_called()
+        git.assert_not_called()
+        self.assertFalse([c for c in sh.call_args_list if c.args and c.args[0][:1] == ["git"]])
+        self.assertEqual(snap.docker.released, {})
+
+
+class PreventionTest(unittest.TestCase):
+    def panel(self, settings, docker=hogs.Docker()):
+        home = Path(tempfile.mkdtemp())
+        if settings is not None:
+            (home / ".claude").mkdir()
+            (home / ".claude" / "settings.json").write_text(json.dumps(settings))
+        snap = hogs.Snapshot(494e9, 28e9, docker, [], [])
+        with mock.patch.object(hogs, "HOME", home), mock.patch.object(hogs, "load_config", return_value={}):
+            p = hogs.prevention_panel(snap)
+        if settings is not None:
+            self.assertEqual(json.loads((home / ".claude" / "settings.json").read_text()), settings)  # nunca altera
+        if p is None:
+            return None
+        con = hogs.Console(file=io.StringIO(), width=200)
+        con.print(p)
+        return con.file.getvalue()
+
+    def test_recommends_keeping_conversations_only_when_needed(self):
+        text = self.panel({})
+        self.assertIn("apagadas depois de 30 dias", text)
+        self.assertIn('"cleanupPeriodDays": 365', text)
+        self.assertIn("apagadas depois de 7 dias", self.panel({"cleanupPeriodDays": 7}))
+        text = self.panel({"cleanupPeriodDays": 400})
+        self.assertIn("guardadas por 400 dias", text)
+        self.assertNotIn("365", text)
+
+    def test_without_claude_code_no_line(self):
+        self.assertIsNone(self.panel(None))
+        text = self.panel(None, hogs.Docker(running=True))
+        self.assertNotIn("Claude", text)
 
 
 class HistoryTest(unittest.TestCase):
@@ -938,6 +1299,29 @@ class HistoryTest(unittest.TestCase):
         rows = hogs.growth({"docker": 30 * 10**9, "npm": 4 * 10**9, "new": 2 * 10**9, "tiny": 10**9},
                            {"docker": 13 * 10**9, "npm": 5 * 10**9, "tiny": 10**9 - 10})
         self.assertEqual(rows, [("docker", 17 * 10**9), ("new", 2 * 10**9)])
+
+    def test_growth_compares_projects_with_worktrees_against_old_records(self):
+        # Registros antigos têm os worktrees dentro de "Projetos" e nenhum "Worktrees": não é crescimento.
+        current = {"Projetos": 50 * 10**9, "Worktrees": 10 * 10**9}
+        self.assertEqual(hogs.growth(current, {"Projetos": 60 * 10**9}), [])
+        self.assertEqual(hogs.growth(current, {"docker": 10**9}), [])
+        self.assertEqual(hogs.growth(current, {"Projetos": 55 * 10**9}), [("Projetos", 5 * 10**9)])
+        self.assertEqual(hogs.growth(current, {"Projetos": 50 * 10**9, "Worktrees": 8 * 10**9}),
+                         [("Worktrees", 2 * 10**9)])
+
+    def test_growth_table_has_no_false_worktrees_row_after_upgrade(self):
+        s = hogs.Snapshot(494e9, 28e9, hogs.Docker(), [], [], projects=int(60e9))
+        w = hogs.Worktree(Path("/dev/wt-a"), Path("/dev/shop-api"), size=int(10e9))
+        s.worktrees = [w]
+        records = [{"t": self.now - 26 * 3600, "full": True, "free": 1, "sizes": {"Projetos": int(57e9)}}]
+        con = hogs.Console(file=io.StringIO(), width=160)
+        with mock.patch.object(hogs.time, "time", return_value=self.now):
+            con.print(hogs.growth_table(s, records))
+        out = con.file.getvalue()
+        self.assertNotIn("Worktrees", out)
+        self.assertIn("Projetos", out)
+        self.assertIn("+3,0 GB", out)
+        self.assertIn("60,0 GB", out)
 
     def test_value_at_picks_last_record_before_time(self):
         records = [{"t": 10, "free": 1}, {"t": 20}, {"t": 30, "free": 3}, {"t": 40, "free": 4}]
@@ -1051,6 +1435,276 @@ class ProcessRunningTest(unittest.TestCase):
         self.assertFalse(self.running("Navegador", procs))
 
 
+class ConversationTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name).resolve()
+        self.scope, self.projects, self.cache = base / "dev", base / "projects", base / "conv.json"
+        self.wt = self.scope / "shop-api" / "feature with spaces"
+
+    def rec(self, kind, cwd="/x", branch="", ts="2026-10-01T10:00:00.000Z", content="oi"):
+        return json.dumps({"type": kind, "cwd": cwd, "gitBranch": branch, "timestamp": ts,
+                           "message": {"content": content}}, ensure_ascii=False)
+
+    def title(self, text):
+        return json.dumps({"type": "ai-title", "aiTitle": text})
+
+    def write(self, rel, *lines, end="\n"):
+        p = self.projects / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + end)
+        return p
+
+    def scan(self, scope=None, live=()):
+        with mock.patch.object(hogs, "live_claude_sessions", return_value=([{"sessionId": s} for s in live], "")):
+            return hogs.claude_conversations(scope or self.scope, self.projects, self.cache)
+
+    def test_title_last_start_branches_and_subagents(self):
+        self.write("-dev/s1.jsonl", self.rec("user", str(self.wt), "feat/checkout"), self.title("Primeiro"),
+                   self.rec("assistant", str(self.scope / "shop-api"), "main", "2026-10-02T09:00:00.000Z", []),
+                   self.title("Checkout em duas etapas"))
+        self.write("-dev/s1/subagents/a.jsonl", self.rec("assistant", str(self.scope / "api"), "x",
+                                                          "2026-10-03T08:00:00.000Z", []))
+        convs, err = self.scan(live=["s1"])
+        self.assertEqual(err, "")
+        [c] = convs
+        self.assertEqual((c.session, c.title, c.start, c.live), ("s1", "Checkout em duas etapas", str(self.wt), True))
+        self.assertEqual(c.last, datetime(2026, 10, 3, 8, tzinfo=timezone.utc).timestamp())
+        self.assertIn((str(self.wt), "feat/checkout"), c.branches)
+        self.assertIn(str(self.scope / "api"), c.cwds)
+
+    def test_mentions_only_from_work_under_scope_keep_spaces_and_accents(self):
+        cmd = [{"type": "tool_use", "input": {"command": f"git -C '{self.wt}' status && ls {self.scope}/api/src"}}]
+        out = [{"type": "tool_result", "content": f"{self.scope}/saida-de-comando"}]
+        self.write("-dev/s1.jsonl", self.rec("assistant", content=cmd), self.rec("user", content=out),
+                   self.rec("user", content=f"veja {self.scope}/shop-api/ção/nota.txt."))
+        [c] = self.scan()[0]
+        self.assertIn("shop-api/feature with spaces", c.mentions)
+        self.assertIn("api/src", c.mentions)
+        self.assertIn("shop-api/ção/nota.txt", c.mentions)
+        self.assertFalse([m for m in c.mentions if m.startswith("saida")])
+
+    def test_scope_cited_with_other_case_counts(self):
+        # G1: o escopo citado com outra caixa ainda é o escopo (APFS não diferencia maiúsculas)
+        self.write("-dev/s1.jsonl", self.rec("user", content=f"veja {str(self.scope).upper()}/shop-api/x.txt"))
+        [c] = self.scan()[0]
+        self.assertIn("shop-api/x.txt", c.mentions)
+
+    def test_reads_only_appended_complete_lines(self):
+        p = self.write("-dev/s1.jsonl", self.title("Antigo"))
+        self.scan()
+        first = p.read_bytes()
+        p.write_bytes(b"x" * (len(first) - 32) + first[-32:])   # mesmo inode, tamanho e fim: não deve ser relido
+        late = self.rec("user", ts="2026-10-05T10:00:00.000Z")
+        with p.open("a") as f:
+            f.write(late[:30])                                  # meia linha
+        self.assertEqual(self.scan()[0][0].title, "Antigo")
+        with p.open("a") as f:
+            f.write(late[30:] + "\n")
+        [c] = self.scan()[0]
+        self.assertEqual(c.title, "Antigo")
+        self.assertEqual(c.last, datetime(2026, 10, 5, 10, tzinfo=timezone.utc).timestamp())
+        p.write_bytes(b"x" * (p.stat().st_size - 1) + b"\n")   # mesmo inode e tamanho, fim diferente: relido
+        self.assertEqual(self.scan()[0][0].title, "")
+
+    def test_corrupt_cache_other_scope_or_rewritten_file_rescans(self):
+        p = self.write("-dev/s1.jsonl", self.title("A" * 50))
+        self.scan()
+        self.cache.write_text("{lixo")
+        self.assertEqual(self.scan()[0][0].title, "A" * 50)
+        data = json.loads(self.cache.read_text())
+        data["files"][str(p)]["cwds"] = 5                          # JSON válido, entrada fora do formato
+        self.cache.write_text(json.dumps(data))
+        self.assertEqual(self.scan()[0][0].title, "A" * 50)
+        p.write_text(self.title("B") + "\n")                       # menor, mesmo inode
+        self.assertEqual(self.scan()[0][0].title, "B")
+        p.write_text(self.rec("user", content=f"{self.wt}/a") + "\n" + self.title("C" * 80) + "\n")  # maior, mesmo inode
+        self.assertEqual(self.scan()[0][0].title, "C" * 80)
+        self.assertIn("feature with spaces/a", self.scan(self.scope / "shop-api")[0][0].mentions)
+
+    def test_missing_dir_is_empty_and_unreadable_file_is_an_error(self):
+        self.assertEqual(self.scan(), ([], ""))
+        p = self.write("-dev/s1.jsonl", self.title("x"))
+        p.chmod(0)
+        self.addCleanup(p.chmod, 0o644)
+        convs, err = self.scan()
+        self.assertEqual(convs, [])
+        self.assertIn("conversas do Claude Code", err)
+
+    def test_every_mention_on_a_line_counts(self):
+        s = self.scope
+        self.assertEqual(hogs.mention_tails(f"ls {s}/a {s}/b".encode(), s), {"a", "b"})
+        self.assertEqual(hogs.mention_tails(f"cp {s}/shop/a.txt {s}/api/b.txt".encode(), s),
+                         {"shop/a.txt", "api/b.txt"})
+
+    def fake_sessions(self, *files):
+        home = self.projects.parent / "home"
+        sessions = home / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        for name, text in files:
+            (sessions / name).write_text(text)
+        p = mock.patch.object(hogs, "HOME", home)
+        p.start()
+        self.addCleanup(p.stop)
+        return sessions
+
+    def test_unreadable_session_record_is_reported_and_conversations_are_kept(self):
+        self.write("-dev/s1.jsonl", self.title("x"))
+        self.fake_sessions(("a.json", "[1]"))
+        self.assertIn("ilegível", hogs.live_claude_sessions()[1])
+        convs, err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual([c.session for c in convs], ["s1"])
+        self.assertIn("sessões abertas do Claude Code", err)
+        with mock.patch.object(hogs, "live_claude_sessions", return_value=([], "registro ilegível: b.json")):
+            convs, err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual(len(convs), 1)
+        self.assertIn("b.json", err)
+
+    def test_session_record_that_vanished_is_not_live(self):
+        sessions = self.fake_sessions(("ok.json", '{"pid": %d, "sessionId": "s1"}' % os.getpid()))
+        (sessions / "gone.json").symlink_to(sessions / "nao-existe.json")   # listado, some na leitura
+        found, err = hogs.live_claude_sessions()
+        self.assertEqual(([d["sessionId"] for d in found], err), (["s1"], ""))
+        self.write("-dev/s1.jsonl", self.title("x"))
+        [c], err = hogs.claude_conversations(self.scope, self.projects, self.cache)
+        self.assertEqual((c.live, err), (True, ""))
+
+    def test_resume_command_quotes_the_folder(self):
+        c = hogs.Conversation("s1", start="/dev/feature with spaces")
+        self.assertEqual(hogs.resume_command(c), "cd '/dev/feature with spaces' && claude --resume s1")
+        self.assertEqual(hogs.resume_command(hogs.Conversation("s2")), "claude --resume s2")
+
+
+class ClaudeDirTest(unittest.TestCase):
+    """G6: o Claude Code respeita CLAUDE_CONFIG_DIR; o hogs lê a mesma pasta (só leitura)."""
+
+    def test_default_is_home_dot_claude(self):
+        self.assertNotIn("CLAUDE_CONFIG_DIR", os.environ)
+        self.assertEqual(hogs.claude_dir(), hogs.HOME / ".claude")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}):
+            self.assertEqual(hogs.claude_dir(), hogs.HOME / ".claude")
+
+    def test_config_dir_is_read_by_every_reader(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name).resolve()
+        cfg = base / "outro-claude"
+        (cfg / "sessions").mkdir(parents=True)
+        (cfg / "projects" / "-dev").mkdir(parents=True)
+        (cfg / "settings.json").write_text('{"cleanupPeriodDays": 400}')
+        (cfg / "sessions" / "1.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": "s-cfg", "name": "apps-1"}))
+        t = cfg / "projects" / "-dev" / "s-cfg.jsonl"
+        t.write_text(json.dumps({"type": "ai-title", "aiTitle": "Pela variável"}) + "\n")
+        before = sorted(str(p) for p in cfg.rglob("*"))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(cfg)}):
+            self.assertEqual(hogs.claude_dir(), cfg)
+            self.assertEqual([d["sessionId"] for d in hogs.live_claude_sessions()[0]], ["s-cfg"])
+            self.assertEqual(hogs.live_claude_transcripts(), ([("apps-1", t)], ""))
+            convs, err = hogs.claude_conversations(base / "dev")
+            self.assertEqual(([c.title for c in convs], [c.live for c in convs], err), (["Pela variável"], [True], ""))
+            self.assertIn(("Claude Code", "-dev"), hogs.agent_activity(7, []).folders)
+            self.assertEqual(hogs.claude_retention()[:2], (True, "Conversas do Claude Code guardadas por 400 dias"))
+        self.assertEqual(sorted(str(p) for p in cfg.rglob("*")), before, "só leitura")
+
+
+class ConversationLinkTest(unittest.TestCase):
+    def test_links_by_folder_branch_and_mention(self):
+        dev = Path("/dev")
+        a = hogs.Worktree(dev / "shop-api/wt a", dev / "shop-api", branch="refs/heads/feat/checkout")
+        a2 = hogs.Worktree(dev / "shop-api/wt a-2", dev / "shop-api", branch="refs/heads/feat/outra")
+        dirs = {dev / "shop-api": [dev / "shop-api", a.path, a2.path]}
+        C = hogs.Conversation
+        convs = [C("dentro", start=str(a.path / "src"), last=5, cwds={str(a.path / "src")}),
+                 C("branch", start="/dev/shop-api", last=4, branches={("/dev/shop-api", "feat/checkout")}),
+                 C("outro-repo", last=3, branches={("/dev/web", "feat/checkout")}),
+                 C("citou", last=2, mentions={"shop-api/wt a/x.txt"}),
+                 C("citou-2", last=1, mentions={"shop-api/wt a-2/y", "shop-api/wt a.bak"})]
+        links = hogs.conversation_links([a, a2], convs, dev, dirs)
+        self.assertEqual([(l.conv.session, l.how, l.reopen) for l in links[a.path]],
+                         [("dentro", "dentro", True), ("branch", "branch", False), ("citou", "citou", False)])
+        self.assertEqual([l.conv.session for l in links[a2.path]], ["citou-2"])
+
+    def test_mention_boundary(self):
+        dev = Path("/dev")
+        w = hogs.Worktree(dev / "shop/wt-a", dev / "shop", branch="refs/heads/x")
+        for mention, hit in (("shop/wt-a", True), ("shop/wt-a/src/x.py", True), ("shop/wt-a -la", True),
+                             ("shop/wt-a-2", False), ("shop/wt-a-2/src", False), ("shop/wt-a.bak", False),
+                             ("shop/wt-ab", False), ("shop/wt", False), ("outro/shop/wt-a", False)):
+            with self.subTest(mention=mention):
+                links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={mention})], dev, {})
+                self.assertEqual([l.how for l in links[w.path]], ["citou"] if hit else [])
+
+    def test_cwd_through_symlink_or_other_case_links_inside(self):
+        # G1: cwds resolvidos (best-effort) e comparados sem diferenciar maiúsculas (APFS não diferencia)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        real = Path(tmp.name).resolve() / "dev"
+        (real / "shop" / "wt-a" / "src").mkdir(parents=True)
+        alias = Path(tmp.name).resolve() / "atalho"
+        alias.symlink_to(real)
+        w = hogs.Worktree(real / "shop" / "wt-a", real / "shop", branch="refs/heads/feat/x")
+        other_case = str(real / "Shop" / "WT-A")
+        for cwd in (str(alias / "shop" / "wt-a" / "src"), other_case + "/src", other_case):
+            with self.subTest(cwd=cwd):
+                c = hogs.Conversation("s", start=cwd, cwds={cwd})
+                links = hogs.conversation_links([w], [c], real, {})
+                self.assertEqual([(l.how, l.reopen) for l in links[w.path]], [("dentro", True)])
+        for cwd in (str(alias / "shop"), str(real / "SHOP")):
+            with self.subTest(branch_from=cwd):
+                c = hogs.Conversation("b", branches={(cwd, "feat/x")})
+                links = hogs.conversation_links([w], [c], real, {w.repo: [w.repo, w.path]})
+                self.assertEqual([l.how for l in links[w.path]], ["branch"])
+        out = Path(tmp.name).resolve() / "fora"
+        out.mkdir()
+        (real / "shop" / "wt-a" / "leva-pra-fora").symlink_to(out)   # escrito dentro, resolve fora: ainda é dentro
+        c = hogs.Conversation("l", start=str(real / "shop/wt-a/leva-pra-fora"), cwds={str(real / "shop/wt-a/leva-pra-fora")})
+        self.assertEqual([(l.how, l.reopen) for l in hogs.conversation_links([w], [c], real, {})[w.path]],
+                         [("dentro", True)])
+        gone = hogs.Conversation("g", start="/nao/existe/mais", cwds={"/nao/existe/mais", ""})
+        self.assertEqual(hogs.conversation_links([w], [gone], real, {})[w.path], [])
+        self.assertEqual([l.how for l in hogs.conversation_links([w], [hogs.Conversation("n", cwds={str(real / "shop/wt-a-2")})],
+                                                                   real, {})[w.path]], [])
+
+    def test_mention_with_other_case_links(self):
+        dev = Path("/dev")
+        w = hogs.Worktree(dev / "shop/wt-a", dev / "shop", branch="refs/heads/x")
+        for mention, hit in (("Shop/WT-A/src", True), ("SHOP/WT-A", True), ("Shop/WT-A-2", False)):
+            with self.subTest(mention=mention):
+                links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={mention})], dev, {})
+                self.assertEqual([l.how for l in links[w.path]], ["citou"] if hit else [])
+        self.assertEqual(hogs.mention_tails(b"ls /DEV/Shop/WT-A/src", dev), {"Shop/WT-A/src"})
+
+    def test_deep_worktree_matches_by_its_first_levels(self):
+        # G2: menções são cortadas em MENTION_PARTS partes; worktree mais fundo casa pelos primeiros níveis
+        dev = Path("/dev")
+        self.assertEqual(hogs.MENTION_PARTS, 8)
+        for depth in (7, 8, 9, 12):
+            rel = "/".join(f"n{i}" for i in range(depth))
+            w = hogs.Worktree(dev / rel, dev / "n0", branch="refs/heads/x")
+            [mention] = hogs.mention_tails(f"ls {dev}/{rel}/src/a.py".encode(), dev)
+            with self.subTest(depth=depth):
+                links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={mention})], dev, {})
+                self.assertEqual([l.how for l in links[w.path]], ["citou"])
+                sibling = "/".join(f"n{i}" for i in range(depth - 1)) + "/outro"
+                [far] = hogs.mention_tails(f"ls {dev}/{sibling}".encode(), dev)
+                links = hogs.conversation_links([w], [hogs.Conversation("s", mentions={far})], dev, {})
+                # irmão que difere até o 8º nível não casa; depois dele, casa (lado seguro: liga a mais)
+                self.assertEqual([l.how for l in links[w.path]], ["citou"] if depth > 8 else [])
+        a = hogs.Worktree(dev / "/".join(f"n{i}" for i in range(9)), dev / "n0", branch="refs/heads/a")
+        b = hogs.Worktree(dev / ("/".join(f"n{i}" for i in range(8)) + "/b"), dev / "n0", branch="refs/heads/b")
+        links = hogs.conversation_links([a, b], [hogs.Conversation("s", mentions={str(a.path.relative_to(dev))[:23]})],
+                                        dev, {})
+        self.assertEqual(([l.how for l in links[a.path]], [l.how for l in links[b.path]]), (["citou"], ["citou"]))
+
+    def test_worktree_outside_scope_links_only_by_folder(self):
+        w = hogs.Worktree(Path("/outro/wt"), Path("/outro/repo"), branch="refs/heads/x")
+        convs = [hogs.Conversation("a", cwds={"/outro/wt"}, last=2), hogs.Conversation("b", mentions={"wt"}, last=1)]
+        links = hogs.conversation_links([w], convs, Path("/dev"), {})
+        self.assertEqual([l.conv.session for l in links[w.path]], ["a"])
+
+
 class WorktreeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1076,8 +1730,8 @@ class WorktreeTest(unittest.TestCase):
     def git(self, path, *args):
         return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True, text=True).stdout.strip()
 
-    def age(self):
-        old = time.time() - 90 * 86400
+    def age(self, days=90):
+        old = time.time() - days * 86400
         gd = Path(self.git(self.path, "rev-parse", "--absolute-git-dir"))
         for base in (self.path, gd):
             for root, dirs, files in os.walk(base):
@@ -1086,13 +1740,58 @@ class WorktreeTest(unittest.TestCase):
             os.utime(base, (old, old))
 
     def inspect(self, usage=None, agents=None, days=30):
-        return hogs.inspect_worktree(self.w, days, usage or ([], "", []), agents or hogs.Agents())
+        """Conversas conferidas (links=[]): nenhuma ligada a ele."""
+        return hogs.inspect_worktree(self.w, days, usage or ([], "", []), agents or hogs.Agents(), links=[])
 
     def quiet(self):
-        stack = mock.patch.object(hogs, "worktree_usage", return_value=([], "", []))
-        stack2 = mock.patch.object(hogs, "agent_activity", return_value=hogs.Agents())
-        stack.start(); stack2.start()
-        self.addCleanup(stack.stop); self.addCleanup(stack2.stop)
+        for target, value in (("worktree_usage", ([], "", [])), ("agent_activity", hogs.Agents()),
+                              ("claude_conversations", ([], ""))):
+            patcher = mock.patch.object(hogs, target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_find_repos_returns_main_checkouts_once(self):
+        self.assertEqual(hogs.find_repos(self.root), ([self.repo], []))
+
+    def test_gather_links_conversations_and_recheck_sees_new_ones(self):
+        self.quiet()
+        (self.path / "file.txt").write_text("trabalho\n")
+        self.git(self.path, "commit", "-am", "work")
+        self.git(self.path, "update-ref", "refs/remotes/origin/feature", "HEAD")
+        self.age()
+        old = hogs.Conversation("s1", "Antiga", str(self.path), time.time() - 60 * 86400, cwds={str(self.path)})
+        with mock.patch.object(hogs, "claude_conversations", return_value=([old], "")) as cc:
+            [row], _ = hogs.gather_worktrees(self.root, 0)
+        cc.assert_called_once()
+        self.assertTrue(row.eligible, row.reason)
+        self.assertEqual([(l.how, l.reopen) for l in row.conversations], [("dentro", True)])
+        new = hogs.Conversation("s2", "Nova", "/x", time.time(), cwds={str(self.path)})
+        with mock.patch.object(hogs, "claude_conversations", return_value=([new], "")):
+            with self.assertRaisesRegex(RuntimeError, "conversa do Claude Code"):
+                hogs.remove_worktree(row, 0, self.root)
+        self.assertTrue(self.path.exists())
+
+    def test_recheck_with_conversations_error_keeps_unmerged(self):
+        # G5: na reconferência, conversas ilegíveis seguram o worktree sem merge
+        self.quiet()
+        self.commit_and_push()
+        row = self.inspect(days=0)
+        self.assertTrue(row.eligible, row.reason)
+        failed = ([], "não foi possível ler as conversas do Claude Code: disco sumiu")
+        with mock.patch.object(hogs, "claude_conversations", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "não foi possível ler as conversas do Claude Code"):
+                hogs.remove_worktree(row, 0, self.root)
+        self.assertTrue(self.path.exists())
+
+    def test_gather_links_by_branch_from_main_checkout(self):
+        self.quiet()
+        self.commit_and_push()
+        talk = hogs.Conversation("s3", "Na principal", str(self.repo), time.time(),
+                                 cwds={str(self.repo)}, branches={(str(self.repo), "feature")})
+        with mock.patch.object(hogs, "claude_conversations", return_value=([talk], "")):
+            [row], _ = hogs.gather_worktrees(self.root, 0)
+        self.assertEqual([(l.how, l.reopen) for l in row.conversations], [("branch", False)])
+        self.assertEqual(row.verdict, "depois")
 
     def test_old_merged_clean_is_eligible_and_removal_preserves_branch(self):
         row = self.inspect()
@@ -1401,6 +2100,262 @@ class WorktreeTest(unittest.TestCase):
             hogs.clean_worktrees(con, [hogs.Worktree(self.path, self.repo, blockers=["x"])], 30, self.root)
         ask.assert_not_called()
         self.assertIn("Nenhum worktree", out.getvalue())
+
+    def commit_and_push(self, push=True):
+        (self.path / "file.txt").write_text("trabalho sem merge\n")
+        self.git(self.path, "commit", "-am", "work")
+        if push:
+            self.git(self.path, "update-ref", "refs/remotes/origin/feature", "HEAD")
+        self.age()
+
+    def link(self, days_ago, inside=False):
+        c = hogs.Conversation("s9", "Rascunho do checkout", str(self.path) if inside else "/x",
+                              time.time() - days_ago * 86400)
+        return [hogs.ConvLink(c, "dentro" if inside else "citou", inside)]
+
+    def test_stale_unmerged_pushed_is_safe_and_removal_keeps_branch(self):
+        self.commit_and_push()
+        row = self.inspect(days=0)
+        self.assertTrue(row.eligible, row.reason)
+        self.assertEqual((row.merged, row.pushed), ("", "origin/feature"))
+        self.assertIn("a branch fica", row.reason)
+        self.assertTrue(all(ok for ok, _ in row.checks))
+        self.assertIn("enviado a origin/feature (conferido nas referências locais de origin)", [t for _, t in row.checks])
+        self.quiet()
+        hogs.remove_worktree(row, 0)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.git(self.repo, "rev-parse", "feature"), row.head)
+
+    def test_unpushed_dirty_or_protected_is_kept_at_any_age(self):
+        self.commit_and_push(push=False)
+        row = self.inspect(days=0)
+        self.assertEqual(row.verdict, "manter")
+        self.assertIn("não enviados", row.reason)
+        self.git(self.path, "update-ref", "refs/remotes/origin/feature", "HEAD")
+        for name in ("file.txt", ".env"):
+            (self.path / name).write_text("só aqui\n")
+            self.age()
+            self.assertEqual(self.inspect(days=0).verdict, "manter", name)
+            self.git(self.path, "checkout", "--", "file.txt")
+            (self.path / ".env").unlink(missing_ok=True)
+
+    def test_unmerged_recent_conversation_or_running_is_in_progress(self):
+        self.commit_and_push()
+        os.utime(self.path / "file.txt", None)
+        self.assertTrue(self.inspect(days=0).reason.startswith("sem merge, mexido"))
+        self.age()
+        row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=self.link(2))
+        self.assertEqual(row.verdict, "depois")
+        self.assertTrue(row.reason.startswith("conversa do Claude Code"))
+        self.assertTrue(hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=self.link(40)).eligible)
+        cited = hogs.Agents(mentions={self.path: {"Claude Code apps-1"}})
+        self.assertEqual(self.inspect(agents=cited, days=0).verdict, "depois")
+        self.assertEqual(self.inspect(([(self.path / "file.txt", "vim (pid 1)")], "", []), days=0).verdict, "depois")
+
+    def test_stale_window_is_a_parameter_and_conversation_error_blocks_only_unmerged(self):
+        self.commit_and_push()
+        self.age(20)
+        args = (self.w, 0, ([], "", []), hogs.Agents(), [])
+        self.assertEqual(hogs.inspect_worktree(*args, stale_days=30).verdict, "depois")
+        self.assertTrue(hogs.inspect_worktree(*args, stale_days=10).eligible)
+        self.assertEqual(hogs.inspect_worktree(*args, conv_error="falhou", stale_days=10).verdict, "manter")
+
+    def test_conversations_not_checked_keep_unmerged_but_not_merged(self):
+        merged = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents())
+        self.assertTrue(merged.eligible, merged.reason)
+        self.commit_and_push()
+        links = self.link(40)
+        row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=None)
+        self.assertEqual(row.verdict, "manter")
+        self.assertEqual(row.reason, "conversas do Claude Code não verificadas")
+        row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=links)
+        self.assertTrue(row.eligible, row.reason)
+        self.assertIsNot(row.conversations, links, "guarda uma cópia, não a lista de quem chamou")
+        self.assertEqual(row.conversations, links)
+
+    def test_check_texts_name_the_remote_and_the_default_branch(self):
+        self.git(self.repo, "update-ref", "refs/remotes/origin/develop", "main")
+        self.git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
+        self.assertIn("já na develop (merge em origin/develop)", [t for _, t in self.inspect().checks])
+        self.commit_and_push(push=False)
+        self.git(self.path, "update-ref", "refs/remotes/fork/feature", "HEAD")
+        row = self.inspect(days=0)
+        self.assertEqual(row.pushed, "fork/feature")
+        self.assertIn("enviado a fork/feature (conferido nas referências locais de fork)", [t for _, t in row.checks])
+
+    def test_merged_ignores_conversations_and_stale_window(self):
+        row = hogs.inspect_worktree(self.w, 0, ([], "", []), hogs.Agents(), links=self.link(0, inside=True),
+                                    conv_error="falhou")
+        self.assertTrue(row.eligible, row.reason)
+        self.assertEqual(len(row.conversations), 1)
+
+    def test_pushed_ref_prefers_own_branch_and_ignores_head(self):
+        self.commit_and_push()
+        head = self.git(self.path, "rev-parse", "HEAD")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/aaa", head)
+        self.assertEqual(hogs.pushed_ref(self.path, head, "refs/heads/feature"), "origin/feature")
+        self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/feature")
+        self.assertEqual(hogs.pushed_ref(self.path, head, "refs/heads/feature"), "origin/aaa")
+        self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/aaa")
+        self.assertEqual(hogs.pushed_ref(self.path, head, "refs/heads/feature"), "")
+
+
+class WorktreeReportTest(unittest.TestCase):
+    DEV = Path("/dev")
+
+    def rows(self):
+        conv = hogs.Conversation("s-123", "Relatório mensal", str(self.DEV / "shop-api-relatorio"),
+                                 time.time() - 41 * 86400, live=True)
+        parado = hogs.Worktree(self.DEV / "shop-api-relatorio", self.DEV / "shop-api", branch="refs/heads/feat/relatorio",
+                               size=int(1.2e9), last_activity=time.time() - 41 * 86400, eligible=True,
+                               pushed="origin/feat/rel", conversations=[hogs.ConvLink(conv, "dentro", True)])
+        andamento = hogs.Worktree(self.DEV / "shop-api-cupom", self.DEV / "shop-api", branch="refs/heads/feat/cupom",
+                                  waits=["sem merge, mexido há 3 d (em andamento; prazo 30 d)"])
+        return [parado, andamento]
+
+    def text(self, fn, *args):
+        out = io.StringIO()
+        fn(hogs.Console(file=out, width=300, force_terminal=False), *args)   # largo: nenhuma célula quebra
+        return out.getvalue()
+
+    def test_table_shows_conversation_pushed_and_new_verdicts(self):
+        text = self.text(hogs.worktrees_report, self.rows(), self.DEV, 0, 30)
+        for expected in ("Conversa", "● Relatório mensal", "reabra antes de apagar", "✓ enviado (origin/feat/rel)",
+                         "seguro · #1", "a pasta sai, a branch fica", "EM ANDAMENTO",
+                         "está sem merge e foi mexido nos últimos 30 dias",
+                         "cd /dev/shop-api-relatorio && claude --resume s-123", "Merge e envio conferidos"):
+            self.assertIn(expected, text)
+
+    def test_clean_warns_to_reopen_before_confirm(self):
+        with mock.patch.object(hogs.Prompt, "ask", return_value="a"), \
+                mock.patch.object(hogs.Confirm, "ask", return_value=False):
+            text = self.text(hogs.clean_worktrees, self.rows(), 0, self.DEV)
+        self.assertIn("⚠ reabra antes de apagar “Relatório mensal”: "
+                      "cd /dev/shop-api-relatorio && claude --resume s-123", text)
+        self.assertIn("Nada apagado", text)
+
+
+class WorktreeSummaryTest(unittest.TestCase):
+    DEV = Path("/dev")
+
+    def wt(self, name, merged="", pushed="", convs=(), **kw):
+        return hogs.Worktree(self.DEV / name, self.DEV / "shop-api", branch=f"refs/heads/{name}", size=1000,
+                             last_activity=time.time() - 41 * 86400, merged=merged, pushed=pushed,
+                             conversations=list(convs), **kw)
+
+    def summary(self, rows, width=300):
+        out = io.StringIO()
+        hogs.worktrees_summary(hogs.Console(file=out, width=width, force_terminal=False), rows, self.DEV, 0, 30)
+        return out.getvalue()
+
+    def conv(self, n, title="T", reopen=True):
+        c = hogs.Conversation(f"s-{n}", title, str(self.DEV / f"shop-api-w{n}"), time.time() - 3600)
+        return hogs.ConvLink(c, "dentro", reopen)
+
+    def test_only_unmerged_safe_never_claims_main(self):
+        text = self.summary([self.wt("a", pushed="origin/a", eligible=True)])
+        self.assertNotIn("Já estão na main", text)
+        self.assertIn("1 worktree sem merge, parados há mais de 30 dias, com tudo commitado e enviado "
+                      "(conferido nas referências locais de origin): a pasta sai, a branch fica.", text)
+
+    def test_only_merged_safe_has_no_unmerged_paragraph(self):
+        text = self.summary([self.wt("a", merged="squash em origin/main", eligible=True)])
+        self.assertIn("Já estão na main", text)
+        self.assertNotIn("sem merge, parados", text)
+
+    def test_both_kinds_have_both_paragraphs(self):
+        text = self.summary([self.wt("a", merged="merge em origin/main", eligible=True),
+                             self.wt("b", pushed="origin/b", eligible=True)])
+        self.assertIn("1 worktree: Já estão na main", text)
+        self.assertIn("1 worktree sem merge, parados", text)
+
+    def test_reopen_header_lines_and_overflow(self):
+        rows = [self.wt(f"w{n}", pushed="origin/x", eligible=True, convs=[self.conv(n)]) for n in range(7)]
+        text = self.summary(rows)
+        self.assertIn("⚠ Reabra antes de apagar (a conversa começou dentro da pasta):", text)
+        self.assertEqual(text.count("claude --resume"), 5)
+        self.assertIn("… mais 2", text)
+        self.assertIn("shop-api / w0: cd /dev/shop-api-w0 && claude --resume s-0", text)
+
+    def test_unmerged_paragraph_and_footer_name_the_remote_actually_checked(self):
+        # G7: o texto diz o remoto conferido, não "origin" fixo
+        text = self.summary([self.wt("a", pushed="fork/a", eligible=True)])
+        self.assertIn("com tudo commitado e enviado (conferido nas referências locais de fork)", text)
+        self.assertNotIn("origin", text)
+        text = self.summary([self.wt("a", pushed="fork/a", eligible=True), self.wt("b", pushed="origin/b", eligible=True)])
+        self.assertIn("com tudo commitado e enviado (conferido nas referências remotas locais)", text)
+        self.assertIn("Merge e envio conferidos nas referências remotas locais; rode git fetch", text)
+
+    def test_open_session_wait_has_its_own_category(self):
+        # G8: "conversa aberta do Claude Code" não cai em "tem conversa nos últimos N dias"
+        one = self.wt("a", waits=["conversa aberta do Claude Code: apps-1"])
+        self.assertEqual(hogs.worktree_category(one), "aberta")
+        self.assertIn("• 1 tem uma sessão do Claude Code aberta que trabalha nele", self.summary([one]))
+        two = [self.wt("b", waits=["conversa aberta do Claude Code: apps-1"]),
+               self.wt("c", waits=["conversa aberta do Claude Code: apps-2"])]
+        self.assertIn("• 2 têm uma sessão do Claude Code aberta que trabalha neles", self.summary(two))
+
+    def test_merge_category_does_not_assume_main(self):
+        # G9: a branch principal pode ser develop ou master
+        keep = self.wt("k", blockers=["merge não comprovado em origin/develop e há commits não enviados"])
+        self.assertIn("• 1 tem commits que não estão na branch principal nem foram enviados", self.summary([keep]))
+
+    def test_categories_singular_plural_and_conversa(self):
+        one = self.wt("a", waits=["conversa do Claude Code há 2 d: x"])
+        two = [self.wt("b", waits=["conversa do Claude Code há 2 d: x"]),
+               self.wt("c", waits=["conversa do Claude Code há 2 d: x"])]
+        self.assertEqual(hogs.worktree_category(one), "conversa")
+        self.assertIn("• 1 está sem merge e tem conversa do Claude Code nos últimos 30 dias", self.summary([one]))
+        self.assertIn("• 2 estão sem merge e têm conversa do Claude Code nos últimos 30 dias", self.summary(two))
+        text = self.summary([self.wt("d", waits=["sem merge, mexido há 3 d (em andamento; prazo 30 d)"])])
+        self.assertIn("está sem merge e foi mexido nos últimos 30 dias", text)
+        self.assertNotIn("{d}", text)
+
+
+class WorktreeTableTest(unittest.TestCase):
+    DEV = Path("/dev")
+
+    def table(self, rows, width=120):
+        out = io.StringIO()
+        with mock.patch.object(hogs, "worktrees_summary"):
+            hogs.worktrees_report(hogs.Console(file=out, width=width, force_terminal=False), rows, self.DEV, 0, 30)
+        return out.getvalue()
+
+    def link(self, n, title, last, reopen=False, live=False):
+        c = hogs.Conversation(f"s-{n}", title, "/dev/x", last, live=live)
+        return hogs.ConvLink(c, "branch", reopen)
+
+    def test_conversation_cell(self):
+        w = hogs.Worktree(self.DEV / "a", self.DEV / "r")
+        self.assertEqual(hogs.conversation_cell(w).plain, "—")
+        now = time.time()
+        w.conversations = [self.link(1, "", now - 7200), self.link(2, "Antiga", now - 5 * 86400, reopen=True)]
+        cell = hogs.conversation_cell(w).plain
+        self.assertEqual(cell, "(sem título)\nhá 2 h · +1 · ⚠ reabra antes de apagar")
+
+    def test_table_rows_by_verdict_at_normal_width(self):
+        now = time.time()
+        safe = hogs.Worktree(self.DEV / "ok", self.DEV / "shop-api", branch="refs/heads/ok", eligible=True,
+                             pushed="origin/ok", last_activity=now - 41 * 86400)
+        wait = hogs.Worktree(self.DEV / "wait", self.DEV / "shop-api", branch="refs/heads/wait",
+                             waits=["sem merge, mexido há 3 d"], reason="sem merge, mexido há 3 d")
+        keep = hogs.Worktree(self.DEV / "keep", self.DEV / "shop-api", branch="refs/heads/keep",
+                             blockers=["merge não comprovado"], reason="merge não comprovado",
+                             conversations=[self.link(1, "Título bem comprido para quebrar a coluna", now, live=True)])
+        text = self.table([safe, wait, keep])
+        self.assertIn("Conversa", text)
+        self.assertIn("🟢 seguro · #1", text)
+        self.assertIn("a pasta sai,", text)
+        self.assertIn("enviado", text)
+        self.assertIn("(origin/ok)", text)
+        self.assertIn("✗ sem merge", text)
+        self.assertIn("🟡 em andamento:", text)
+        self.assertIn("⚪ com trabalho só", text)          # a coluna quebra a linha aqui na largura 120
+        self.assertIn("aqui: merge não", text)
+        self.assertNotIn("depois:", text)
+        self.assertNotIn("manter:", text)
+        self.assertEqual(text.count("✗ não"), 2)
+        self.assertIn("● Título", text)
 
 if __name__ == "__main__":
     unittest.main()
