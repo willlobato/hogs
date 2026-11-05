@@ -2357,5 +2357,32 @@ class WorktreeTableTest(unittest.TestCase):
         self.assertEqual(text.count("✗ não"), 2)
         self.assertIn("● Título", text)
 
+# ---- Task 1
+
+
+# ---- Task 2
+
+
+# ---- Task 3
+
+
+# ---- Task 4
+
+
+# ---- Task 5
+
+
+# ---- Task 6
+
+
+# ---- Task 7
+
+
+# ---- Task 8
+
+
+# ---- Task 9
+
+
 if __name__ == "__main__":
     unittest.main()

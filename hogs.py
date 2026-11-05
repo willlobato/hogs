@@ -17,23 +17,28 @@ import math
 import os
 import plistlib
 import re
+import select
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import termios
 import time
+import tty
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable, Iterator, NamedTuple, TextIO
 
 try:
     from rich import box
+    from rich.cells import cell_len
     from rich.columns import Columns
-    from rich.console import Console, Group
+    from rich.console import Console, Group, RenderableType
     from rich.padding import Padding
     from rich.panel import Panel
     from rich.prompt import Confirm, Prompt
@@ -3158,6 +3163,30 @@ def clean(con: Console, s: Snapshot) -> None:
         msg.append("\nO Docker devolve o espaço do Docker.raw aos poucos; se não mudar, reinicie o Docker Desktop.",
                    style="dim")
     con.print(Panel(msg, border_style="green", padding=(0, 2)))
+
+
+# ---------------------------------------------------------------- tela: terminal
+
+
+# ---------------------------------------------------------------- tela: lista
+
+
+# ---------------------------------------------------------------- tela: itens e ações
+
+
+# ---------------------------------------------------------------- tela: desenho
+
+
+# ---------------------------------------------------------------- tela: abas Recomendado e Disco
+
+
+# ---------------------------------------------------------------- tela: aba Worktrees
+
+
+# ---------------------------------------------------------------- tela: aba Docker
+
+
+# ---------------------------------------------------------------- tela: app
 
 
 # ---------------------------------------------------------------- configuração e agente
