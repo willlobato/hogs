@@ -146,6 +146,14 @@ def short(p: Path | str) -> str:
     return str(p).replace(str(HOME), "~", 1)
 
 
+def plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def preview(names: list[str], n: int = 3) -> str:
+    return ", ".join(names[:n]) + ("…" if len(names) > n else "")
+
+
 def require(r: subprocess.CompletedProcess | None, what: str) -> subprocess.CompletedProcess:
     """Comando ausente, sem resposta ou com código ≠ 0 vira RuntimeError com a última linha do erro."""
     if r is None:
@@ -521,6 +529,42 @@ def image_ref(img: dict) -> str:
     return img.get("ref") or img["name"]
 
 
+def rollback_pairs(d: Docker) -> list[tuple[dict, dict]]:
+    """(ponto de volta, imagem atual da mesma origem); sem a imagem atual, não é ponto de volta."""
+    words = setting("rollback_tags")
+    by_ref = {i["name"]: i for i in d.images}
+    pairs: list[tuple[dict, dict]] = []
+    for img in d.images:
+        if img["used"] or img["origin"] == "none" or img.get("tag", "<none>") == "<none>":
+            continue
+        base = rollback_base(img["tag"], words)
+        current = by_ref.get(f"{img['repo']}:{base}") if base else None
+        if current is not None and current is not img:
+            pairs.append((img, current))
+    return pairs
+
+
+def rollback_info(d: Docker) -> list[tuple[dict, int, Risk, str]]:
+    """(imagem, quanto libera, risco, dica) de cada ponto de volta, do maior para o menor.
+    O relatório e o --clean usam esta mesma função, então o risco mostrado é sempre o mesmo."""
+    pairs = rollback_pairs(d)
+    if not pairs:
+        return []
+    now = time.time()
+    seen = first_seen([i["name"] for i, _ in pairs], now)
+    days = setting("rollback_days")
+    out = []
+    for img, current in sorted(pairs, key=lambda p: -p[0]["size"]):
+        age = rollback_age_days(img, current, seen[img["name"]], now)
+        old = age > days
+        hint = f"ponto de volta há {int(age)} dias" if old else "ponto de volta recente: o QA pode estar em andamento"
+        same = bool(img["id"]) and img["id"] == current["id"]
+        if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
+            hint = "mesma imagem da atual: só remove a tag"
+        out.append((img, 0 if same else img["size"], SAFE if old else EVAL, hint))
+    return out
+
+
 def docker_clean_items(d: Docker) -> list[Item]:
     if not d.running:
         return []
@@ -557,32 +601,11 @@ def docker_clean_items(d: Docker) -> list[Item]:
         items.append(Item("docker", f"Docker: container {c['name']}", c["size"], stopped_risk(c),
                           lambda n=c["name"]: run_all([["docker", "rm", n]]), why))
 
-    words = setting("rollback_tags")
-    by_ref = {i["name"]: i for i in d.images}
-    rollbacks: list[tuple[dict, dict]] = []
-    for img in d.images:
-        if img["used"] or img["origin"] == "none" or img.get("tag", "<none>") == "<none>":
-            continue
-        base = rollback_base(img["tag"], words)
-        current = by_ref.get(f"{img['repo']}:{base}") if base else None
-        if current is not None and current is not img:
-            rollbacks.append((img, current))
-    rollback_ids = {id(i) for i, _ in rollbacks}
-    if rollbacks:
-        now = time.time()
-        seen = first_seen([i["name"] for i, _ in rollbacks], now)
-        days = setting("rollback_days")
-        for img, current in sorted(rollbacks, key=lambda p: -p[0]["size"]):
-            age = rollback_age_days(img, current, seen[img["name"]], now)
-            old = age > days
-            hint = (f"ponto de volta há {int(age)} dias" if old
-                    else "ponto de volta recente: o QA pode estar em andamento")
-            same = bool(img["id"]) and img["id"] == current["id"]
-            if same:  # mesma imagem da atual: `rmi` só tira a tag e não libera nada
-                hint = "mesma imagem da atual: só remove a tag"
-            items.append(Item("docker", f"Ponto de volta {img['name']}", 0 if same else img["size"],
-                              SAFE if old else EVAL,
-                              lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]), hint))
+    rollbacks = rollback_info(d)
+    rollback_ids = {id(img) for img, _, _, _ in rollbacks}
+    for img, size, risk, hint in rollbacks:
+        items.append(Item("docker", f"Ponto de volta {img['name']}", size, risk,
+                          lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]), hint))
 
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):
@@ -2008,8 +2031,11 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
         rows.append(("Docker parado", 0, INFO, "abra o Docker Desktop pra ver o detalhe"))
         return rows
 
+    rollbacks = rollback_info(d)
+    rollback_ids = {id(img) for img, _, _, _ in rollbacks}
+
     def group(pred):
-        sel = [i for i in d.images if pred(i)]
+        sel = [i for i in d.images if pred(i) and id(i) not in rollback_ids]
         return sel, sum(i["size"] for i in sel)
 
     used, used_size = group(lambda i: i["used"])
@@ -2024,6 +2050,7 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
         (f"Imagens em uso ({len(used)})", used_size, INFO, "usadas por containers"),
         (f"Imagens sem uso, de registry ({len(pull)})", pull_size, REDOWN, "voltam com docker pull"),
         (f"Imagens sem uso, construídas aqui ({len(local)})", local_size, LOSS, local_names),
+        *rollback_rows(rollbacks),
         (f"Imagens sem tag ({len(none)})", none_size, SAFE, "versões antigas órfãs"),
         ("Cache de build", d.build_cache, SAFE, "próximo build fica mais lento"),
         *[(f"Cache do builder {bc['builder']}", bc["size"], SAFE, "volume do BuildKit; o daemon.json não limita")
@@ -2035,6 +2062,17 @@ def docker_rows(d: Docker) -> list[tuple[str, int, Risk, str]]:
     untracked = d.raw_real - d.total
     if untracked > 3 * GB:
         rows.append(("Não contabilizado pelo Docker", untracked, INFO, "VM e sobras; parte volta ao reiniciar o Docker"))
+    return rows
+
+
+def rollback_rows(rollbacks: list[tuple[dict, int, Risk, str]]) -> list[tuple[str, int, Risk, str]]:
+    """Pontos de volta numa linha por risco, o mesmo do --clean (🟢 passados do prazo, 🟡 recentes)."""
+    rows = []
+    for risk, label in ((SAFE, "Pontos de volta"), (EVAL, "Pontos de volta recentes")):
+        sel = [(img, size) for img, size, r, _ in rollbacks if r is risk]
+        if sel:
+            rows.append((f"{label} ({len(sel)})", sum(size for _, size in sel), risk,
+                         preview([img["name"] for img, _ in sel])))
     return rows
 
 
@@ -2063,10 +2101,14 @@ def unused_images_table(d: Docker) -> Table | None:
     t.add_column("Tamanho", justify="right", no_wrap=True)
     t.add_column("Origem", no_wrap=True)
     t.add_column("Criada", style="dim", no_wrap=True)
+    rollback_risk = {id(img): risk for img, _, risk, _ in rollback_info(d)}
     for i in imgs:
-        risk = LOSS if i["origin"] == "local" else REDOWN
+        if id(i) in rollback_risk:
+            risk, origin = rollback_risk[id(i)], "ponto de volta"
+        else:
+            risk, origin = (LOSS if i["origin"] == "local" else REDOWN), ORIGIN_LABEL[i["origin"]]
         t.add_row(i["name"], Text(fmt(i["size"]), style="bold"),
-                  Text(f"{risk.icon} {ORIGIN_LABEL[i['origin']]}", style=risk.color), i["created"])
+                  Text(f"{risk.icon} {origin}", style=risk.color), i["created"])
     return t
 
 
@@ -2112,10 +2154,12 @@ def breakdown(s: Snapshot) -> list[tuple[str, int, str]]:
                        ("Não identificado", unknown, "grey50"), ("Livre", s.free, "green")]
 
 
-def header(s: Snapshot, records: list[dict] | None = None) -> Panel:
+def header(s: Snapshot, records: list[dict] | None = None, cleanable: list[Item] | None = None) -> Panel:
     used = s.total - s.free
     segs = breakdown(s)
-    recommended = s.free + sum(i.size for i in clean_items(s) if i.risk is SAFE)
+    if cleanable is None:
+        cleanable = clean_items(s)
+    recommended = s.free + sum(i.size for i in cleanable if i.risk is SAFE)
 
     width = 64
     bar, cum, pos = Text(), 0, 0
@@ -2207,14 +2251,6 @@ def prevention_panel(s: Snapshot) -> Panel | None:
 CAT_TITLES = {"docker": "🐳 Docker", "dev": "🧰 Caches de dev", "apps": "📦 Apps e dados", "worktree": "🌳 Worktrees"}
 
 
-def plural(n: int, one: str, many: str) -> str:
-    return f"{n} {one if n == 1 else many}"
-
-
-def preview(names: list[str], n: int = 3) -> str:
-    return ", ".join(names[:n]) + ("…" if len(names) > n else "")
-
-
 def recommended_panel(s: Snapshot, cleanable: list[Item]) -> Panel:
     """Só os 🟢 contam como recomendado; as ações do macOS (↻) e os 🟡 para avaliar aparecem à parte."""
     t = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
@@ -2230,17 +2266,17 @@ def recommended_panel(s: Snapshot, cleanable: list[Item]) -> Panel:
         t.add_row(Text(CAT_TITLES.get(cat, cat), style="bold"), Text(fmt(sum(i.size for i in items)), style="bold"),
                   "", "")
         for i in sorted(items, key=lambda i: -i.size):
-            t.add_row(f"   {i.label}", fmt(i.size), Text(SAFE.icon), i.hint)
+            why = i.guard() if i.guard else None   # ex.: app aberto; a guarda vale de novo na hora de apagar
+            t.add_row(f"   {i.label}", fmt(i.size), Text(SAFE.icon), Text(why, style="yellow") if why else i.hint)
     for label, size, how in s.advice:
         t.add_row(f"💻 {label}", f"~{fmt(size)}" if size else "", Text("↻", style="cyan"), how)
     evals = [i for i in cleanable if i.risk is EVAL]
-    if evals:
-        files = sum(1 for i in evals if i.cat != "docker")
-        kinds = [plural(files, "arquivo (vai para a Lixeira)", "arquivos (vão para a Lixeira)") if files else "",
-                 plural(len(evals) - files, "ponto de volta recente", "pontos de volta recentes")
-                 if len(evals) > files else ""]
-        t.add_row(f"🗂  Arquivos parados para avaliar ({len(evals)})", fmt(sum(i.size for i in evals)),
-                  Text(EVAL.icon), " e ".join(k for k in kinds if k) + " · um por um no hogs --clean")
+    for title, sel, why in (
+            ("🗂  Arquivos parados para avaliar", [i for i in evals if i.cat != "docker"], "vão para a Lixeira"),
+            ("🐳 Pontos de volta recentes", [i for i in evals if i.cat == "docker"], "o QA pode estar em andamento")):
+        if sel:
+            t.add_row(f"{title} ({len(sel)})", fmt(sum(i.size for i in sel)), Text(EVAL.icon),
+                      f"{why} · um por um no hogs --clean")
     body: list = [t] if t.row_count else [Text("Nada recomendado agora. 🎉", style="green")]
     if not s.mounts_known:
         body.append(Text("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.",
@@ -2263,6 +2299,8 @@ def protected_panel(s: Snapshot) -> Panel:
     if s.mounts:
         lines.append(f"{plural(len(s.mounts), 'caminho montado', 'caminhos montados')} em containers "
                      f"({preview([short(m) for m in s.mounts])}): nada ali dentro é sugerido")
+    if not s.mounts_known:
+        lines.append("Docker não respondeu: não sei o que está em uso.")
     text = Text("\n".join(lines) if lines else "Nada em uso pelo Docker agora.")
     return Panel(text, title="[bold]🛡 Não mexo[/]", title_align="left", border_style="grey50", padding=(0, 2))
 
@@ -2270,7 +2308,7 @@ def protected_panel(s: Snapshot) -> Panel:
 def report(con: Console, s: Snapshot, records: list[dict] | None = None) -> None:
     records = records or []
     cleanable = clean_items(s)
-    con.print(header(s, records))
+    con.print(header(s, records, cleanable))
     con.print(recommended_panel(s, cleanable))
     con.print(protected_panel(s))
     con.print(growth_table(s, records))
@@ -2405,6 +2443,13 @@ def setting(key: str) -> object:
     elif isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
     return default
+
+
+def remember_worktrees_root(path: Path) -> None:
+    """Guarda a pasta do último --worktrees; o relatório mede ela como "Projetos"."""
+    cfg = load_config()
+    cfg["worktrees_root"] = str(path.expanduser().resolve())
+    save_config(cfg)
 
 
 def log(msg: str) -> None:
@@ -2621,6 +2666,7 @@ def run() -> None:
 
     con = Console()
     if args.worktrees:
+        remember_worktrees_root(args.worktrees)
         with con.status("[bold]🌳 Conferindo worktrees, alterações e sinais de uso…[/]"):
             rows, warnings = gather_worktrees(args.worktrees, args.worktree_days)
         root = args.worktrees.expanduser().resolve()

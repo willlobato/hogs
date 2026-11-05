@@ -690,7 +690,8 @@ class BreakdownTest(unittest.TestCase):
         s = self.snap(92e9, 0, 0)
         s.items += [hogs.Item("apps", "Lixeira", 2e9, hogs.SAFE, lambda: None),
                     hogs.Item("apps", "Parado: ~/a.mov", 5e9, hogs.EVAL, lambda: None),
-                    hogs.Item("apps", "Parado: ~/b.iso", 1e9, hogs.EVAL, lambda: None)]
+                    hogs.Item("apps", "Parado: ~/b.iso", 1e9, hogs.EVAL, lambda: None),
+                    hogs.Item("docker", "Ponto de volta app:antes-x", 3e9, hogs.EVAL, lambda: None)]
         s.advice = [("Reiniciar o Mac", 13e9, "swap 13,0 GB · ligado há 20 dias")]
         s.docker.live = ["shop-db"]
         s.mounts = [Path("/u/dev/db/data")]
@@ -699,9 +700,10 @@ class BreakdownTest(unittest.TestCase):
         recommended = out.split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
         self.assertIn("Lixeira", recommended)
         self.assertIn("↻", recommended)
-        self.assertIn("Arquivos parados para avaliar (2)", recommended)
-        self.assertIn("2 arquivos (vão para a Lixeira)", " ".join(recommended.split()))
-        self.assertIn("6,0 GB", recommended)
+        files = next(line for line in recommended.splitlines() if "Arquivos parados para avaliar (2)" in line)
+        self.assertIn("6,0 GB", files)
+        rollbacks = next(line for line in recommended.splitlines() if "Pontos de volta recentes (1)" in line)
+        self.assertIn("3,0 GB", rollbacks)
         self.assertNotIn("Docker não respondeu", out)
         protected = out.split("🛡 Não mexo")[1]
         self.assertIn("1 container rodando (shop-db)", protected)
@@ -710,8 +712,61 @@ class BreakdownTest(unittest.TestCase):
     def test_report_says_why_files_are_not_suggested_without_docker(self):
         s = self.snap(0, 0, 0)
         s.mounts_known = False
-        self.assertIn("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.",
-                      " ".join(self.render_report(s).split()))
+        out = " ".join(self.render_report(s).split())
+        self.assertIn("Docker não respondeu: não sei quais pastas os containers usam, então não sugiro arquivos.", out)
+        protected = out.split("🛡 Não mexo")[1]
+        self.assertIn("Docker não respondeu: não sei o que está em uso.", protected)
+        self.assertNotIn("Nada em uso pelo Docker agora", protected)
+
+    def test_report_shows_guard_reason_of_open_app(self):
+        s = self.snap(0, 0, 0)
+        group = hogs.CloneGroup("Navegador", "Navegador", "122.0", {"120.0": [Path("/x/c1")]})
+        with mock.patch.object(hogs, "du", return_value=2e9):
+            s.items += hogs.sign_clone_items([group])
+        with mock.patch.object(hogs, "process_running", return_value=True):
+            recommended = self.render_report(s).split("✨ Recomendado agora")[1].split("🛡 Não mexo")[0]
+        line = next(line for line in recommended.splitlines() if "Cópias antigas do Navegador" in line)
+        self.assertIn("feche o Navegador antes", line)
+
+    def test_rollback_risk_in_report_rows_matches_clean(self):
+        tmp = Path(tempfile.mkdtemp())
+        now = time.time()
+        (tmp / "s.json").write_text(json.dumps({"app:antes-velho": now - 30 * 86400}))
+
+        def img(tag, used=False):
+            return {"name": f"app:{tag}", "repo": "app", "tag": tag, "ref": f"app:{tag}", "size": 1e9, "used": used,
+                    "origin": "local", "created": "", "id": tag, "created_at": now - 60 * 86400}
+        d = hogs.Docker(running=True, images=[img("latest", True), img("antes-velho"), img("antes-novo")])
+        with mock.patch.object(hogs, "SEEN_TAGS", tmp / "s.json"), mock.patch.object(hogs, "DATA_DIR", tmp), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            clean = {i.label.split()[-1]: i.risk for i in hogs.clean_items(hogs.Snapshot(1, 1, d, [], []))
+                     if i.label.startswith("Ponto de volta")}
+            rows = hogs.docker_rows(d)
+            con = hogs.Console(file=io.StringIO(), width=160)
+            con.print(hogs.unused_images_table(d))
+        self.assertEqual(clean, {"app:antes-velho": hogs.SAFE, "app:antes-novo": hogs.EVAL})
+        for name, risk in clean.items():
+            row = next(r for r in rows if name in r[3])
+            self.assertIs(row[2], risk)
+            self.assertTrue(row[0].startswith("Pontos de volta"))
+        self.assertIn(("Imagens sem uso, construídas aqui (0)", 0), [(r[0], r[1]) for r in rows])
+        table = con.file.getvalue()
+        self.assertNotIn("construída aqui", table)
+        self.assertIn(f"{hogs.SAFE.icon} ponto de volta", table)
+        self.assertIn(f"{hogs.EVAL.icon} ponto de volta", table)
+
+    def test_worktrees_folder_is_remembered_keeping_other_settings(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "projetos").mkdir()
+        (tmp / "config.json").write_text(json.dumps({"alert_gb": 30}))
+        with mock.patch.object(hogs, "DATA_DIR", tmp), mock.patch.object(hogs, "CONFIG", tmp / "config.json"), \
+                mock.patch.object(sys, "argv", ["hogs", "--worktrees", str(tmp / "projetos")]), \
+                mock.patch.object(hogs, "gather_worktrees", return_value=([], [])), \
+                mock.patch.object(hogs, "worktrees_report"):
+            hogs.run()
+            self.assertEqual(hogs.load_config(),
+                             {"alert_gb": 30, "worktrees_root": str((tmp / "projetos").resolve())})
+            self.assertEqual(hogs.projects_root(), (tmp / "projetos").resolve())
 
     def test_history_keys_skip_counts_and_files_to_evaluate(self):
         s = self.snap(0, 0, 0)
