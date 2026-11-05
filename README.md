@@ -116,6 +116,7 @@ Você escolhe por número (`1,3,5-7`) ou digita `a` para todos os 🟢. Antes de
 - 🛡️ Imagem sem tag baixada por digest (`postgres@sha256:…`) é removida pelo digest, nunca por `docker rmi postgres` (que seria a `postgres:latest`).
 - Se um comando de limpeza falha, o item aparece como mantido, com a mensagem de erro, e não como apagado.
 - 🛡️ Imagens construídas localmente aparecem uma por uma, nunca em grupo.
+- 🛡️ Pontos de volta de imagens (`antes-*`, `backup-*`…) só viram 🟢 depois de `rollback_days` dias (padrão 2, configurável), contados a partir do sinal mais recente; antes disso ficam 🟡 para avaliar.
 - 🛡️ Não apaga a VM do Claude enquanto o app está aberto.
 - Nada é apagado sem você confirmar.
 

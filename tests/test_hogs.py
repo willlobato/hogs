@@ -102,6 +102,63 @@ class ParseGbTest(unittest.TestCase):
                 hogs.parse_gb(bad, "uso")
 
 
+class RollbackTest(unittest.TestCase):
+    W = ["antes", "backup"]
+
+    def test_base_of_rollback_tags(self):
+        self.assertEqual(hogs.rollback_base("antes-20261104-2004", self.W), "latest")
+        self.assertEqual(hogs.rollback_base("web-local-antes-checkout", self.W), "web-local")
+        self.assertEqual(hogs.rollback_base("Backup-1", self.W), "latest")
+        self.assertIsNone(hogs.rollback_base("latest", self.W))
+        self.assertIsNone(hogs.rollback_base("antesx", self.W))
+
+    def test_tag_date(self):
+        self.assertEqual(hogs.tag_date("antes-20261104-2004"), time.mktime((2026, 11, 4, 20, 4, 0, 0, 0, -1)))
+        self.assertIsNone(hogs.tag_date("antes-tema-qa"))
+
+    def test_age_uses_youngest_signal(self):
+        now = time.time()
+        img = {"tag": "antes-20200101-0000"}
+        self.assertAlmostEqual(hogs.rollback_age_days(img, {"created_at": now - 3 * 86400}, now - 10 * 86400, now), 3, 1)
+        self.assertAlmostEqual(hogs.rollback_age_days(img, {"created_at": None}, now - 1 * 86400, now), 1, 1)
+
+    def test_first_seen_corrupt_or_future_is_now(self):
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(hogs, "SEEN_TAGS", tmp / "s.json"), mock.patch.object(hogs, "DATA_DIR", tmp):
+            (tmp / "s.json").write_text("{lixo")
+            self.assertEqual(hogs.first_seen(["a:antes-1"], 100.0), {"a:antes-1": 100.0})
+            (tmp / "s.json").write_text(json.dumps({"a:antes-1": 999.0, "sumiu:x": 5.0}))
+            self.assertEqual(hogs.first_seen(["a:antes-1"], 100.0), {"a:antes-1": 100.0})
+
+    def items(self, ages_days, current=True):
+        now = time.time()
+        d = hogs.Docker(running=True)
+        d.images = [{"name": "app:antes-x", "repo": "app", "tag": "antes-x", "ref": "app:antes-x", "size": 7e8,
+                     "used": False, "origin": "local", "created": "", "id": "1", "created_at": now - 90 * 86400}]
+        if current:
+            d.images.append({"name": "app:latest", "repo": "app", "tag": "latest", "ref": "app:latest", "size": 7e8,
+                             "used": True, "origin": "local", "created": "", "id": "2",
+                             "created_at": now - ages_days * 86400})
+        with mock.patch.object(hogs, "first_seen", return_value={"app:antes-x": now - 90 * 86400}), \
+                mock.patch.object(hogs, "load_config", return_value={}):
+            return {i.label: i for i in hogs.docker_clean_items(d)}
+
+    def test_old_rollback_is_safe_recent_is_eval_and_never_grouped(self):
+        item = self.items(3)["Ponto de volta app:antes-x"]
+        self.assertIs(item.risk, hogs.SAFE)
+        self.assertIs(self.items(1)["Ponto de volta app:antes-x"].risk, hogs.EVAL)
+        calls = []
+        with mock.patch.object(hogs, "sh", lambda cmd, timeout=60: calls.append(cmd) or
+                               subprocess.CompletedProcess(cmd, 0, "", "")):
+            item.action()
+        self.assertEqual(calls, [["docker", "rmi", "app:antes-x"]])  # só a tag, nunca o ID
+
+    def test_without_current_image_it_stays_a_local_loss(self):
+        labels = self.items(3, current=False)
+        self.assertNotIn("Ponto de volta app:antes-x", labels)
+        self.assertIs(labels["Imagem app:antes-x"].risk, hogs.LOSS)
+
+
 class AgoTest(unittest.TestCase):
     def days_ago(self, n):
         return hogs.ago(datetime.now(timezone.utc) - timedelta(days=n, hours=1))
