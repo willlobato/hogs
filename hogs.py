@@ -116,6 +116,7 @@ class Item:
     kind: str = ""               # "pessoal" | "ponto_de_volta": separa os 🟡 para avaliar no Recomendado
     path: Path | None = None     # onde o item mora no disco (para abrir no Finder e mostrar no 🔎)
     worktree: Worktree | None = None   # o worktree, quando o item é um só
+    refs: list[str] = field(default_factory=list)   # imagens do Docker (image_ref) que o item remove
 
 
 # ---------------------------------------------------------------- utilidades
@@ -794,7 +795,7 @@ def docker_clean_items(d: Docker) -> list[Item]:
         ids = [i["id"] for i in untagged]
         items.append(Item("docker", f"Docker: imagens sem tag ({len(untagged)})", sum(i["size"] for i in untagged),
                           SAFE, lambda ids=ids: run_all([["docker", "rmi", x] for x in ids]), "versões antigas órfãs",
-                          kind="sem_tag"))
+                          kind="sem_tag", refs=[image_ref(i) for i in untagged]))
 
     old = [c for c in d.stopped if is_old_stopped(c)]
     if old:
@@ -816,7 +817,7 @@ def docker_clean_items(d: Docker) -> list[Item]:
     for rb in rollbacks.values():
         items.append(Item("docker", f"Ponto de volta {rb.img['name']}", rb.size, rb.risk,
                           lambda ref=image_ref(rb.img): run_all([["docker", "rmi", ref]]), rb.hint,
-                          kind="ponto_de_volta"))
+                          kind="ponto_de_volta", refs=[image_ref(rb.img)]))
 
     small_pullable = []
     for img in sorted(d.images, key=lambda i: -i["size"]):
@@ -828,14 +829,15 @@ def docker_clean_items(d: Docker) -> list[Item]:
             continue
         items.append(Item("docker", f"Imagem {img['name']}", img["size"], LOSS if local else REDOWN,
                           lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]),
-                          f"{ORIGIN_LABEL[img['origin']]} · {img['created']}", kind="imagem"))
+                          f"{ORIGIN_LABEL[img['origin']]} · {img['created']}", kind="imagem",
+                          refs=[image_ref(img)]))
     if small_pullable:
         names = [i["name"] for i in small_pullable]
         refs = [image_ref(i) for i in small_pullable]
         items.append(Item("docker", f"Imagens pequenas de registry/Hub ({len(names)})",
                           sum(i["size"] for i in small_pullable), REDOWN,
                           lambda refs=refs: run_all([["docker", "rmi", r] for r in refs]),
-                          preview([n.rsplit("/", 1)[-1] for n in names]), kind="imagem"))
+                          preview([n.rsplit("/", 1)[-1] for n in names]), kind="imagem", refs=refs))
     return items
 
 
@@ -4116,6 +4118,7 @@ class App:
         self.marked: set[str] = set()
         self.gone: set[str] = set()
         self.gone_paths: set[Path] = set()
+        self.gone_refs: set[str] = set()
         self.skipped: dict[str, str] = {}
         self.mode = "list"
         self.status = ""
@@ -4136,10 +4139,9 @@ class App:
         return [w for w in self.worktrees if w.path not in self.gone_paths]
 
     def docker_left(self) -> Docker:
+        """O Docker da medição sem as imagens que os itens ✔ removeram (pelas referências de cada item)."""
         d = self.s.docker
-        gone = {k.split("|", 1)[1] for k in self.gone if k.startswith("docker|")}
-        images = [img for img in d.images
-                  if f"Imagem {img['name']}" not in gone and f"Ponto de volta {img['name']}" not in gone]
+        images = [img for img in d.images if image_ref(img) not in self.gone_refs]
         return Docker(**{**vars(d), "images": images})
 
     def tree(self, n: int) -> tuple[list[Column], list[Row]]:
@@ -4462,6 +4464,7 @@ class App:
                 self.done_items.append(i)
                 if i.worktree is not None:
                     self.gone_paths.add(i.worktree.path)
+                self.gone_refs.update(i.refs)
                 self.log.append(f"✔ {i.label}")
             else:
                 self.skipped[k] = why

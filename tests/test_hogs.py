@@ -3008,6 +3008,36 @@ class AppTest(unittest.TestCase):
         self.press(app, "x")
         self.assertEqual(app.mode, "list")
 
+    def test_removed_docker_items_take_their_images_out_of_the_docker_tab(self):
+        d = DockerTreeTest.docker(None)
+        for name in ("tiny:1", "tiny:2"):
+            d.images.append({"repo": "tiny", "tag": name[-1], "id": f"t{name[-1]}", "name": name, "ref": name,
+                             "size": 2e6, "used": False, "origin": "hub", "created": "1 day ago", "labels": {}})
+        s = hogs.Snapshot(500 * hogs.GB, 28 * hogs.GB, d, [], [])
+        with mock.patch.object(hogs, "first_seen", return_value={"acme/api:antes-20260101-1200": 0}):
+            app = hogs.App(s, [], [], None, trim_off=False)
+        for i in app.items:
+            i.action = lambda label=i.label: self.calls.append(label)
+        small, latest, rollback = ("docker|Imagens pequenas de registry/Hub (2)", "docker|Imagem acme/api:latest",
+                                   "docker|Ponto de volta acme/api:antes-20260101-1200")
+
+        def images():
+            rows = {r.key: r for r in app.trees()[2][1]}
+            return rows["dk/images"], {str(c.cells[0]) for r in rows.values() for c in r.children}
+
+        group, before = images()
+        self.assertTrue({small[7:], latest[7:], rollback[7:]} <= before)
+        self.assertEqual(str(group.cells[1]), hogs.fmt(3e9 + 2e9 + 4e6))
+        app.marked = {small, latest, rollback}
+        app.execute()
+        self.assertEqual(len(self.calls), 3)
+        group, after = images()
+        for name in ("tiny:1", "tiny:2", "acme/api:latest", "acme/api:antes-20260101-1200"):
+            self.assertFalse(any(name in label for label in after), name)
+        self.assertNotIn(small[7:], after)
+        self.assertEqual(str(group.cells[1]), hogs.fmt(3e9))
+        self.assertEqual(app.marked, set())
+
     def test_reopen_warning_in_confirm(self):
         rows = WorktreesTreeTest.rows(self)[:3]
         conv = hogs.Conversation("s-7", "Checkout v2", "/dev/shop-api/a", time.time() - 86400)
