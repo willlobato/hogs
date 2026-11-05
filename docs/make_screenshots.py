@@ -79,14 +79,15 @@ DEV, T0 = Path("~/Development"), time.time()
 
 
 def wt(repo, name, branch, gb, age, merged="", users=(), sessions=(), blockers=(), waits=(), ok=False,
-       pushed="", conversations=()):
+       pushed="", conversations=(), leftovers=()):
     w = h.Worktree(DEV / name, DEV / repo, branch=f"refs/heads/{branch}", size=int(gb * GB),
                    last_activity=T0 - age, eligible=ok, merged=merged, pushed=pushed, users=list(users),
                    sessions=list(sessions), blockers=list(blockers), waits=list(waits),
-                   conversations=list(conversations))
+                   conversations=list(conversations), leftovers=list(leftovers))
     w.reason = (f"{merged} · mexido {h.elapsed(w.last_activity)}" if ok and merged
                 else f"enviado a {pushed} · mexido {h.elapsed(w.last_activity)} · a branch fica" if ok
-                else (w.blockers or w.waits)[0])
+                else f"{merged} · {len(w.leftovers)} fora do Git vão para a Lixeira: {h.leftover_text(w.leftovers)}"
+                if w.trashable else (w.blockers or w.waits)[0])
     return w
 
 
@@ -103,7 +104,7 @@ WORKTREES = [
     wt("app", "app-dashboard", "feat/dashboard", 1.4, 2 * H, users=["Claude Code app-7", "node ×3"],
        sessions=["app-7"], blockers=["merge não comprovado em origin/main"]),
     wt("api", "api-infra", "feat/infra", 0.6, 9 * D, "merge em origin/main",
-       blockers=["ignorados que não voltam pelo Git: .terraform/, .env"]),
+       leftovers=[".terraform/", ".env"]),
     wt("api", "api-cache", "feat/cache", 0.3, 3 * D, "rebase em origin/main", ["node ×2"],
        waits=["em uso agora: node ×2"]),
     # Caminho absoluto fictício: resume_command não expande "~".

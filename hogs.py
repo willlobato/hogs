@@ -49,7 +49,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -866,10 +866,21 @@ class Worktree:
     waits: list[str] = field(default_factory=list)         # 🟡 depois: em uso ou mexido há pouco
     conversations: list[ConvLink] = field(default_factory=list)  # conversas do Claude Code ligadas a ele
     checks: list[tuple[bool, str]] = field(default_factory=list)  # cada verificação: (passou, texto)
+    leftovers: list[str] = field(default_factory=list)     # fora do Git (não versionados e ignorados que não
+                                                           # voltam), relativos à pasta; só num worktree mergeado
+
+    @property
+    def trashable(self) -> bool:
+        """Mergeado e limpo, a não ser por arquivos fora do Git: sai mandando esses arquivos para a Lixeira."""
+        return bool(self.merged and self.leftovers and not self.blockers and not self.waits)
 
     @property
     def verdict(self) -> str:
-        return "seguro" if self.eligible else ("manter" if self.blockers or not self.waits else "depois")
+        if self.eligible:
+            return "seguro"
+        if self.trashable:
+            return "avaliar"
+        return "manter" if self.blockers or not self.waits else "depois"
 
     def latest_conversation(self) -> ConvLink | None:
         """A conversa ligada mais recente (pela última mensagem); None sem conversa."""
@@ -981,6 +992,39 @@ def protected_ignored(listing: str, path: Path) -> list[str]:
         if not any(entry.startswith(k) for k in kept if k.endswith("/")):
             kept.append(entry)
     return kept
+
+
+def split_status(out: str) -> tuple[list[str], int]:
+    """Saída de `git status --porcelain -z`: (não versionados, quantas alterações em arquivos versionados).
+
+    Pasta não versionada inteira vem numa entrada só ("tmp/"). Renomeado/copiado traz a origem no token seguinte."""
+    untracked, changed = [], 0
+    tokens = out.split("\0")
+    n = 0
+    while n < len(tokens):
+        token = tokens[n]
+        n += 1
+        if not token:
+            continue
+        if token.startswith("?? "):
+            untracked.append(token[3:])
+            continue
+        changed += 1
+        if "R" in token[:2] or "C" in token[:2]:
+            n += 1
+    return untracked, changed
+
+
+def leftover_line(w: Worktree, entry: str) -> str:
+    """Como um arquivo fora do Git aparece na confirmação e no 🔎."""
+    if (w.path / entry).is_symlink():
+        return f"→ atalho removido (o destino fica): {entry}"
+    return f"→ Lixeira: {entry}"
+
+
+def leftover_text(entries: list[str]) -> str:
+    more = f" (+{len(entries) - 3})" if len(entries) > 3 else ""
+    return ", ".join(entries[:3]) + more
 
 
 def default_branch(path: Path, remote: str = "origin") -> str:
@@ -1460,14 +1504,6 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
 
         # ⚪ trabalho que só existe aqui, ou dúvida
         b = result.blockers
-        status = git_at(w.path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
-        if status is None or status.returncode:
-            b.append("não foi possível verificar alterações locais")
-        elif status.stdout:
-            b.append(f"{len(status.stdout.splitlines())} alterações locais ou arquivos não versionados")
-        if (w.path / ".gitmodules").exists():
-            b.append("contém submódulos; revise antes")
-        check("tudo commitado")
         ref = default_branch(w.path)
         base_name = ref.removeprefix("refs/remotes/").partition("/")[2]
         if not ref:
@@ -1488,15 +1524,35 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
         check(f"já na {base_name} ({result.merged})" if result.merged
               else f"enviado a {result.pushed} (conferido nas referências locais de "
                    f"{result.pushed.partition('/')[0]})")
+        # Fora do Git: num worktree mergeado, sai pela Lixeira (🟡, marcado um por um); sem merge, segura (⚪).
+        # Alteração em arquivo versionado segura sempre.
+        status = git_at(w.path, "status", "--porcelain", "-z", "--untracked-files=normal",
+                        "--ignore-submodules=none")
+        untracked: list[str] = []
+        if status is None or status.returncode:
+            b.append("não foi possível verificar alterações locais")
+        else:
+            untracked, changed = split_status(status.stdout)
+            if changed:
+                b.append(f"{changed} alterações locais sem commit")
+            elif untracked and not result.merged:
+                b.append(f"{len(untracked)} alterações locais ou arquivos não versionados")
+        if (w.path / ".gitmodules").exists():
+            b.append("contém submódulos; revise antes")
+        check("tudo commitado")
         ignored = git_at(w.path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
+        kept: list[str] = []
         if ignored is None or ignored.returncode:
             b.append("não foi possível verificar arquivos ignorados")
         else:
             kept = protected_ignored(ignored.stdout, w.path)
-            if kept:
-                more = f" (+{len(kept) - 3})" if len(kept) > 3 else ""
-                b.append(f"ignorados que não voltam pelo Git: {', '.join(kept[:3])}{more}")
+            if kept and not result.merged:
+                b.append(f"ignorados que não voltam pelo Git: {leftover_text(kept)}")
         check("sem .env nem arquivo que o Git não recupera")
+        if result.merged and (untracked or kept):
+            result.leftovers = untracked + kept
+            result.checks[-1] = (False, f"{len(result.leftovers)} fora do Git, vão para a Lixeira: "
+                                        f"{leftover_text(result.leftovers)}")
 
         # Quem usa a pasta. Sessões do Claude Code e do Codex que trabalharam nele são só informação: o
         # trabalho delas já está na main. Trava apenas o que roda dentro da pasta agora (dev server,
@@ -1557,8 +1613,12 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
     except (OSError, RuntimeError, KeyError) as exc:
         result.blockers.append(f"inspeção inconclusiva: {exc}")
         check("")
-    result.eligible = not result.blockers and not result.waits and bool(result.merged or result.pushed)
-    if result.eligible and not result.merged:
+    result.eligible = (not result.blockers and not result.waits and not result.leftovers
+                       and bool(result.merged or result.pushed))
+    if result.trashable:
+        result.reason = (f"{result.merged} · {len(result.leftovers)} fora do Git vão para a Lixeira: "
+                         f"{leftover_text(result.leftovers)}")
+    elif result.eligible and not result.merged:
         result.reason = f"enviado a {result.pushed} · mexido {elapsed(result.last_activity)} · a branch fica"
     elif result.eligible:
         result.reason = f"{result.merged} · mexido {elapsed(result.last_activity)}"
@@ -1705,22 +1765,57 @@ def gather_worktrees(root: Path, days: int) -> tuple[list[Worktree], list[str]]:
     return sorted(rows, key=lambda w: -w.size), warnings
 
 
-def remove_worktree(w: Worktree, days: int, scope: Path | None = None) -> None:
-    """Reconfere tudo, inclusive conversas lidas agora, e remove sem --force; a branch fica."""
+def recheck_worktree(w: Worktree, days: int, scope: Path | None) -> Worktree:
+    """Inspeciona de novo, com conversas lidas agora; levanta se HEAD ou branch mudou desde a análise."""
     scope = (scope or projects_root() or w.path.parent).expanduser().resolve()
     links, conv_error = linked_conversations([w], scope, {w.repo: registered_dirs(registered_worktrees(w.repo))})
     current = inspect_worktree(w, days, worktree_usage(), links=links[w.path], conv_error=conv_error,
                                stale_days=setting("stale_worktree_days"))
-    if not current.eligible or (current.head, current.branch) != (w.head, w.branch):
-        raise RuntimeError(current.reason if not current.eligible else "HEAD ou branch mudou desde a análise")
+    if (current.head, current.branch) != (w.head, w.branch):
+        raise RuntimeError("HEAD ou branch mudou desde a análise")
+    return current
+
+
+def git_remove_worktree(w: Worktree) -> None:
     r = git_at(w.repo, "worktree", "remove", str(w.path))
     if r is None or r.returncode:
         raise RuntimeError(r.stderr.strip() if r is not None else "Git não respondeu")
 
 
-VERDICTS = {"seguro": ("🟢", "green"), "depois": ("🟡", "yellow"), "manter": ("⚪", "dim")}
+def remove_worktree(w: Worktree, days: int, scope: Path | None = None) -> None:
+    """Reconfere tudo, inclusive conversas lidas agora, e remove sem --force; a branch fica."""
+    current = recheck_worktree(w, days, scope)
+    if not current.eligible:
+        raise RuntimeError(current.reason)
+    git_remove_worktree(w)
+
+
+def trash_and_remove_worktree(w: Worktree, days: int, scope: Path | None = None) -> None:
+    """Worktree mergeado com arquivos fora do Git: reconfere tudo, manda para a Lixeira só o que foi mostrado na
+    confirmação (algo novo fora do Git → recusa sem mexer em nada) e remove sem --force; a branch fica."""
+    current = recheck_worktree(w, days, scope)
+    if current.eligible:
+        git_remove_worktree(w)
+        return
+    if not current.trashable:
+        raise RuntimeError(current.reason)
+    new = [e for e in current.leftovers if e not in w.leftovers]
+    if new:
+        raise RuntimeError(f"apareceu arquivo fora do Git desde a análise: {leftover_text(new)}")
+    for entry in current.leftovers:
+        p = w.path / entry
+        if p.is_symlink():
+            p.unlink()        # só o atalho: pelo Finder, "as alias" poderia mandar o destino para a Lixeira
+        else:
+            move_to_trash(p)
+    git_remove_worktree(w)
+
+
+VERDICTS = {"seguro": ("🟢", "green"), "avaliar": ("🟠", "yellow"), "depois": ("🟡", "yellow"),
+            "manter": ("⚪", "dim")}
 # Como cada veredito aparece na tela; as chaves continuam as internas.
-VERDICT_LABELS = {"seguro": "seguro", "depois": "em andamento", "manter": "com trabalho só aqui"}
+VERDICT_LABELS = {"seguro": "seguro", "avaliar": "com sobras (Lixeira)", "depois": "em andamento",
+                  "manter": "com trabalho só aqui"}
 
 
 def safe_worktrees(rows: list[Worktree]) -> list[Worktree]:
@@ -1766,7 +1861,7 @@ def conversation_cell(w: Worktree) -> Text:
 def worktrees_report(con: Console, rows: list[Worktree], root: Path | None = None, days: int = 0,
                      stale_days: int = DEFAULTS["stale_worktree_days"]) -> None:
     """Quadro por projeto e, por último (o que fica na tela), o resumo."""
-    order = {"seguro": 0, "depois": 1, "manter": 2}
+    order = {v: n for n, v in enumerate(VERDICTS)}
     projects: dict[Path, list[Worktree]] = {}
     for w in rows:
         projects.setdefault(w.repo, []).append(w)
@@ -1861,7 +1956,7 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
         return [indent(f"• {len(v)} {CATEGORIES[k][len(v) != 1].format(d=stale_days)} · {size(v)}")
                 for k, v in sorted(by.items(), key=lambda kv: -len(kv[1]))]
 
-    safe, later, keep = group("seguro"), group("depois"), group("manter")
+    safe, trash, later, keep = group("seguro"), group("avaliar"), group("depois"), group("manter")
     lines: list = [Text.assemble(("🟢 SEGURO PARA APAGAR  ", "bold green"),
                                  (f"{n_worktrees(len(safe))} · {size(safe)}", "bold"))]
     prazo = f", e parados há mais de {days} dias" if days else ""
@@ -1893,6 +1988,12 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
         names = ", ".join(f"{n} ({c})" for n, c in sorted(with_session.items(), key=lambda kv: -kv[1]))
         lines.append(indent(Text(f"Sessões do Claude Code abertas que trabalharam em alguns deles: {names}. Não "
                                  "impedem: o trabalho já está na main; a sessão só perde a pasta.", style="dim")))
+    if trash:
+        lines += [Text(""), Text.assemble(("🟠 MERGEADOS, COM ARQUIVOS FORA DO GIT  ", "bold yellow"),
+                                          (f"{n_worktrees(len(trash))} · {size(trash)}", "bold"))]
+        lines.append(indent(Text("Já estão na main, mas têm arquivos que o Git não guarda. Se você marcar um, esses "
+                                 "arquivos vão para a Lixeira e a pasta sai; a branch fica. Confira a lista na "
+                                 "confirmação.", style="yellow")))
     if later:
         lines += [Text(""), Text.assemble(("🟡 EM ANDAMENTO  ", "bold yellow"),
                                           (f"{n_worktrees(len(later))} · {size(later)}", "bold"),
@@ -1911,13 +2012,17 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
         todo.append(indent("Num terminal, abre a tela na aba Worktrees: espaço marca (a marca todos os 🟢), Enter "
                            "mostra a lista e s apaga. Cada um é conferido de novo antes de sair."))
         step += 1
+    if trash:
+        todo.append(Text(f"  {step}. 🟠 você decide: na tela, marque um por um (o a não pega). Os arquivos fora do "
+                         "Git vão para a Lixeira."))
+        step += 1
     if later:
         todo.append(Text(f"  {step}. 🟡 ficam: estão em uso ou em andamento (motivo na coluna Veredito). "
                          "Rode de novo depois."))
         step += 1
     if keep:
         todo.append(Text(f"  {step}. ⚪ ficam com você: o motivo de cada um está na coluna Veredito."))
-    if not safe and not later:
+    if not safe and not trash and not later:
         todo.append(Text("  Nada a apagar agora. Rode de novo daqui a alguns dias."))
     con.print(Panel(Group(*lines, *todo), title=f"Resumo · {n_worktrees(len(rows))} · {size(rows)}",
                     title_align="left", border_style="green" if safe else "yellow", padding=(1, 2)))
@@ -1925,8 +2030,13 @@ def worktrees_summary(con: Console, rows: list[Worktree], root: Path | None, day
                    "atualizá-las.", style="dim"))
 
 
+def shown_verdicts(counts: dict[str, tuple[int, int]]) -> list[str]:
+    """Os vereditos que aparecem num resumo: todos, menos o 🟠 quando não há nenhum (é raro)."""
+    return [v for v in VERDICTS if v != "avaliar" or counts[v][0]]
+
+
 def verdict_counts(rows: list[Worktree]) -> dict[str, tuple[int, int]]:
-    """Quantos worktrees e quantos bytes em cada veredito, sempre com as três chaves."""
+    """Quantos worktrees e quantos bytes em cada veredito, sempre com todas as chaves de VERDICTS."""
     counts = {v: (0, 0) for v in VERDICTS}
     for w in rows:
         n, size = counts[w.verdict]
@@ -1944,9 +2054,10 @@ def worktrees_line(rows: list[Worktree], root: Path | None, error: str = "") -> 
     if not rows:
         return Text(f"🌳 Worktrees: nenhum em {short(root)}")
     c = verdict_counts(rows)
-    (a, sa), (b, _), (k, _) = c["seguro"], c["depois"], c["manter"]
+    (a, sa), (e, _), (b, _), (k, _) = c["seguro"], c["avaliar"], c["depois"], c["manter"]
+    extra = f" · {e} com arquivos fora do Git" if e else ""
     return Text.assemble(f"🌳 Worktrees: {len(rows)} · {fmt(sum(w.size for w in rows))} · "
-                         f"{plural(a, 'pode sair', 'podem sair')} ({fmt(sa)})"
+                         f"{plural(a, 'pode sair', 'podem sair')} ({fmt(sa)}){extra}"
                          f" · {b} em andamento · {k} com trabalho só aqui",
                          (f"  detalhes: hogs --worktrees {short(root)}", "dim"))
 
@@ -3438,7 +3549,8 @@ RISK_WHY = {
 
 
 def worktree_items(rows: list[Worktree], root: Path, days: int = 0) -> list[Item]:
-    """Um Item por worktree 🟢 (a tela apaga um por um; o relatório continua com `worktree_item`)."""
+    """Um Item por worktree 🟢 e um 🟡 por worktree mergeado com arquivos fora do Git (eles vão para a Lixeira).
+    A tela apaga um por um; o relatório continua com `worktree_item`, só dos 🟢."""
     items = []
     for w in safe_worktrees(rows):
         hint = f"já na main ({w.merged})" if w.merged else f"enviado ({w.pushed}), parado {elapsed(w.last_activity)}"
@@ -3446,6 +3558,13 @@ def worktree_items(rows: list[Worktree], root: Path, days: int = 0) -> list[Item
             hint += " · ⚠ reabra antes de apagar"
         items.append(Item("worktree", f"{w.repo.name} / {where(w, root)}", w.size, SAFE,
                           lambda w=w: remove_worktree(w, days, root), hint, path=w.path, worktree=w))
+    for w in sorted((w for w in rows if w.trashable), key=lambda w: (w.repo.name.lower(), -w.size)):
+        hint = f"já na main · {len(w.leftovers)} fora do Git vão para a Lixeira: {leftover_text(w.leftovers)}"
+        if any(link.reopen for link in w.conversations):
+            hint += " · ⚠ reabra antes de apagar"
+        items.append(Item("worktree", f"{w.repo.name} / {where(w, root)}", w.size, EVAL,
+                          lambda w=w: trash_and_remove_worktree(w, days, root), hint, kind="worktree_sobras",
+                          path=w.path, worktree=w))
     return items
 
 
@@ -3499,7 +3618,11 @@ def worktree_detail(w: Worktree, root: Path | None) -> list[Text]:
     verdict = f"{icon} {VERDICT_LABELS[w.verdict]}"
     if w.eligible:
         verdict += " · a pasta sai, a branch fica"
+    elif w.trashable:
+        verdict += " · os arquivos fora do Git vão para a Lixeira, a pasta sai, a branch fica"
     lines.append(Text(verdict, style=color))
+    if w.trashable:
+        lines += [Text(f"  {leftover_line(w, entry)}", style="yellow") for entry in w.leftovers]
     for link in sorted(w.conversations, key=lambda l: -l.conv.last):
         c = link.conv
         lines.append(Text(f"💬 {'● ' if c.live else ''}“{c.name}” · última msg {elapsed(c.last)}"))
@@ -3705,6 +3828,9 @@ def recommended_tree(s: Snapshot, items: list[Item], trim_off: bool,
                         kind="advice", how=how, title=label,
                         detail=[label, how, "o hogs nunca reinicia nem atualiza o Mac"]))
     for kind, key, title, note in (("pessoal", "rec/eval/pessoal", "🗂  Arquivos parados para avaliar", "vão para a Lixeira"),
+                                   ("worktree_sobras", "rec/eval/worktree_sobras",
+                                    "🌳 Worktrees mergeados com arquivos fora do Git",
+                                    "os arquivos vão para a Lixeira; a branch fica"),
                                    ("ponto_de_volta", "rec/eval/ponto_de_volta", "🐳 Pontos de volta recentes",
                                     RECENT_ROLLBACK)):
         group = sorted((i for i in items if i.risk is EVAL and i.kind == kind), key=lambda i: -i.size)
@@ -3776,9 +3902,9 @@ def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
 
 # ---------------------------------------------------------------- tela: aba Worktrees
 
-WT_FILTERS = ["", "seguro", "depois", "manter"]
-WT_FILTER_LABELS = {"": "todos", "seguro": "🟢 podem sair", "depois": "🟡 em andamento",
-                    "manter": "⚪ com trabalho só aqui"}
+WT_FILTERS = ["", "seguro", "avaliar", "depois", "manter"]
+WT_FILTER_LABELS = {"": "todos", "seguro": "🟢 podem sair", "avaliar": "🟠 com sobras",
+                    "depois": "🟡 em andamento", "manter": "⚪ com trabalho só aqui"}
 
 
 def _wt_merge_cell(w: Worktree) -> Text:
@@ -3796,8 +3922,8 @@ def _wt_conv_cell(w: Worktree) -> Text:
 def _wt_group_detail(repo: Path, kids: list[Worktree]) -> list[Text]:
     counts = verdict_counts(kids)
     lines = [Text(f"📁 {repo.name}", style="bold"), Text(short(repo))]
-    for v, (icon, color) in VERDICTS.items():
-        n, size = counts[v]
+    for v in shown_verdicts(counts):
+        (icon, color), (n, size) = VERDICTS[v], counts[v]
         lines.append(Text(f"{icon} {n} {WT_FILTER_LABELS[v][2:]} · {fmt(size)}", style=color))
     lines.append(Text(f"{len(kids)} worktrees · {fmt(sum(w.size for w in kids))}"))
     return lines
@@ -3822,7 +3948,7 @@ def worktrees_tree(rows: list[Worktree], root: Path | None, days: int = 0, flt: 
     for repo in sorted(by_repo, key=lambda r: (r.name.lower(), str(r))):
         kids = sorted(by_repo[repo], key=lambda w: (order[w.verdict], -w.size))
         counts = verdict_counts(kids)
-        summary = " ".join(f"{VERDICTS[v][0]}{counts[v][0]}" for v in VERDICTS)
+        summary = " ".join(f"{VERDICTS[v][0]}{counts[v][0]}" for v in VERDICTS if counts[v][0])
         cells = [f"📁 {repo.name}", fmt(sum(w.size for w in kids))] + [""] * (len(cols) - 3) + [summary]
         children = []
         for w in kids:
@@ -3847,7 +3973,8 @@ def worktrees_tree(rows: list[Worktree], root: Path | None, days: int = 0, flt: 
 
 def worktree_totals(rows: list[Worktree], flt: str = "") -> Text:
     counts = verdict_counts(rows)
-    parts = [f"{VERDICTS[v][0]} {counts[v][0]} {WT_FILTER_LABELS[v][2:]} · {fmt(counts[v][1])}" for v in VERDICTS]
+    parts = [f"{VERDICTS[v][0]} {counts[v][0]} {WT_FILTER_LABELS[v][2:]} · {fmt(counts[v][1])}"
+             for v in shown_verdicts(counts)]
     text = "   ".join(parts)
     if flt:
         text += f"   filtro: {WT_FILTER_LABELS[flt]}"
@@ -4000,6 +4127,7 @@ HELP_LINES = [
     "Enter mostra a lista antes de apagar; cada item é reconferido na hora (✔ apagado, ↷ pulado com o motivo).",
     "↻ é conselho do macOS: o hogs nunca reinicia nem atualiza o Mac.",
 ]
+TRASH_NOTE = "o que foi para a Lixeira só libera espaço quando você esvaziar a Lixeira"
 DOCKER_RAW_NOTE = "O Docker devolve o espaço do Docker.raw aos poucos; se não mudar, reinicie o Docker Desktop."
 SAFE_ONLY = "🟡 e 🔴 se marcam um por um: abra o grupo com →"
 
@@ -4179,6 +4307,9 @@ class App:
         grid.add_column(justify="right", no_wrap=True)
         for i in items:
             grid.add_row(i.risk.icon, Text(i.label), Text(fmt(i.size), style="bold"))
+            if i.kind == "worktree_sobras" and i.worktree:
+                for entry in i.worktree.leftovers:         # cada arquivo que vai junto, por inteiro
+                    grid.add_row("", Text(f"  {leftover_line(i.worktree, entry)}", style="yellow"), "")
         tail = [Text(""), Text(f"Total: {fmt(sum(i.size for i in items))}", style="bold")]
         if any(i.risk is LOSS for i in items):
             tail.append(Text("Atenção: tem item 🔴 na lista, ele não volta.", style="red"))
@@ -4188,7 +4319,7 @@ class App:
                     c = link.conv
                     tail.append(Text(f"⚠ reabra antes de apagar “{c.name}”: {resume_command(c)}",
                                      style="yellow"))
-        if any(i.kind == "pessoal" for i in items):
+        if any(i.kind in ("pessoal", "worktree_sobras") for i in items):
             tail.append(Text("Arquivos vão para a Lixeira."))
         tail.append(Text("s apaga · n ou Esc volta", style="bold"))
         return self.scrolled("🗑 Vou apagar", grid, tail, width, height, "red")
@@ -4202,6 +4333,8 @@ class App:
                                             f" · livre agora: {fmt(self.free_after)}")]
             if any(i.cat == "docker" for i in self.done_items):
                 tail.append(Text(DOCKER_RAW_NOTE, style="dim"))
+            if any(i.kind in ("pessoal", "worktree_sobras") for i in self.done_items):
+                tail.append(Text(TRASH_NOTE, style="dim"))
             w = next((i.worktree for i in self.done_items if i.worktree is not None), None)
             if w is not None:
                 tail.append(Text(f"Para recriar um: git -C {short(w.repo)} worktree add {short(w.path)} "
