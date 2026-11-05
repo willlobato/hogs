@@ -2809,6 +2809,99 @@ class WorktreesTreeTest(unittest.TestCase):
 
 # ---- Task 7
 
+class DockerTreeTest(unittest.TestCase):
+    def docker(self):
+        d = hogs.Docker(running=True, raw_real=92e9, raw_limit=200e9, build_cache=40e9)
+        img = lambda name, used, origin, size: {"repo": name.split(":")[0], "tag": name.split(":")[1], "id": f"{size:.0f}"[:6],
+                                                "name": name, "ref": name, "size": size, "used": used,
+                                                "origin": origin, "created": "3 days ago", "labels": {}}
+        d.images = [img("mcr.example/mssql:2022", True, "registry", 3e9), img("acme/api:latest", False, "local", 2e9),
+                    img("acme/api:antes-20260101-1200", False, "local", 1e9)]
+        d.containers = [{"name": "sqlserver", "image": "mcr.example/mssql:2022", "running": True,
+                         "mounts": ["/Users/x/dados/mssql"]}]
+        d.live = ["sqlserver"]
+        d.volumes = [{"name": "pgdata", "size": 5e9, "used": True}]
+        return d
+
+    def test_groups_rollbacks_images_and_protected(self):
+        d = self.docker()
+        with mock.patch.object(hogs, "first_seen", return_value={"acme/api:antes-20260101-1200": 0}):
+            items = hogs.docker_clean_items(d)
+            cols, rows = hogs.docker_tree(d, items, {})
+        self.assertEqual([r.key for r in rows], ["dk/build", "dk/rollback", "dk/images", "dk/protected"])
+        rb = rows[1].children[0]
+        self.assertEqual(rb.key, "docker|Ponto de volta acme/api:antes-20260101-1200")
+        images = {str(c.cells[0]): c for c in rows[2].children}
+        sql = images["mcr.example/mssql:2022"]
+        self.assertEqual(sql.kind, "info")
+        self.assertIn("● sqlserver", str(sql.cells[3]))
+        self.assertIn("dados em /Users/x/dados/mssql", str(sql.cells[3]))
+        self.assertTrue(hogs.checkable(images["Imagem acme/api:latest"]))
+        self.assertIn("construída aqui", str(images["Imagem acme/api:latest"].cells[3]))
+        self.assertTrue(all(not hogs.checkable(c) for c in rows[3].children), "protegidos nunca marcáveis")
+        keys = [c.key for r in rows for c in r.children]
+        self.assertEqual(len(keys), len(set(keys)), "nenhuma chave repetida")
+
+    def test_filter_and_stopped_docker(self):
+        d = self.docker()
+        with mock.patch.object(hogs, "first_seen", return_value={"acme/api:antes-20260101-1200": 0}):
+            _, rows = hogs.docker_tree(d, hogs.docker_clean_items(d), {}, flt="em_uso")
+        images = next(r for r in rows if r.key == "dk/images")
+        self.assertEqual([str(c.cells[0]) for c in images.children], ["mcr.example/mssql:2022"])
+        self.assertEqual(hogs.docker_tree(hogs.Docker(), [], {})[1], [])
+        self.assertIn("Docker parado", hogs.docker_totals(hogs.Docker(), [], False).plain)
+
+    def test_stopped_containers_group_and_small_images_row(self):
+        d = self.docker()
+        d.stopped = [{"name": "old-job", "size": 1, "age": 5, "project": None, "project_running": False}]
+        d.images.append({"repo": "tiny", "tag": "1", "id": "t1", "name": "tiny:1", "ref": "tiny:1", "size": 1e6,
+                         "used": False, "origin": "hub", "created": "1 day ago", "labels": {}})
+        with mock.patch.object(hogs, "first_seen", return_value={"acme/api:antes-20260101-1200": 0}):
+            _, rows = hogs.docker_tree(d, hogs.docker_clean_items(d), {})
+        by = {r.key: r for r in rows}
+        self.assertEqual(by["dk/stopped"].children[0].key, "docker|Docker: container old-job")
+        self.assertTrue(any(str(c.cells[0]).startswith("Imagens pequenas") for c in by["dk/images"].children))
+
+    def test_image_users_matches_name_ref_and_id_prefix(self):
+        img = {"name": "a:1", "ref": "a:1", "id": "abc123"}
+        cs = [{"image": "a:1"}, {"image": "abc123def"}, {"image": "b:1"}]
+        self.assertEqual(hogs.image_users(img, cs), cs[:2])
+
+    def test_totals_line(self):
+        d = self.docker()
+        with mock.patch.object(hogs, "first_seen", return_value={"acme/api:antes-20260101-1200": 0}):
+            items = hogs.docker_clean_items(d)
+        line = hogs.docker_totals(d, items, True, flt="local").plain
+        self.assertIn("Docker.raw", line)
+        self.assertIn("🟢", line)
+        self.assertIn("⚪ em uso", line)
+        self.assertIn(hogs.TRIM_OFF_NOTE, line)
+        self.assertIn("filtro: construídas aqui", line)
+
+    def test_gather_keeps_container_mounts_in_order(self):
+        cs = [{"ID": "a" * 64, "Names": "db", "State": "running", "Image": "pg:16", "Labels": "", "Size": "1MB"},
+              {"ID": "b" * 64, "Names": "job", "State": "exited", "Image": "tool:1", "Labels": "", "Size": "1MB"}]
+        sh, _ = DockerCleanItemsTest.fake_docker(containers=cs)
+
+        def gather(inspect_out):
+            def sh2(cmd, timeout=60):
+                if cmd[:2] == ["docker", "inspect"] and "Mounts" in cmd[3]:
+                    return subprocess.CompletedProcess(cmd, 0, inspect_out, "")
+                if cmd[:2] == ["docker", "inspect"]:
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                return sh(cmd, timeout)
+            with mock.patch.object(hogs, "sh", sh2):
+                return hogs.gather_docker()
+        two = (json.dumps([{"Type": "bind", "Source": "/tmp/dados-db"}]) + "\n"
+               + json.dumps([{"Type": "bind", "Source": "/tmp/dados-job"}]) + "\n")
+        d = gather(two)
+        self.assertEqual([(c["name"], c["image"], c["running"]) for c in d.containers],
+                         [("db", "pg:16", True), ("job", "tool:1", False)])
+        self.assertEqual([c["mounts"] for c in d.containers],
+                         [[str(Path("/tmp/dados-db").resolve())], [str(Path("/tmp/dados-job").resolve())]])
+        d = gather(json.dumps([{"Type": "bind", "Source": "/tmp/dados-db"}]) + "\n")
+        self.assertEqual([c["mounts"] for c in d.containers], [[], []])
+
 
 # ---- Task 8
 

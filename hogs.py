@@ -313,6 +313,7 @@ class Docker:
     mounts_ok: bool = False                            # True só se o inspect respondeu
     live: list[str] = field(default_factory=list)      # containers rodando (nomes)
     released: dict[str, str] = field(default_factory=dict)  # imagem atual → branch padrão (de um clone local) com o commit dela
+    containers: list[dict] = field(default_factory=list)    # todos: {"name", "image", "running", "mounts"}
 
 
 def list_builders() -> list[dict]:
@@ -445,6 +446,7 @@ def gather_docker() -> Docker:
                 i["size"] = int(i["size"] * target / reported)
 
     containers = v.get("Containers") or []
+    per_container: list[list[str]] = []
     if not containers:
         d.mounts_ok = True
     else:
@@ -455,15 +457,24 @@ def gather_docker() -> Docker:
             found, volumes = [], []
             for line in r.stdout.splitlines():
                 if line.strip():
+                    binds: list[str] = []
                     for m in json.loads(line) or []:
                         if m.get("Type") == "bind" and m.get("Source"):
                             found.append(Path(m["Source"]).resolve())
+                            binds.append(str(found[-1]))
                         elif m.get("Type") == "volume" and m.get("Name") and m["Name"] not in volumes:
                             volumes.append(m["Name"])
+                    per_container.append(binds)
             found += bind_volume_folders(volumes)
             d.mounts, d.mounts_ok = sorted(set(found)), True
         except (ValueError, TypeError, AttributeError, KeyError, OSError, RuntimeError):
             d.mounts, d.mounts_ok = [], False
+            per_container = []
+    if len(per_container) != len(containers):
+        per_container = [[] for _ in containers]
+    d.containers = [{"name": c.get("Names", c["ID"][:12]), "image": c.get("Image", ""),
+                     "running": c.get("State") in ACTIVE_STATES, "mounts": m}
+                    for c, m in zip(containers, per_container)]
     running_projects = {
         _labels(c.get("Labels", "")).get("com.docker.compose.project")
         for c in containers if c.get("State") in ACTIVE_STATES
@@ -770,33 +781,36 @@ def docker_clean_items(d: Docker) -> list[Item]:
     if d.build_cache:
         items.append(Item("docker", "Docker: cache de build", d.build_cache, SAFE,
                           lambda: run_all([["docker", "builder", "prune", "-a", "-f"]], timeout=900),
-                          "próximo build fica mais lento"))
+                          "próximo build fica mais lento", kind="cache"))
 
     for bc in d.builder_caches:
         if bc["size"] >= 1e6:
             items.append(Item("docker", f"Docker: cache do builder {bc['builder']}", bc["size"], SAFE,
                               lambda n=bc["builder"]: require(prune_builder(n), "docker buildx prune"),
-                              "próximo build fica mais lento"))
+                              "próximo build fica mais lento", kind="cache"))
 
     untagged = [i for i in d.images if not i["used"] and i["origin"] == "none"]
     if untagged:
         ids = [i["id"] for i in untagged]
         items.append(Item("docker", f"Docker: imagens sem tag ({len(untagged)})", sum(i["size"] for i in untagged),
-                          SAFE, lambda ids=ids: run_all([["docker", "rmi", x] for x in ids]), "versões antigas órfãs"))
+                          SAFE, lambda ids=ids: run_all([["docker", "rmi", x] for x in ids]), "versões antigas órfãs",
+                          kind="sem_tag"))
 
     old = [c for c in d.stopped if is_old_stopped(c)]
     if old:
         names = [c["name"] for c in old]
         items.append(Item("docker", f"Docker: containers parados há +{OLD_CONTAINER_DAYS} dias ({len(old)})",
                           sum(c["size"] for c in old), SAFE,
-                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview(names)))
+                          lambda names=names: run_all([["docker", "rm", n] for n in names]), preview(names),
+                          kind="container"))
     for c in d.stopped:
         if is_old_stopped(c):
             continue
         why = (f"projeto {c['project']} está rodando" if c["project_running"]
                else f"parado há {c['age']} dias" if c["age"] is not None else "idade desconhecida")
         items.append(Item("docker", f"Docker: container {c['name']}", c["size"], stopped_risk(c),
-                          lambda n=c["name"]: run_all([["docker", "rm", n]]), why))
+                          lambda n=c["name"]: run_all([["docker", "rm", n]]), why,
+                          kind="container"))
 
     rollbacks = rollback_info(d)
     for rb in rollbacks.values():
@@ -814,14 +828,14 @@ def docker_clean_items(d: Docker) -> list[Item]:
             continue
         items.append(Item("docker", f"Imagem {img['name']}", img["size"], LOSS if local else REDOWN,
                           lambda ref=image_ref(img): run_all([["docker", "rmi", ref]]),
-                          f"{ORIGIN_LABEL[img['origin']]} · {img['created']}"))
+                          f"{ORIGIN_LABEL[img['origin']]} · {img['created']}", kind="imagem"))
     if small_pullable:
         names = [i["name"] for i in small_pullable]
         refs = [image_ref(i) for i in small_pullable]
         items.append(Item("docker", f"Imagens pequenas de registry/Hub ({len(names)})",
                           sum(i["size"] for i in small_pullable), REDOWN,
                           lambda refs=refs: run_all([["docker", "rmi", r] for r in refs]),
-                          preview([n.rsplit("/", 1)[-1] for n in names])))
+                          preview([n.rsplit("/", 1)[-1] for n in names]), kind="imagem"))
     return items
 
 
@@ -3901,6 +3915,123 @@ def worktree_totals(rows: list[Worktree], flt: str = "") -> Text:
 
 
 # ---------------------------------------------------------------- tela: aba Docker
+
+DOCKER_FILTERS = ["", "em_uso", "sem_uso", "local"]
+DOCKER_FILTER_LABELS = {"": "todas", "em_uso": "em uso", "sem_uso": "sem uso", "local": "construídas aqui"}
+DOCKER_COLUMNS = [Column("O quê", ratio=4), Column("Tamanho", "right"), Column("Risco"), Column("Detalhe", ratio=4)]
+
+
+def image_users(img: dict, containers: list[dict]) -> list[dict]:
+    """Containers (rodando ou parados) que usam a imagem, pelo nome, pela referência ou pelo ID."""
+    return [c for c in containers
+            if c["image"] in (img["name"], img["ref"]) or (img["id"] and c["image"].startswith(img["id"]))]
+
+
+def _users_text(users: list[dict]) -> str:
+    return ", ".join(("● " if c["running"] else "") + c["name"] for c in users)
+
+
+def _data_text(users: list[dict]) -> str:
+    folders = sorted({m for c in users for m in c["mounts"]})
+    return f"dados em {', '.join(short(m) for m in folders)}" if folders else ""
+
+
+def _image_detail(img: dict, users: list[dict]) -> Text:
+    parts = [ORIGIN_LABEL[img["origin"]], _users_text(users), _data_text(users)]
+    return Text(" · ".join(p for p in parts if p))
+
+
+def _image_passes(img: dict, flt: str) -> bool:
+    return (flt == "" or (flt == "em_uso" and img["used"]) or (flt == "sem_uso" and not img["used"])
+            or (flt == "local" and img["origin"] == "local"))
+
+
+def docker_tree(d: Docker, items: list[Item], guards: dict[str, str | None],
+                flt: str = "") -> tuple[list[Column], list[Row]]:
+    if not d.running:
+        return DOCKER_COLUMNS, []
+    mine = [i for i in items if i.cat == "docker"]
+
+    def group(key: str, title: str, kids: list[Row], size: int, note: str = "") -> Row:
+        return _group_row(key, f"{title} ({len(kids)})", fmt(size), "", note, kids,
+                          [Text(title, style="bold"), Text(f"{plural(len(kids), 'item', 'itens')} · {fmt(size)}")])
+
+    def item_group(key: str, title: str, kinds: tuple, note: str = "") -> Row | None:
+        sel = sorted((i for i in mine if i.kind in kinds), key=lambda i: -i.size)
+        return group(key, title, [item_row(i, guards) for i in sel], sum(i.size for i in sel), note) if sel else None
+
+    rows: list[Row] = []
+    for r in (item_group("dk/build", "🧱 Cache e sobras de build", ("cache", "sem_tag")),
+              item_group("dk/rollback", "⏪ Pontos de volta de QA", ("ponto_de_volta",)),
+              item_group("dk/stopped", "📦 Containers parados", ("container",))):
+        if r:
+            rows.append(r)
+
+    rollback_names = {i.label for i in mine if i.kind == "ponto_de_volta"}
+    by_label = {i.label: i for i in mine if i.kind == "imagem"}
+    grouped = next((i for i in mine if i.kind == "imagem" and i.label.startswith("Imagens pequenas")), None)
+    small = set()
+    if grouped:   # as imagens pequenas aparecem juntas, na linha do item agrupado
+        small = {img["name"] for img in d.images
+                 if not img["used"] and img["origin"] not in ("none", "local") and img["size"] < BIG_ITEM
+                 and f"Imagem {img['name']}" not in by_label and f"Ponto de volta {img['name']}" not in rollback_names}
+    entries: list[tuple[int, Row]] = []
+    total = 0
+    for img in d.images:
+        if img["tag"] == "<none>" or f"Ponto de volta {img['name']}" in rollback_names or img["name"] in small:
+            continue
+        if not _image_passes(img, flt):
+            continue
+        users = image_users(img, d.containers)
+        detail = _image_detail(img, users)
+        item = by_label.get(f"Imagem {img['name']}")
+        if item:
+            row = item_row(item, guards)
+            row.cells = list(row.cells)
+            row.cells[3] = detail
+        else:
+            row = Row(f"dk/image/{img['name']}", [Text(img["name"]), fmt(img["size"]), "⚪" if img["used"] else "", detail],
+                      kind="info", title=img["name"], detail=[img["name"], fmt(img["size"]), detail.plain])
+        entries.append((img["size"], row))
+        total += img["size"]
+    if grouped and _image_passes({"used": False, "origin": "registry"}, flt):
+        entries.append((grouped.size, item_row(grouped, guards)))
+        total += grouped.size
+    if entries:
+        rows.append(group("dk/images", "🖼 Imagens", [r for _, r in sorted(entries, key=lambda e: -e[0])], total))
+
+    prot: list[Row] = []
+    for name in d.live:
+        mounts = [m for c in d.containers if c["running"] and c["name"] == name for m in c["mounts"]]
+        note = _data_text([{"mounts": mounts}])
+        prot.append(_info_row(f"dk/live/{name}", [Text(f"● {name}"), "", "⚪", Text(note)]))
+    for v in d.volumes:
+        prot.append(_info_row(f"dk/volume/{v['name']}", [Text(f"volume {v['name']}"), fmt(v["size"]), "⚪",
+                                                          "em uso" if v["used"] else "sem uso: revise à mão"]))
+    if prot:
+        rows.append(_group_row("dk/protected", f"🛡 Containers rodando e volumes ({len(prot)})",
+                               fmt(sum(v["size"] for v in d.volumes)), "⚪", "nunca apagados", prot,
+                               [Text("🛡 Containers rodando e volumes", style="bold"),
+                                Text("o hogs nunca apaga estes")]))
+    return DOCKER_COLUMNS, rows
+
+
+def docker_totals(d: Docker, items: list[Item], trim_off: bool, flt: str = "") -> Text:
+    if not d.running:
+        return Text("Docker parado: abra o Docker Desktop pra ver o detalhe")
+    mine = [i for i in items if i.cat == "docker"]
+    safe = sum(i.size for i in mine if i.risk is SAFE)
+    mid = sum(i.size for i in mine if i.risk in (EVAL, REDOWN))
+    loss = sum(i.size for i in mine if i.risk is LOSS)
+    busy = sum(i["size"] for i in d.images if i["used"]) + sum(v["size"] for v in d.volumes)
+    line = f"Docker.raw {fmt(d.raw_real)}" + (f" de {fmt(d.raw_limit)}" if d.raw_limit else "")
+    line += f"   🟢 {fmt(safe)} · 🟡 {fmt(mid)} · 🔴 {fmt(loss)} · ⚪ em uso {fmt(busy)}"
+    if trim_off:
+        line += f"   {TRIM_OFF_NOTE}"
+    if flt:
+        line += f"   filtro: {DOCKER_FILTER_LABELS[flt]}"
+    return Text(line)
+
 
 
 # ---------------------------------------------------------------- tela: app
