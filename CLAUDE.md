@@ -39,6 +39,15 @@ The interactive screen (`App`, opened by `hogs`/`hogs --clean` in a terminal) on
   confirmation showed, moves each listed entry to the Trash (`move_to_trash`; a symlink is only
   unlinked, its target never touched) and then runs `git worktree remove` without force. The confirmation
   lists every one of those entries.
+- The user may also mark by hand a not-recommended worktree whose removal loses nothing (`by_hand`: has a
+  branch, not 🟢/🟠, and nothing in `hard`): unmerged or unpushed (the branch keeps the commits), recent, with
+  conversations. It is an `EVAL` item `kind="worktree_manual"`, only in the Worktrees tab (never in ✨
+  Recomendado or 💾 Disco, never in `a`); the verdict stays 🟡/⚪. `hard` (also blocks by hand): uncommitted
+  changes to tracked files, anything running inside now, a leftover in a container folder or mounts unknown,
+  main checkout/detached/locked/nested worktree, submodules and any check that could not run. Its action is
+  `trash_and_remove_worktree(..., by_hand=True)`: same recheck (refuses on any `hard`, new HEAD or new file
+  outside Git), leftovers to the Trash, `git worktree remove` without force. The confirmation lists every
+  reason it is not recommended (⚠), the branch that stays and every leftover.
 - An unmerged worktree is 🟢 only when untouched for `stale_worktree_days`, HEAD contained in a local
   remote-tracking ref (never fetched), clean, no protected ignored files, nothing running, no live Claude
   Code session citing it and no linked Claude Code conversation within the window. Unpushed commits keep
@@ -68,7 +77,8 @@ The interactive screen (`App`, opened by `hogs`/`hogs --clean` in a terminal) on
   with `--report`; then the static report prints, and `--clean` adds a message on stderr and exits 2. It always
   restores the terminal on any exit, including exceptions, Ctrl-C and EOF (alt screen off, cursor visible,
   mouse off, `termios` restored), also when the very first write to the terminal fails.
-- On the screen, ↻ (macOS advice) and ⚪ (information) rows never have a box. The Docker tab shows running
+- On the screen, ↻ (macOS advice) and ⚪ (information) rows never have a box (a ⚪ worktree *verdict* is not
+  information: it has a box when `by_hand`). The Docker tab shows running
   containers and volumes only as information; images match their `Item` only by `Item.refs` (never by
   label), and removed items' images disappear by them.
 - hogs only reads `~/.claude`, or `CLAUDE_CONFIG_DIR` when set (`claude_dir()`: transcripts, sessions, settings);

@@ -49,7 +49,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 HOME = Path.home()
 LIB = HOME / "Library"
@@ -867,13 +867,22 @@ class Worktree:
     conversations: list[ConvLink] = field(default_factory=list)  # conversas do Claude Code ligadas a ele
     checks: list[tuple[bool, str]] = field(default_factory=list)  # cada verificação: (passou, texto)
     leftovers: list[str] = field(default_factory=list)     # fora do Git (não versionados e ignorados que não
-                                                           # voltam), relativos à pasta; só num worktree mergeado
+                                                           # voltam), relativos à pasta
     leftover_files: set[str] = field(default_factory=set)  # tudo o que há dentro deles (files_under), na análise
+    hard: list[str] = field(default_factory=list)          # trava até a remoção marcada à mão: algo se perderia
+                                                           # (alteração sem commit), está rodando ou é dúvida
 
     @property
     def trashable(self) -> bool:
         """Mergeado e limpo, a não ser por arquivos fora do Git: sai mandando esses arquivos para a Lixeira."""
         return bool(self.merged and self.leftovers and not self.blockers and not self.waits)
+
+    @property
+    def by_hand(self) -> bool:
+        """Não recomendado, mas nada se perde: a branch fica com os commits e o que está fora do Git vai para a
+        Lixeira. Só pode ser marcado à mão, um por um."""
+        return bool(not self.eligible and not self.trashable and not self.hard and self.branch
+                    and (self.blockers or self.waits))
 
     @property
     def verdict(self) -> str:
@@ -1542,8 +1551,13 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
         marks[:] = [len(result.blockers), len(result.waits)]
     def keep(reason: str) -> Worktree:
         result.blockers.append(reason)
+        result.hard.append(reason)
         result.reason = result.blockers[0]
         return result
+    def stop(reason: str) -> None:
+        """⚪ que trava também a remoção marcada à mão."""
+        result.blockers.append(reason)
+        result.hard.append(reason)
     try:
         records = registered_worktrees(w.repo)
         entry = next((r for r in records if Path(r["worktree"]).resolve() == w.path), None)
@@ -1578,44 +1592,45 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
         check(f"já na {base_name} ({result.merged})" if result.merged
               else f"enviado a {result.pushed} (conferido nas referências locais de "
                    f"{result.pushed.partition('/')[0]})")
-        # Fora do Git: num worktree mergeado, sai pela Lixeira (🟡, marcado um por um); sem merge, segura (⚪).
-        # Alteração em arquivo versionado segura sempre.
+        # Fora do Git: num worktree mergeado, sai pela Lixeira (🟠, marcado um por um); sem merge, segura (⚪,
+        # mas à mão também sai pela Lixeira). Alteração em arquivo versionado segura sempre, até à mão.
         status = git_at(w.path, "status", "--porcelain", "-z", "--untracked-files=normal",
                         "--ignore-submodules=none")
         untracked: list[str] = []
         if status is None or status.returncode:
-            b.append("não foi possível verificar alterações locais")
+            stop("não foi possível verificar alterações locais")
         else:
             untracked, changed = split_status(status.stdout)
             if changed:
-                b.append(f"{changed} alterações locais sem commit")
+                stop(f"{changed} alterações locais sem commit")
             elif untracked and not result.merged:
-                b.append(f"{len(untracked)} alterações locais ou arquivos não versionados")
+                b.append(f"{len(untracked)} arquivos não versionados")
         if (w.path / ".gitmodules").exists():
-            b.append("contém submódulos; revise antes")
+            stop("contém submódulos; revise antes")
         check("tudo commitado")
         ignored = git_at(w.path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
         kept: list[str] = []
         if ignored is None or ignored.returncode:
-            b.append("não foi possível verificar arquivos ignorados")
+            stop("não foi possível verificar arquivos ignorados")
         else:
             kept = protected_ignored(ignored.stdout, w.path)
             if kept and not result.merged:
                 b.append(f"ignorados que não voltam pelo Git: {leftover_text(kept)}")
         check("sem .env nem arquivo que o Git não recupera")
-        if result.merged and (untracked or kept):
+        if untracked or kept:
             result.leftovers = outermost(untracked + kept)
             result.leftover_files = files_under(w.path, result.leftovers)
-            result.checks[-1] = (False, f"{len(result.leftovers)} fora do Git, vão para a Lixeira: "
+            goes = "vão para a Lixeira" if result.merged else "se apagar à mão, vão para a Lixeira"
+            result.checks[-1] = (False, f"{len(result.leftovers)} fora do Git, {goes}: "
                                         f"{leftover_text(result.leftovers)}")
             # Pasta de um container, mesmo parado (o banco de um compose, por exemplo), nunca vai para a Lixeira.
             folders, known = mounts if mounts is not None else all_container_mounts()
             if not known:
-                b.append("Docker não respondeu: não sei se algum arquivo fora do Git é pasta de container")
+                stop("Docker não respondeu: não sei se algum arquivo fora do Git é pasta de container")
             else:
                 mounted = [e for e in result.leftovers if under_mount(w.path / e, folders)]
                 if mounted:
-                    b.append(f"pasta usada por um container (mesmo parado): {leftover_text(mounted)}")
+                    stop(f"pasta usada por um container (mesmo parado): {leftover_text(mounted)}")
             check("nenhum arquivo fora do Git usado por container")
 
         # Quem usa a pasta. Sessões do Claude Code e do Codex que trabalharam nele são só informação: o
@@ -1623,7 +1638,7 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
         # container, Claude aberto dentro dela), porque apagar a pasta derruba o programa.
         paths, error, mounts = usage
         if error:
-            b.append(error)
+            stop(error)
         if agents is None:
             agents = agent_activity(SESSION_WINDOW_DAYS, [w.path])
         cited = agents.mentions.get(w.path, set())
@@ -1646,11 +1661,12 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
                     + group_processes(running) + containers)
         if now_here:
             result.waits.append(f"em uso agora: {', '.join(now_here[:2])}")
+            result.hard.append(result.waits[-1])
         check("nada rodando dentro, nenhum container")
 
         gitdir = git_at(w.path, "rev-parse", "--absolute-git-dir")
         if gitdir is None or gitdir.returncode:
-            b.append("metadados Git indisponíveis")
+            stop("metadados Git indisponíveis")
         else:
             result.last_activity = last_change(w.path, Path(gitdir.stdout.strip()))
             if days and result.last_activity > time.time() - days * 86400:
@@ -1675,7 +1691,7 @@ def inspect_worktree(w: Worktree, days: int, usage: tuple[list[tuple[Path, str]]
         idle = max(0, int((time.time() - result.last_activity) // 86400))
         check(f"sem mexer desde {datetime.fromtimestamp(result.last_activity):%d/%m} ({idle} dias)")
     except (OSError, RuntimeError, KeyError) as exc:
-        result.blockers.append(f"inspeção inconclusiva: {exc}")
+        stop(f"inspeção inconclusiva: {exc}")
         check("")
     result.eligible = (not result.blockers and not result.waits and not result.leftovers
                        and bool(result.merged or result.pushed))
@@ -1855,14 +1871,18 @@ def remove_worktree(w: Worktree, days: int, scope: Path | None = None) -> None:
     git_remove_worktree(w)
 
 
-def trash_and_remove_worktree(w: Worktree, days: int, scope: Path | None = None) -> None:
-    """Worktree mergeado com arquivos fora do Git: reconfere tudo, manda para a Lixeira só o que foi mostrado na
-    confirmação (algo novo fora do Git → recusa sem mexer em nada) e remove sem --force; a branch fica."""
+def trash_and_remove_worktree(w: Worktree, days: int, scope: Path | None = None, by_hand: bool = False) -> None:
+    """Worktree mergeado com arquivos fora do Git (🟠) ou, com by_hand, um não recomendado que você marcou à mão:
+    reconfere tudo, manda para a Lixeira só o que foi mostrado na confirmação (algo novo fora do Git → recusa sem
+    mexer em nada) e remove sem --force; a branch fica. À mão continua travado o que perderia algo (alteração sem
+    commit), o que está rodando dentro e o que não deu para conferir (`hard`)."""
     current = recheck_worktree(w, days, scope)
     if current.eligible:
         git_remove_worktree(w)
         return
-    if not current.trashable:
+    if current.hard:
+        raise RuntimeError(current.hard[0])
+    if not (current.trashable or by_hand and current.by_hand):
         raise RuntimeError(current.reason)
     new = sorted(current.leftover_files - w.leftover_files)
     if new:
@@ -3454,6 +3474,7 @@ class Row:
     how: str = ""
     group: str = ""
     size: int = 0          # o tamanho que a linha mostra; a linha "… mais N" soma o dos escondidos
+    locked: str = ""       # por que a linha não tem caixinha (worktree que nem à mão sai); o espaço mostra
 
 
 def item_key(i: Item) -> str:
@@ -3616,8 +3637,9 @@ RISK_WHY = {
 
 
 def worktree_items(rows: list[Worktree], root: Path, days: int = 0) -> list[Item]:
-    """Um Item por worktree 🟢 e um 🟡 por worktree mergeado com arquivos fora do Git (eles vão para a Lixeira).
-    A tela apaga um por um; o relatório continua com `worktree_item`, só dos 🟢."""
+    """Um Item por worktree 🟢, um 🟡 por worktree mergeado com arquivos fora do Git (eles vão para a Lixeira) e um
+    🟡 por não recomendado que dá para marcar à mão (`by_hand`). A tela apaga um por um; o relatório continua com
+    `worktree_item`, só dos 🟢."""
     items = []
     for w in safe_worktrees(rows):
         hint = f"já na main ({w.merged})" if w.merged else f"enviado ({w.pushed}), parado {elapsed(w.last_activity)}"
@@ -3632,6 +3654,15 @@ def worktree_items(rows: list[Worktree], root: Path, days: int = 0) -> list[Item
         items.append(Item("worktree", f"{w.repo.name} / {where(w, root)}", w.size, EVAL,
                           lambda w=w: trash_and_remove_worktree(w, days, root), hint, kind="worktree_sobras",
                           path=w.path, worktree=w))
+    # Os não recomendados que não perdem nada: só na aba Worktrees, marcados à mão (nunca pelo a nem no
+    # Recomendado). A branch fica com os commits; o que está fora do Git vai para a Lixeira.
+    for w in sorted((w for w in rows if w.by_hand), key=lambda w: (w.repo.name.lower(), -w.size)):
+        hint = f"não recomendado: {w.reason} · a branch fica"
+        if w.leftovers:
+            hint += f" · {len(w.leftovers)} fora do Git vão para a Lixeira"
+        items.append(Item("worktree", f"{w.repo.name} / {where(w, root)}", w.size, EVAL,
+                          lambda w=w: trash_and_remove_worktree(w, days, root, by_hand=True), hint,
+                          kind="worktree_manual", path=w.path, worktree=w))
     return items
 
 
@@ -3688,7 +3719,13 @@ def worktree_detail(w: Worktree, root: Path | None) -> list[Text]:
     elif w.trashable:
         verdict += " · os arquivos fora do Git vão para a Lixeira, a pasta sai, a branch fica"
     lines.append(Text(verdict, style=color))
-    if w.trashable:
+    if w.by_hand:
+        lines.append(Text("não recomendado, mas dá para marcar à mão: a pasta sai, a branch fica com os commits"
+                          + (", o que está fora do Git vai para a Lixeira" if w.leftovers else ""),
+                          style="yellow"))
+    elif w.hard and not w.eligible:
+        lines.append(Text(f"não dá para marcar: {w.hard[0]}", style="grey62"))
+    if w.trashable or w.by_hand:
         lines += [Text(f"  {leftover_line(w, entry)}", style="yellow") for entry in w.leftovers]
     for link in sorted(w.conversations, key=lambda l: -l.conv.last):
         c = link.conv
@@ -3925,7 +3962,8 @@ def disk_tree(s: Snapshot, items: list[Item], trim_off: bool,
               ("worktree", CAT_TITLES["worktree"]), ("system", "💻 macOS e swap"), ("others", "🔎 Outros grandes")]
     rows: list[Row] = []
     for cat, title in blocks:
-        kids = [item_row(i, guards) for i in sorted(items, key=lambda i: -i.size) if i.cat == cat]
+        kids = [item_row(i, guards) for i in sorted(items, key=lambda i: -i.size)
+                if i.cat == cat and i.kind != "worktree_manual"]      # esses só na aba Worktrees
         total = sum(c.item.size for c in kids)
         infos = [i for i in s.items if i.cat == cat and i.action is None and i.size >= MIN_SHOW]
         for i in sorted(infos, key=lambda i: -i.size):
@@ -4031,7 +4069,8 @@ def worktrees_tree(rows: list[Worktree], root: Path | None, days: int = 0, flt: 
             children.append(Row(key=item_key(item) if item else f"wt/{w.path}", cells=wcells, item=item,
                                 detail=worktree_detail(w, root), title=f"{w.repo.name} / {where(w, root)}",
                                 path=w.path, resume=link.conv if link else None,
-                                how=link.how if link else "", size=w.size))
+                                how=link.how if link else "", size=w.size,
+                                locked="" if item or not w.hard else w.hard[0]))
         out.append(Row(key=f"wt/{repo}", cells=cells, children=children, limit=8, kind="group",
                        detail=_wt_group_detail(repo, kids), title=repo.name, path=repo,
                        size=sum(w.size for w in kids)))
@@ -4195,6 +4234,12 @@ HELP_LINES = [
     "↻ é conselho do macOS: o hogs nunca reinicia nem atualiza o Mac.",
 ]
 TRASH_NOTE = "o que foi para a Lixeira só libera espaço quando você esvaziar a Lixeira"
+
+
+def to_trash(i: Item) -> bool:
+    """O item manda algo para a Lixeira: arquivos pessoais ou os arquivos fora do Git de um worktree."""
+    return i.kind == "pessoal" or bool(i.kind in ("worktree_sobras", "worktree_manual")
+                                         and i.worktree and i.worktree.leftovers)
 DOCKER_RAW_NOTE = "O Docker devolve o espaço do Docker.raw aos poucos; se não mudar, reinicie o Docker Desktop."
 SAFE_ONLY = "🟡 e 🔴 se marcam um por um: abra o grupo com →"
 
@@ -4374,9 +4419,14 @@ class App:
         grid.add_column(justify="right", no_wrap=True)
         for i in items:
             grid.add_row(i.risk.icon, Text(i.label), Text(fmt(i.size), style="bold"))
-            if i.kind == "worktree_sobras" and i.worktree:
-                for entry in i.worktree.leftovers:         # cada arquivo que vai junto, por inteiro
-                    grid.add_row("", Text(f"  {leftover_line(i.worktree, entry)}", style="yellow"), "")
+            w = i.worktree
+            if i.kind == "worktree_manual" and w:
+                for why in w.blockers + w.waits:           # por que não é recomendado, tudo
+                    grid.add_row("", Text(f"  ⚠ não recomendado: {why}", style="yellow"), "")
+                grid.add_row("", Text(f"  a pasta sai; a branch {branch_name(w)} fica com os commits"), "")
+            if i.kind in ("worktree_sobras", "worktree_manual") and w:
+                for entry in w.leftovers:                  # cada arquivo que vai junto, por inteiro
+                    grid.add_row("", Text(f"  {leftover_line(w, entry)}", style="yellow"), "")
         tail = [Text(""), Text(f"Total: {fmt(sum(i.size for i in items))}", style="bold")]
         if any(i.risk is LOSS for i in items):
             tail.append(Text("Atenção: tem item 🔴 na lista, ele não volta.", style="red"))
@@ -4386,7 +4436,9 @@ class App:
                     c = link.conv
                     tail.append(Text(f"⚠ reabra antes de apagar “{c.name}”: {resume_command(c)}",
                                      style="yellow"))
-        if any(i.kind in ("pessoal", "worktree_sobras") for i in items):
+        if any(i.kind == "worktree_manual" for i in items):
+            tail.append(Text("Tem worktree não recomendado na lista (⚠): confira os avisos.", style="yellow"))
+        if any(to_trash(i) for i in items):
             tail.append(Text("Arquivos vão para a Lixeira."))
         tail.append(Text("s apaga · n ou Esc volta", style="bold"))
         return self.scrolled("🗑 Vou apagar", grid, tail, width, height, "red")
@@ -4400,7 +4452,7 @@ class App:
                                             f" · livre agora: {fmt(self.free_after)}")]
             if any(i.cat == "docker" for i in self.done_items):
                 tail.append(Text(DOCKER_RAW_NOTE, style="dim"))
-            if any(i.kind in ("pessoal", "worktree_sobras") for i in self.done_items):
+            if any(to_trash(i) for i in self.done_items):
                 tail.append(Text(TRASH_NOTE, style="dim"))
             w = next((i.worktree for i in self.done_items if i.worktree is not None), None)
             if w is not None:
@@ -4549,6 +4601,8 @@ class App:
             return
         leaves = leaf_items(row)
         if not leaves:
+            if row.locked:
+                self.status = f"não dá para marcar: {row.locked}"
             return
         safe = box_items(row)
         if not safe:
